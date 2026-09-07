@@ -1,5 +1,6 @@
 # CodeRabbit configuration
-# https://docs.coderabbit.ai/getting-started/configure-coderabbit
+# Guide:    https://docs.coderabbit.ai/guides/configure-coderabbit
+# Reference: https://docs.coderabbit.ai/reference/yaml-template
 #
 # Written because auto review was silently skipping every pull request in this repository:
 # by default CodeRabbit only reviews pull requests whose base is the default branch, and the
