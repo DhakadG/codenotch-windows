@@ -21,6 +21,23 @@ pub struct Config {
     /// Vertical position of the notch: the window centre as a fraction of the primary monitor's height (0 = top, 1 = bottom), default 0.5; saved after a drag
     #[serde(default = "default_notch_y")]
     pub notch_y: f64,
+    /// Provider ids the user has switched off: "claude", "codex", "cursor", "gemini".
+    ///
+    /// Hidden, not uninstalled - a hidden provider keeps its stored reading, so switching it
+    /// back on shows the last number rather than an empty ring while it polls again.
+    #[serde(default)]
+    pub hidden_providers: Vec<String>,
+    /// Which window the ring shows: "auto" | "session" | "weekly".
+    ///
+    /// "auto" is the upstream behaviour and the default - whichever window is most used, i.e.
+    /// the one that will stop you first. The other two pin the ring to a particular window for
+    /// people who only care about one of them, and the hover card still lists them all.
+    #[serde(default = "default_ring_window")]
+    pub ring_window: String,
+}
+
+fn default_ring_window() -> String {
+    "auto".into()
 }
 
 fn default_notch_y() -> f64 {
@@ -44,6 +61,8 @@ impl Default for Config {
             bar_w: None,
             drag_enabled: false,
             notch_y: default_notch_y(),
+            hidden_providers: Vec::new(),
+            ring_window: default_ring_window(),
         }
     }
 }

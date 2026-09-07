@@ -339,6 +339,37 @@ fn get_codex(state: tauri::State<AppState>) -> usage::UsageSnapshot {
     state.codex.lock().unwrap().clone()
 }
 
+/// The subset of the config the pill needs: which providers to draw and which window the
+/// ring should follow. Kept to exactly that, so the UI never has to know about ports, drag
+/// state or window geometry.
+#[derive(serde::Serialize, Clone)]
+pub struct Prefs {
+    pub hidden_providers: Vec<String>,
+    pub ring_window: String,
+}
+
+#[tauri::command]
+fn get_prefs(state: tauri::State<AppState>) -> Prefs {
+    let c = state.cfg.lock().unwrap();
+    Prefs {
+        hidden_providers: c.hidden_providers.clone(),
+        ring_window: c.ring_window.clone(),
+    }
+}
+
+/// Pushes the current preferences to the pill. Called after any tray toggle.
+pub fn broadcast_prefs(app: &AppHandle) {
+    let prefs = {
+        let st = app.state::<AppState>();
+        let c = st.cfg.lock().unwrap();
+        Prefs {
+            hidden_providers: c.hidden_providers.clone(),
+            ring_window: c.ring_window.clone(),
+        }
+    };
+    let _ = app.emit("prefs", &prefs);
+}
+
 /// A click on a cell opens that provider's usage page
 #[tauri::command]
 fn open_provider_page(provider: String) {
@@ -672,6 +703,7 @@ fn main() {
             get_codex,
             get_cursor,
             get_antigravity,
+            get_prefs,
             get_glyphs,
             get_activity,
             open_data_dir,

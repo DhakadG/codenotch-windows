@@ -29,12 +29,20 @@ const BACKOFF_CAP_SECS: u64 = 900;
 const NUDGE_EVERY_MS: u64 = 10 * 60 * 1000;
 /// Minimum age of the last good reading before the endpoint is asked again.
 ///
-/// `/api/oauth/usage` is rate-limited per token, and a persisted reading is the same answer
-/// it would give. Without this floor every launch fetched immediately, so restarting the app
-/// - which the hook does whenever it is not running - became a tight loop against a limiter
-/// that answers with an hour of 429. Five minutes is what other readers of this endpoint
-/// settled on independently, and a usage percentage does not move meaningfully faster.
-pub const MIN_REFETCH_SECS: u64 = 300;
+/// `/api/oauth/usage` is rate-limited, and a persisted reading is the same answer it would
+/// give. Without this floor every launch fetched immediately, so restarting the app - which
+/// the hook does whenever it is not running - became a tight loop against a limiter that
+/// answers with an hour of 429.
+///
+/// Ten minutes rather than five, because this app is rarely the only thing reading the
+/// endpoint. A user running another usage monitor alongside it - a taskbar widget, a status
+/// line, the bundled CLI - shares whatever budget the endpoint actually enforces, and the
+/// observed evidence is that the limit has an account-level component and not only a
+/// per-token one: a second tool on the same account started being refused after this app had
+/// been polling for a while, despite holding its own separate token. Being the reason
+/// somebody else's tool stops working is worse than showing a percentage six minutes old,
+/// and a usage percentage does not move meaningfully in six minutes anyway.
+pub const MIN_REFETCH_SECS: u64 = 600;
 
 /// Whether a persisted reading is young enough to serve instead of asking again.
 ///
@@ -53,7 +61,7 @@ pub fn too_fresh(fetched_at: u64, now: u64) -> bool {
 /// path that forgets the floor exists - so that no sequence of events can turn this app
 /// into the thing that rate-limits the user's account. Deliberately above normal usage and
 /// well below the point where the endpoint objects.
-pub const MAX_REQUESTS_PER_HOUR: usize = 20;
+pub const MAX_REQUESTS_PER_HOUR: usize = 10;
 const HOUR_MS: u64 = 60 * 60 * 1000;
 /// How long `claude auth status` gets before it is killed. Measured at about half a second
 /// on a healthy install; ten is generous for a slow disk and still short enough that a

@@ -56,10 +56,27 @@
   /* Session arc animation */
   @keyframes spin{to{transform:rotate(360deg)}}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
-  /* A 60 fps SVG transform animation in a transparent always-on-top window slows the whole desktop
-     compositor (other apps stutter). steps() drops repaints to ~10 fps; it still reads as spinning/breathing. */
-  .arc-spin{animation:spin 1.2s steps(12) infinite;transform-origin:center}
-  .arc-pulse{animation:pulse 1.1s steps(6) infinite}
+  /* Smooth, and still cheap.
+     The original comment here was right about the cause and wrong about the only cure: a 60 fps
+     SVG transform in a transparent always-on-top window did stutter the desktop compositor, so
+     steps(12) cut it to ~10 fps - which is why it read as a slideshow rather than a spinner.
+     The expense was never the frame rate, it was that each frame repainted. `will-change` promotes
+     these two elements to their own compositor layers, after which a transform or an opacity change
+     is handled entirely on the GPU: no repaint, no layout, nothing for the main thread to do per
+     frame. That is the one pair of properties browsers can animate for free, which is exactly why
+     rotation and fade were chosen in the first place.
+     If this ever does cost anything on a weaker GPU, the honest fallback is a longer duration, not
+     a coarser one - 2s linear still reads as motion, steps() reads as a fault. */
+  /* No transform-box here on purpose. The spinner is a partial arc, so fill-box would put the
+     origin at the centre of that fragment's own bounds and it would wobble around the ring
+     instead of turning about it. The SVG default, view-box, is the ring's centre. */
+  .arc-spin{animation:spin 1.2s linear infinite;transform-origin:center;will-change:transform}
+  .arc-pulse{animation:pulse 1.1s ease-in-out infinite;will-change:opacity}
+  /* Someone who has asked the system to stop animating things means it. */
+  @media (prefers-reduced-motion:reduce){
+    .arc-spin{animation-duration:3s}
+    .arc-pulse{animation:none;opacity:.6}
+  }
 
   /* Hover card, shown to the left of the pill */
   #card{
@@ -140,16 +157,39 @@ function glyphHtml(p,small){
   return small?'':p.glyph; // fallback letter
 }
 // Provider table (order = top to bottom in the pill). `glyph` is the fallback letter used when no mark is available
+/* User preferences, pushed from the tray. Defaults match the previous behaviour exactly, so
+   a config that has never been touched changes nothing. */
+let prefs={hidden_providers:[],ring_window:'auto'};
+
 function providers(){
   const list=[{id:'claude',name:'Claude',glyph:'C',snap:usage}];
   if(codexSnap.status!=='absent') list.push({id:'codex',name:'Codex',glyph:'Cx',snap:codexSnap});
   if(cursorSnap.status!=='absent') list.push({id:'cursor',name:'Cursor',glyph:'Cu',snap:cursorSnap});
   if(agSnap.status!=='absent') list.push({id:'gemini',name:'Antigravity',glyph:'Ag',snap:agSnap});
-  return list;
+  return list.filter(p=>!prefs.hidden_providers.includes(p.id));
 }
+
+/* Does this window belong to the 5-hour family or the weekly one?
+   Provider ids differ (`session`, `five_hour`, `primary`, `gemini-5h`), so the grouping is by
+   meaning rather than by a single name. Anything unrecognised belongs to neither and is only
+   ever chosen by "auto". */
+function windowFamily(w){
+  const id=(w.id||'').toLowerCase();
+  if(id==='session'||id==='five_hour'||id==='primary'||id.endsWith('-5h')) return 'session';
+  if(id.startsWith('seven_day')||id.startsWith('weekly')||id.endsWith('-weekly')||id==='secondary') return 'weekly';
+  return '';
+}
+
 function headlineOf(snap){
   if(!snap.windows.length) return null;
   const metered=snap.windows.filter(w=>w.count==null);
+  const pool=metered.length?metered:snap.windows;
+  // A pinned choice only applies when this provider actually has that window; otherwise fall
+  // back to auto rather than showing an empty ring for a window that does not exist here.
+  if(prefs.ring_window!=='auto'){
+    const pick=pool.filter(w=>windowFamily(w)===prefs.ring_window);
+    if(pick.length) return pick.reduce((a,b)=> b.used>a.used?b:a);
+  }
   if(metered.length) return metered.reduce((a,b)=> b.used>a.used?b:a);
   return snap.windows[0];
 }
@@ -173,6 +213,38 @@ function isStale(){
   return usage.fetched_at>0 && (Date.now()-usage.fetched_at)>5*60*1000;
 }
 
+/* How long the window behind a reading is, inferred from which window it is.
+   The API sends when a window resets but never how long it runs, so the length has to come
+   from the kind. Only the two lengths that are actually published are claimed; anything else
+   returns 0 and simply gets no tick, because a pace mark drawn against a guessed window
+   length is worse than no pace mark at all. */
+function windowLenMs(w){
+  const id=(w.id||'').toLowerCase();
+  if(id==='session'||id==='five_hour'||id==='primary'||id.endsWith('-5h')||id==='extra_usage_5h') return 5*3600*1000;
+  if(id.startsWith('seven_day')||id.startsWith('weekly')||id.endsWith('-weekly')||id==='secondary') return 7*24*3600*1000;
+  return 0;
+}
+
+/* A mark on the ring showing how far through the reset window you are.
+   Usage alone cannot tell you whether you are in trouble: 60% used is comfortable an hour
+   before a reset and alarming five minutes in. The tick is the second half of that sentence,
+   and the same idea as the pace tick in the taskbar mod. Drawn as a dark line under a light
+   one so it stays visible over any ring colour, including where it crosses the filled arc. */
+function paceTick(w){
+  const len=windowLenMs(w);
+  if(!len||!w.resets_at) return '';
+  const remain=w.resets_at-Date.now();
+  // Outside the window we assumed, the assumption is wrong, so draw nothing rather than
+  // pinning the mark misleadingly at one end.
+  if(remain<=0||remain>len) return '';
+  const th=((1-remain/len)*360-90)*Math.PI/180;
+  const c=Math.cos(th), s=Math.sin(th);
+  const p=(r)=>[(28+r*c).toFixed(2),(28+r*s).toFixed(2)];
+  const [x1,y1]=p(21.9), [x2,y2]=p(28);
+  return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#0a0a0a" stroke-width="2.6" stroke-linecap="butt"/>`
+       + `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#f2f2f4" stroke-width="1.1" stroke-linecap="butt"/>`;
+}
+
 function renderRing(){
   const ps=providers();
   // Rebuild the DOM only when the structure changes (never swap the element under the cursor)
@@ -188,7 +260,12 @@ function renderRing(){
     const svg=cell.querySelector('svg.ring'), pct=cell.querySelector('.pct'), glyph=cell.querySelector('.glyph'), wrap=cell.querySelector('.ringwrap');
     const h=headlineOf(p.snap);
     let inner=`<circle cx="28" cy="28" r="22" fill="#2a2a2a"/><circle cx="28" cy="28" r="25" fill="none" stroke="${TRACK}" stroke-width="5"/>`;
-    if(h && h.count==null) inner+=svgArc(25,Math.min(h.used,1),tone(h.used),5);
+    if(h && h.count==null){
+      inner+=svgArc(25,Math.min(h.used,1),tone(h.used),5);
+      // Only for a metered window, and only when it is not stale: a pace mark computed from
+      // a reading of unknown age would point at a moment that has already passed.
+      if(!staleOf(p.snap)) inner+=paceTick(h);
+    }
     { // thin inner arc: spinning = working, amber pulse = waiting on you (one animation for all four, different sources)
       const ws=workState(p.id);
       if(ws==='running') inner+=`<g class="arc-spin">${svgArc(19,0.28,RUNGREEN,2.5)}</g>`;
@@ -392,6 +469,11 @@ invoke('get_cursor').then(u=>{cursorSnap=u||cursorSnap;renderRing();}).catch(()=
 listen('antigravity',e=>{agSnap=e.payload||agSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_antigravity').then(u=>{agSnap=u||agSnap;renderRing();}).catch(()=>{});
 listen('glyphs',e=>{glyphs=e.payload||glyphs;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+// Preferences arrive like everything else. The cell signature is cleared so the pill is
+// rebuilt rather than patched, otherwise hiding a provider would leave its cell on screen
+// until some other change happened to alter the structure.
+listen('prefs',e=>{prefs=e.payload||prefs;pill.dataset.cells='';renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+invoke('get_prefs').then(p=>{if(p){prefs=p;pill.dataset.cells='';renderRing();}}).catch(()=>{});
 listen('activity',e=>{activity=e.payload||activity;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_activity').then(a=>{activity=a||activity;renderRing();}).catch(()=>{});
 invoke('get_glyphs').then(g=>{glyphs=g||glyphs;renderRing();}).catch(()=>{});

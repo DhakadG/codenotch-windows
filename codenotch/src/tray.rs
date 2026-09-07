@@ -43,6 +43,44 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     let lang_menu = SubmenuBuilder::new(app, tr(lang, "language"))
         .items(&[&l_auto, &l_zh, &l_en, &l_ja, &l_ko])
         .build()?;
+    // Providers the user can switch off, and which window the ring follows. Both read their
+    // checked state from the config, so the menu always shows what is actually in effect
+    // rather than what was in effect when the menu was last built.
+    let (hidden, ring_window) = {
+        let st = app.state::<crate::AppState>();
+        let c = st.cfg.lock().unwrap();
+        (c.hidden_providers.clone(), c.ring_window.clone())
+    };
+    let mut provider_items = Vec::new();
+    for (id, label) in [
+        ("claude", "Claude"),
+        ("codex", "Codex"),
+        ("cursor", "Cursor"),
+        ("gemini", "Antigravity"),
+    ] {
+        provider_items.push(
+            CheckMenuItemBuilder::with_id(format!("prov-{id}"), label)
+                .checked(!hidden.iter().any(|h| h == id))
+                .build(app)?,
+        );
+    }
+    let provider_menu = SubmenuBuilder::new(app, tr(lang, "providers"))
+        .items(&provider_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<Wry>).collect::<Vec<_>>())
+        .build()?;
+
+    let r_auto = CheckMenuItemBuilder::with_id("ring-auto", tr(lang, "ring_auto"))
+        .checked(ring_window == "auto")
+        .build(app)?;
+    let r_session = CheckMenuItemBuilder::with_id("ring-session", tr(lang, "ring_session"))
+        .checked(ring_window == "session")
+        .build(app)?;
+    let r_weekly = CheckMenuItemBuilder::with_id("ring-weekly", tr(lang, "ring_weekly"))
+        .checked(ring_window == "weekly")
+        .build(app)?;
+    let ring_menu = SubmenuBuilder::new(app, tr(lang, "ring_shows"))
+        .items(&[&r_auto, &r_session, &r_weekly])
+        .build()?;
+
     let refresh = MenuItemBuilder::with_id("refresh", tr(lang, "refresh")).build(app)?;
     let refresh_creds =
         MenuItemBuilder::with_id("refresh-creds", tr(lang, "refresh_creds")).build(app)?;
@@ -63,6 +101,8 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     MenuBuilder::new(app)
         .items(&[hook_item])
         .separator()
+        .item(&provider_menu)
+        .item(&ring_menu)
         .item(&lang_menu)
         .item(&refresh)
         .item(&refresh_creds)
@@ -96,6 +136,34 @@ fn handle(app: &AppHandle, id: &str) {
         }
         "uninstall" => {
             notice(app, hooks_install::uninstall());
+            refresh_menu(app);
+        }
+        // Hiding a provider keeps its stored reading, so switching it back on shows the last
+        // number immediately instead of an empty ring while it polls again.
+        id if id.starts_with("prov-") => {
+            let provider = id.trim_start_matches("prov-").to_string();
+            {
+                let st = app.state::<crate::AppState>();
+                let mut c = st.cfg.lock().unwrap();
+                if let Some(pos) = c.hidden_providers.iter().position(|h| *h == provider) {
+                    c.hidden_providers.remove(pos);
+                } else {
+                    c.hidden_providers.push(provider);
+                }
+                crate::config::save(&c);
+            }
+            crate::broadcast_prefs(app);
+            refresh_menu(app);
+        }
+        id if id.starts_with("ring-") => {
+            let choice = id.trim_start_matches("ring-").to_string();
+            {
+                let st = app.state::<crate::AppState>();
+                let mut c = st.cfg.lock().unwrap();
+                c.ring_window = choice;
+                crate::config::save(&c);
+            }
+            crate::broadcast_prefs(app);
             refresh_menu(app);
         }
         "reset" => crate::reset_bar(app),

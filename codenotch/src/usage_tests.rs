@@ -260,10 +260,18 @@ fn the_request_log_forgets_anything_older_than_an_hour() {
 
 #[test]
 fn the_budget_allows_normal_polling() {
-    // The five minute floor produces twelve requests an hour, comfortably under the cap,
-    // so ordinary operation must never be held back by this guardrail.
+    // The refetch floor sets the normal rate, and the ceiling must sit above it or ordinary
+    // operation would trip its own guardrail. Six an hour at a ten minute floor, against a
+    // ceiling of ten, leaves room for a few manual refreshes without ever colliding.
     let now = 10 * HOUR_MS;
-    let mut log: Vec<u64> = (0..12).map(|i| now - i * 5 * 60 * 1000).collect();
+    let normal_per_hour = 3600 / MIN_REFETCH_SECS;
+    assert!(
+        (normal_per_hour as usize) < MAX_REQUESTS_PER_HOUR,
+        "the poll cadence ({normal_per_hour}/h) must stay under the ceiling ({MAX_REQUESTS_PER_HOUR}/h)"
+    );
+    let mut log: Vec<u64> = (0..normal_per_hour)
+        .map(|i| now - i * MIN_REFETCH_SECS * 1000)
+        .collect();
     assert_eq!(budget_check(&mut log, now), Ok(()));
 }
 
