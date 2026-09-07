@@ -6,9 +6,11 @@ and what is genuinely new — so that a reviewer can check the reasoning rather 
 and so that the next change starts by reading the original instead of inventing.
 
 That habit has already earned its keep. Raising the refetch floor to ten minutes silently
-broke the staleness display, because the threshold for dimming a ring was five minutes; every
-ring would have sat permanently dimmed while showing a current number. The bug was not found
-by testing. It was found because `UsageStore.swift` documents the trap:
+broke the staleness display, because the threshold for dimming a ring was five minutes. A
+reading is refetched at most every ten minutes, so from the five minute mark until the next
+eligible fetch — half of every cycle — a ring would have been dimmed while showing a number
+that was correct and at most ten minutes old. The bug was not found by testing. It was found
+because `UsageStore.swift` documents the trap:
 
 > Comfortably above `idleRefreshInterval`, on purpose. With the two equal, a ring dimmed the
 > instant the *first* idle refresh attempt failed — which reads as "nothing is being read
@@ -57,11 +59,12 @@ each is a deliberate divergence rather than parity work.
 
 A rolling cap on requests per provider, persisted so it survives restarts.
 
-macOS does not need this. Windows does, because of the hook messenger: `codenotch-hook`
-relaunches the application whenever it is not running, and every start used to fetch from
-every provider. A burst therefore arrived spread across many short-lived processes, which an
-in-memory counter cannot see at all. This machine rate-limited its own account twice before
-the ceiling existed.
+macOS does not need this. Windows does, because of the hook messenger: when it cannot reach
+the application, `codenotch-hook` may launch it — subject to two guards, a marker written by
+an explicit quit and a thirty second cooldown between attempts — and every start used to fetch
+from every provider. A burst therefore arrived spread across many short-lived processes, which
+an in-memory counter cannot see at all. This machine rate-limited its own account twice before
+the ceiling existed; both guards were added afterwards, and neither removes the need for it.
 
 ### The refetch floor
 
