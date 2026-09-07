@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
+#[cfg(test)]
+#[path = "usage_tests.rs"]
+mod tests;
+
 const ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const POLL_ACTIVE_SECS: u64 = 60;
 const POLL_IDLE_SECS: u64 = 300;

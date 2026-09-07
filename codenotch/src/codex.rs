@@ -209,6 +209,10 @@ fn fetch_usage(cred: &Credential) -> Result<serde_json::Value, LiveErr> {
     }
 }
 
+#[cfg(test)]
+#[path = "codex_tests.rs"]
+mod tests;
+
 /// Upstream's label rule: Codex names windows only by length, and "5h limit" says more than "primary"
 fn label_for(window_minutes: Option<f64>, id: &str) -> String {
     match window_minutes {
