@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  /* 视觉基准：上游 docs/specs/2026-08-28-usage-notch-design.md（Windows 复刻） */
+  *{box-sizing:border-box} /* card 曾因 content-box padding 撑破窗口左界 */
+  html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overflow:hidden;user-select:none}
+  body{font-family:"Segoe UI",system-ui,sans-serif;color:#fff}
+  #root{position:relative;width:100%;height:100%}
+
+  /* 右缘胶囊 */
+  #pill{
+    position:absolute;right:0;top:50%;transform:translateY(-50%);
+    width:70px;padding:18px 0;background:#000;
+    border-radius:20px 0 0 20px;
+    /* 深色壁纸防隐形：细描边 + 微光晕（黑对黑时唯一的轮廓线索） */
+    border:1px solid #2e2e2e;border-right:none;
+    box-shadow:none;
+    display:flex;flex-direction:column;align-items:center;gap:14px;cursor:pointer;
+  }
+  /* 反圆角填角：胶囊顶/底与屏幕右缘之间的凹弧（inverse rounded corner），上游设计帧同款。
+     实现：R×R 的黑块贴右缘，径向渐变把以外角为圆心、半径 R 的圆挖掉，剩下的就是凹弧；
+     再叠 1px 描边色环与胶囊描边衔接（黑壁纸上的轮廓线索）。 */
+  #pill::before,#pill::after{
+    content:"";position:absolute;right:0;width:var(--fillet);height:var(--fillet);pointer-events:none;
+  }
+  #pill{--fillet:26px}
+  #pill::before{
+    top:calc(-1 * var(--fillet)); /* 压住胶囊顶边的 1px 描边，避免接缝 */
+    background:radial-gradient(circle at 0 0, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px));
+  }
+  #pill::after{
+    bottom:calc(-1 * var(--fillet));
+    background:radial-gradient(circle at 0 100%, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px));
+  }
+  .cell{display:flex;flex-direction:column;align-items:center;gap:6px}
+  .ringwrap{position:relative;width:56px;height:56px}
+  .ringwrap > svg.ring{position:absolute;inset:0;overflow:visible} /* 只钉环本体；logo 的内联 svg 不能吃到这条（吃到了就被钉在左上角） */
+  .glyph{
+    position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    font-size:20px;font-weight:700;color:#e8e8ea;letter-spacing:-.5px;
+  }
+  .glyph.small{font-size:15px}
+  /* 图标：mark=官方品牌素材（单色，按白色显示）；appicon=本机应用自己的图标（彩色，圆角缩小） */
+  .glyph img,.glyph svg{display:block;pointer-events:none;user-select:none}
+  .glyph .mark{display:block;width:26px;height:26px;color:#e8e8ea}
+  .glyph .mark svg{width:26px;height:26px;fill:currentColor}   /* 内联 SVG：随 currentColor，dim 时一起变暗 */
+  .glyph img.png{width:26px;height:26px;object-fit:contain}
+  .glyph img.appicon{width:30px;height:30px;border-radius:8px;object-fit:cover}
+  .c-head .mark{display:inline-block;width:16px;height:16px;color:#e8e8ea;margin-right:2px}
+  .c-head .mark svg{width:16px;height:16px;fill:currentColor}
+  .pct{font-size:15px;font-weight:600;color:#fff;font-variant-numeric:tabular-nums}
+  .dim{opacity:.55}
+  /* 会话弧动画 */
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+  /* 透明置顶窗里 60fps 的 SVG 变换动画会拖慢整个桌面合成器（连带其他应用卡）。
+     steps() 把重绘降到 ~10fps，视觉上仍是"在转/在呼吸"。 */
+  .arc-spin{animation:spin 1.2s steps(12) infinite;transform-origin:center}
+  .arc-pulse{animation:pulse 1.1s steps(6) infinite}
+
+  /* 悬停细节卡（弹在胶囊左侧） */
+  #card{
+    position:absolute;left:10px;right:80px;top:50%;transform:translateY(-50%);--tail:50%;
+    /* 左右双锚定=流式宽度：无论 WebView 实际逻辑宽是多少，卡片都不可能伸出窗口左界
+       （固定 max-width 在 DPI 脱节时被裁）。上限 246 与上游规格一致 */
+    max-width:246px;margin-left:auto;background:#0a0a0a;border-radius:16px;padding:16px;
+    overflow-wrap:anywhere;min-width:0;
+    max-height:calc(100% - 16px);overflow:hidden; /* 窗口再矮也不许伸出上下界 */
+    display:none;
+  }
+  #card.show{display:block}
+  #card::after{ /* 指向胶囊的实心三角 */
+    content:"";position:absolute;right:-8px;top:var(--tail);transform:translateY(-50%);
+    border:8px solid transparent;border-right:none;border-left:10px solid #0a0a0a;
+  }
+  .c-head{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+  .c-title{font-size:14px;font-weight:700}
+  .c-sub{font-size:11px;color:#808080;margin-bottom:10px}
+  .win{margin-top:10px}
+  .w-row{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;flex-wrap:wrap;column-gap:8px}
+  .w-label{color:#e8e8ea;font-weight:600;white-space:nowrap}
+  .w-reset{color:#808080;font-size:11px;white-space:nowrap;margin-left:auto} /* 放不下整体换行，绝不在单词中间折 */
+  .w-track{height:4px;border-radius:2px;background:#2d2d2d;margin:6px 0 4px;overflow:hidden}
+  .w-fill{height:100%;border-radius:2px}
+  .w-used{font-size:11px;color:#808080}
+  .c-note{font-size:12px;color:#c8c8c8;line-height:1.5;margin-top:6px}
+  .c-sessions{margin-top:12px;border-top:1px solid #1e1e1e;padding-top:8px}
+  .s-row{display:flex;align-items:center;gap:6px;font-size:11px;color:#b0b0b3;padding:2px 0}
+  .s-dot{width:6px;height:6px;border-radius:3px;flex:0 0 auto}
+  #notice{
+    position:absolute;left:8px;bottom:6px;right:80px;font-size:10px;color:#808080;
+    background:rgba(0,0,0,.85);border-radius:8px;padding:4px 8px;display:none
+  }
+  #notice.show{display:block}
+</style>
+</head>
+<body>
+<div id="root">
+  <div id="card"></div>
+  <div id="pill"></div><!-- 每个提供商一个 .cell，纵向堆叠（上游：data-driven，1–5 个 cell 同一布局） -->
+  <div id="notice"></div>
+</div>
+<script>
+const invoke = window.__TAURI__.core.invoke;
+const listen = window.__TAURI__.event.listen;
+
+/* 色阶（上游 Palette 实值） */
+const AMPLE='#00FF88', WATCH='#F2FF00', CRIT='#FF3F00';
+const TRACK='#303030', AMBER='#FFBF00', RUNGREEN='#28E07B';
+const tone=f=> f>=0.8?CRIT : f>=0.5?WATCH : AMPLE;
+
+let usage={status:'',windows:[],fetched_at:0,note:''};
+let codexSnap={status:'absent',windows:[],fetched_at:0,note:''};
+let cursorSnap={status:'absent',windows:[],fetched_at:0,note:''};
+let agSnap={status:'absent',windows:[],fetched_at:0,note:''};
+let glyphs={}; // id → {kind:'mark'|'appicon', url}
+function glyphHtml(p,small){
+  const g=glyphs[p.id];
+  if(g&&g.kind==='svg'&&g.svg) return `<span class="mark">${g.svg}</span>`;
+  if(g&&g.url) return `<img class="${g.kind}" src="${g.url}" alt="${p.name}"${small?' style="width:16px;height:16px;border-radius:4px"':''}>`;
+  return small?'':p.glyph; // 占位字母
+}
+// 提供商表（顺序=胶囊从上到下）。字形为占位字母：上游 SVG 图标需作者 LICENSE 后才能用
+function providers(){
+  const list=[{id:'claude',name:'Claude',glyph:'C',snap:usage}];
+  if(codexSnap.status!=='absent') list.push({id:'codex',name:'Codex',glyph:'Cx',snap:codexSnap});
+  if(cursorSnap.status!=='absent') list.push({id:'cursor',name:'Cursor',glyph:'Cu',snap:cursorSnap});
+  if(agSnap.status!=='absent') list.push({id:'gemini',name:'Antigravity',glyph:'Ag',snap:agSnap});
+  return list;
+}
+function headlineOf(snap){
+  if(!snap.windows.length) return null;
+  const metered=snap.windows.filter(w=>w.count==null);
+  if(metered.length) return metered.reduce((a,b)=> b.used>a.used?b:a);
+  return snap.windows[0];
+}
+function staleOf(snap){ if(snap.status==='stale') return true; return snap.fetched_at>0 && (Date.now()-snap.fetched_at)>5*60*1000; }
+let stateSnap={sessions:[],agg:'idle'};
+
+function svgArc(r,frac,color,width,extra=''){
+  const C=2*Math.PI*r;
+  return `<circle cx="28" cy="28" r="${r}" fill="none" stroke="${color}" stroke-width="${width}"
+    stroke-dasharray="${(C*frac).toFixed(2)} ${C.toFixed(2)}" stroke-linecap="butt"
+    transform="rotate(-90 28 28)" ${extra}/>`;
+}
+
+function headline(){ // cell 显示"最受限窗口"——最先掐你的那个
+  if(!usage.windows.length) return null;
+  return usage.windows.reduce((a,b)=> b.used>a.used?b:a);
+}
+
+function isStale(){
+  if(usage.status==='stale') return true;
+  return usage.fetched_at>0 && (Date.now()-usage.fetched_at)>5*60*1000;
+}
+
+function renderRing(){
+  const ps=providers();
+  // 结构变化才重建 DOM（避免把光标下的元素换掉）
+  const want=ps.map(p=>p.id+':'+(glyphs[p.id]?glyphs[p.id].kind:'-')).join(',');
+  if(pill.dataset.cells!==want){
+    pill.innerHTML=ps.map(p=>`<div class="cell" data-p="${p.id}">
+      <div class="ringwrap"><svg class="ring" viewBox="0 0 56 56"></svg><div class="glyph ${(!glyphs[p.id]&&p.glyph.length>1)?'small':''}">${glyphHtml(p)}</div></div>
+      <div class="pct">—</div></div>`).join('');
+    pill.dataset.cells=want;
+  }
+  for(const p of ps){
+    const cell=pill.querySelector(`.cell[data-p="${p.id}"]`); if(!cell) continue;
+    const svg=cell.querySelector('svg.ring'), pct=cell.querySelector('.pct'), glyph=cell.querySelector('.glyph'), wrap=cell.querySelector('.ringwrap');
+    const h=headlineOf(p.snap);
+    let inner=`<circle cx="28" cy="28" r="22" fill="#2a2a2a"/><circle cx="28" cy="28" r="25" fill="none" stroke="${TRACK}" stroke-width="5"/>`;
+    if(h && h.count==null) inner+=svgArc(25,Math.min(h.used,1),tone(h.used),5);
+    if(p.id==='claude'){ // 会话态内圈细弧（仅 Claude：引擎只检测 Claude 会话）
+      if(stateSnap.agg==='running') inner+=`<g class="arc-spin">${svgArc(19,0.28,RUNGREEN,2.5)}</g>`;
+      else if(stateSnap.agg==='attention') inner+=`<g class="arc-pulse"><circle cx="28" cy="28" r="19" fill="none" stroke="${AMBER}" stroke-width="2.5"/></g>`;
+    }
+    svg.innerHTML=inner;
+    if(p.snap.status==='needsAuth'||p.snap.status==='none') pct.textContent='—';
+    else if(h && h.count!=null) pct.textContent='~'+h.count;
+    else if(h) pct.textContent=(h.derived?'~':'')+Math.round(h.used*100)+'%';
+    else pct.textContent='…';
+    glyph.classList.toggle('dim', !!(h && h.used>=1));
+    wrap.classList.toggle('dim', staleOf(p.snap));
+  }
+}
+
+function resetCopy(ms){
+  if(!ms) return '';
+  const diff=ms-Date.now();
+  if(diff<=0) return 'Resetting…';
+  if(diff<60*60*1000) return `Resets in ${Math.max(1,Math.round(diff/60000))} min`;
+  const d=new Date(ms);
+  const t=d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+  if(diff<24*60*60*1000) return `Resets at ${t}`;
+  return `Resets ${d.toLocaleDateString('en-US',{weekday:'short'})} ${t}`;
+}
+
+function ago(ms){
+  const m=Math.round((Date.now()-ms)/60000);
+  return m<60?`${m}m ago`:`${Math.round(m/60)}h ago`;
+}
+
+const STATE_DOT={running:RUNGREEN,attention:AMBER,done:'#57c7ff'};
+
+let hoverId='claude';
+function renderCard(){
+  const c=document.getElementById('card');
+  const p=providers().find(x=>x.id===hoverId)||providers()[0];
+  const snap=p.snap;
+  const headIcon=glyphHtml(p,true);
+  let html=`<div class="c-head">${headIcon}<span class="c-title">${p.name} Usage</span><span class="c-sub" style="margin:0 0 0 auto">${BUILD}</span></div>`;
+  if(staleOf(snap)&&snap.fetched_at) html+=`<div class="c-sub">Updated ${ago(snap.fetched_at)}</div>`;
+  if(snap.status==='needsAuth'){
+    const who={claude:'Sign in to Claude Code to see usage.',cursor:'Sign in to Cursor to see usage.',codex:'Sign in to Codex to see usage.',gemini:'Sign in to Antigravity to see usage.'}[p.id]||'';
+    html+=`<div class="c-note">${who}<br>${snap.note||''}</div>`;
+  }else if(!snap.windows.length){
+    html+=`<div class="c-note">${snap.note||'Waiting for first reading…'}</div>`;
+  }else{
+    for(const w of snap.windows){
+      if(w.count!=null){
+        html+=`<div class="win"><div class="w-row"><span class="w-label">${w.label}</span></div>
+          <div class="w-used">${w.count>0?`~${w.count} request${w.count===1?'':'s'} today`:'no requests today'}</div></div>`;
+        continue;
+      }
+      html+=`<div class="win">
+        <div class="w-row"><span class="w-label">${w.label}</span><span class="w-reset">${resetCopy(w.resets_at)}</span></div>
+        <div class="w-track"><div class="w-fill" style="width:${(Math.min(w.used,1)*100).toFixed(0)}%;background:${tone(w.used)}"></div></div>
+        <div class="w-used">${w.derived?'~':''}${Math.round(w.used*100)}% Used</div>
+      </div>`;
+    }
+    if(snap.note) html+=`<div class="c-note">${snap.note}</div>`;
+  }
+  if(p.id==='claude'){ // 活跃会话（W2 将扩展为完整列表+跳回）
+    const act=stateSnap.sessions.filter(s=>s.state!=='idle');
+    if(act.length){
+      html+=`<div class="c-sessions">`;
+      for(const s of act.slice(0,5)){
+        html+=`<div class="s-row"><span class="s-dot" style="background:${STATE_DOT[s.state]||'#666'}"></span>${esc(s.title)}</div>`;
+      }
+      html+=`</div>`;
+    }
+  }
+  c.innerHTML=html;
+  placeCard();
+}
+// 卡片跟随被指的 cell：垂直对齐该 cell 中心（限制在窗口内），尾巴指向它
+function placeCard(){
+  const cell=pill.querySelector(`.cell[data-p="${hoverId}"]`)||pill;
+  const cr=cell.getBoundingClientRect();
+  const cy=cr.top+cr.height/2;
+  const H=innerHeight, ch=card.offsetHeight||0;
+  let top=Math.round(cy-ch/2); top=Math.max(8,Math.min(top,H-ch-8));
+  card.style.top=top+'px'; card.style.transform='none';
+  card.style.setProperty('--tail',Math.max(16,Math.min(ch-16,Math.round(cy-top)))+'px');
+}
+
+function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML;}
+
+/* 悬停展开：胶囊或卡片其一被指着就保持展开，离开 250ms 宽限收起（上游动效纪律） */
+const card=document.getElementById('card'), pill=document.getElementById('pill');
+let hideTimer=null;
+function showCard(){clearTimeout(hideTimer);card.classList.add('show');renderCard();armWatchdog();} // 先显示再渲染：placeCard 需要 offsetHeight
+function hideCard(){card.classList.remove('show');invoke('set_expanded',{on:false,rects:null}).catch(()=>{});}
+function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(hideCard,250);}
+// ===== 诊断可视化 + 几何判定 =====
+const BUILD='r20';
+function jslog(m){invoke('log_js',{msg:String(m)}).catch(()=>{});}
+function callq(cmd,args){ // 带可视化失败的 invoke：任何命令失败都在屏上报出来（之前 .catch 静默吞掉了）
+  return invoke(cmd,args).catch(e=>{notice(cmd+' 失败: '+(e&&e.message||e));throw e;});
+}
+// 热区用物理像素上报（乘以本页真实 DPR），Rust 端零换算——WebView2 的 DPR 与窗口 scale 可能不一致
+function rectOf(el){const r=el.getBoundingClientRect(),k=window.devicePixelRatio||1;return [r.left*k,r.top*k,r.width*k,r.height*k];}
+function armWatchdog(){
+  requestAnimationFrame(()=>{ // 等一帧：让 renderCard 的新内容先完成布局再量矩形
+    if(!card.classList.contains('show'))return;
+    callq('set_expanded',{on:true,rects:[rectOf(pill),rectOf(card)]}).catch(()=>{});
+  });
+}
+// 视口自适配（纯前端兜底，不依赖 Rust）：窗口物理宽=340×主屏scale，若本页 CSS 视口≠340，
+// 说明 WebView 的 DPR 与主屏不一致，用 CSS zoom 把布局拉回设计尺寸。
+function fitZoom(){
+  const z=innerWidth/340;
+  document.documentElement.style.zoom=(Math.abs(z-1)>0.02)?String(z):'';
+  return z;
+}
+function reportDpr(){
+  const z=fitZoom();
+  jslog(`dpr=${window.devicePixelRatio} inner=${innerWidth}x${innerHeight} cssZoom=${z.toFixed(3)} build=${BUILD}`);
+  callq('report_dpr',{dpr:window.devicePixelRatio||1,w:innerWidth,h:innerHeight}).catch(()=>{});
+}
+reportDpr();
+window.addEventListener('resize',()=>{clearTimeout(window._dprT);window._dprT=setTimeout(()=>{reportDpr();if(card.classList.contains('show'))armWatchdog();},120);});
+matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`).addEventListener('change',reportDpr);
+callq('build_tag').then(b=>{ if(b!==BUILD){notice(`前后端轮次不一致: exe=${b} html=${BUILD}`);jslog('build mismatch exe='+b);} else notice('codenotch '+BUILD); }).catch(()=>{});
+
+/* 收起判定：不再信任任何元素级 mouseenter/mouseleave/e.target——
+   只用几何：光标(clientX/Y) 是否落在胶囊矩形∪卡片矩形∪两者包围盒内。
+   离开窗口：document mouseout(relatedTarget=null) + Rust 看门狗（系统光标）双保险。 */
+function inRect(x,y,r,pad){return x>=r.left-pad&&y>=r.top-pad&&x<r.right+pad&&y<r.bottom+pad;}
+function cellAt(x,y){
+  for(const el of pill.querySelectorAll('.cell')){ if(inRect(x,y,el.getBoundingClientRect(),6)) return el.dataset.p; }
+  return null;
+}
+function pointerInHot(x,y){
+  const p=pill.getBoundingClientRect();
+  if(inRect(x,y,p,4))return true;
+  if(!card.classList.contains('show'))return false;
+  const c=card.getBoundingClientRect();
+  if(inRect(x,y,c,4))return true;
+  const u={left:Math.min(p.left,c.left),top:Math.min(p.top,c.top),right:Math.max(p.right,c.right),bottom:Math.max(p.bottom,c.bottom)};
+  return inRect(x,y,u,0);
+}
+let hideLogged=0;
+document.addEventListener('mousemove',e=>{
+  if(dragging)return; // 拖动中不弹卡片
+  const hot=pointerInHot(e.clientX,e.clientY);
+  if(hot){
+    clearTimeout(hideTimer);
+    const id=cellAt(e.clientX,e.clientY);
+    if(id&&id!==hoverId){ hoverId=id; if(card.classList.contains('show')){ renderCard(); armWatchdog(); } }
+    if(!card.classList.contains('show')) showCard();
+  }
+  else if(card.classList.contains('show')){ if(hideLogged++<5) jslog(`mousemove 出热区 → 收起 at ${e.clientX},${e.clientY}`); scheduleHide(); }
+});
+document.addEventListener('mouseout',e=>{ // relatedTarget 为空 = 光标离开了整个页面
+  if(!e.relatedTarget && card.classList.contains('show')){ if(hideLogged++<5) jslog('mouseout 离开页面 → 收起'); scheduleHide(); }
+});
+listen('pointer_left',()=>{clearTimeout(hideTimer);hideCard();}).catch(()=>{});
+// 卡片内容变化会改变高度 → 重新上报热区
+listen('usage',()=>{if(card.classList.contains('show'))armWatchdog();}).catch(()=>{});
+listen('state',()=>{if(card.classList.contains('show'))armWatchdog();}).catch(()=>{});
+/* 胶囊可沿右缘上下拖动。按下后移动 >4px = 拖动（交给 Rust 按系统光标驱动，卡片先收）；
+   松开前没动 = 点击（打开该提供商的用量页）。 */
+let press=null, dragging=false;
+pill.addEventListener('mousedown',e=>{ if(e.button!==0)return; press={x:e.clientX,y:e.clientY,id:cellAt(e.clientX,e.clientY)||hoverId}; });
+document.addEventListener('mousemove',e=>{
+  if(!press||dragging)return;
+  if(Math.abs(e.clientY-press.y)>4||Math.abs(e.clientX-press.x)>4){
+    dragging=true; clearTimeout(hideTimer); hideCard();
+    invoke('drag_begin').catch(err=>{notice('drag_begin 失败: '+err);dragging=false;});
+  }
+});
+document.addEventListener('mouseup',e=>{
+  if(e.button!==0)return;
+  if(press&&!dragging) invoke('open_provider_page',{provider:press.id}).catch(()=>{});
+  press=null;
+});
+listen('drag_end',()=>{dragging=false;press=null;}).catch(()=>{});
+
+function notice(msg){
+  const n=document.getElementById('notice');
+  n.textContent=msg;n.classList.add('show');
+  clearTimeout(n._h);n._h=setTimeout(()=>n.classList.remove('show'),6000);
+}
+
+listen('usage',e=>{usage=e.payload||usage;renderRing();if(card.classList.contains('show'))renderCard();})
+  .catch(e=>notice('listen(usage) failed: '+e));
+listen('state',e=>{stateSnap=e.payload||stateSnap;renderRing();if(card.classList.contains('show'))renderCard();})
+  .catch(e=>notice('listen(state) failed: '+e));
+listen('notice',e=>notice(e.payload)).catch(()=>{});
+listen('codex',e=>{codexSnap=e.payload||codexSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('cursor',e=>{cursorSnap=e.payload||cursorSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+invoke('get_cursor').then(u=>{cursorSnap=u||cursorSnap;renderRing();}).catch(()=>{});
+listen('antigravity',e=>{agSnap=e.payload||agSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+invoke('get_antigravity').then(u=>{agSnap=u||agSnap;renderRing();}).catch(()=>{});
+listen('glyphs',e=>{glyphs=e.payload||glyphs;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+invoke('get_glyphs').then(g=>{glyphs=g||glyphs;renderRing();}).catch(()=>{});
+invoke('get_codex').then(u=>{codexSnap=u||codexSnap;renderRing();}).catch(()=>{});
+invoke('get_usage').then(u=>{usage=u||usage;renderRing();}).catch(e=>notice('get_usage failed: '+e));
+invoke('get_state').then(s=>{stateSnap=s||stateSnap;renderRing();}).catch(()=>{});
+setInterval(renderRing,30_000); // 陈旧态与重置文案随时间推移刷新
+</script>
+</body>
+</html>
