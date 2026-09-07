@@ -105,13 +105,33 @@ pub fn load() -> Config {
         .unwrap_or_default()
 }
 
+/// Replace the config file atomically: write a sibling, then rename over the old one.
+///
+/// `fs::write` truncates first, so a reader arriving mid-write got an empty or partial file,
+/// fell back to `Config::default()`, and saw every provider as connected. That window is
+/// microseconds wide and `is_disconnected` is now read from disk by four polling loops, so the
+/// consequence was a provider the user had switched off firing exactly the request this port
+/// keeps having to stop it firing. The same rename also means a crash or a full disk mid-save
+/// leaves the previous settings intact instead of an empty file.
+///
+/// `fs::rename` maps to `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` on Windows, so the
+/// destination already existing is not an error. If the rename fails the temporary file is
+/// removed rather than left beside the real one for someone to find later and wonder about.
 pub fn save(cfg: &Config) {
     let path = config_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(txt) = serde_json::to_string_pretty(cfg) {
-        let _ = std::fs::write(path, txt);
+    let Ok(txt) = serde_json::to_string_pretty(cfg) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, txt).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -126,16 +146,31 @@ mod tests {
     /// the build would notice.
     #[test]
     fn only_the_listed_provider_is_disconnected() {
+        const TRAY_IDS: [&str; 4] = ["claude", "codex", "cursor", "gemini"];
+        // Every id positively, one at a time: asserting only that the *others* come back
+        // connected would pass just as happily if a loop asked for an id the tray never
+        // writes, which is the mistake this is here to catch.
+        for id in TRAY_IDS {
+            let cfg = Config {
+                hidden_providers: vec![id.to_string()],
+                ..Default::default()
+            };
+            assert!(cfg.is_disconnected(id), "{id} should be disconnected");
+            for other in TRAY_IDS.into_iter().filter(|o| *o != id) {
+                assert!(!cfg.is_disconnected(other), "{other} should be untouched by {id}");
+            }
+        }
+        // Exact match, not a prefix or substring: "cursor" must not switch off a future
+        // "cursor-cli", and "claud" must not switch off "claude".
         let cfg = Config {
-            hidden_providers: vec!["cursor".into(), "codex".into()],
+            hidden_providers: vec!["cursor".into(), "claud".into()],
             ..Default::default()
         };
-        assert!(cfg.is_disconnected("cursor"));
-        assert!(cfg.is_disconnected("codex"));
-        assert!(!cfg.is_disconnected("claude"));
-        assert!(!cfg.is_disconnected("gemini"));
-        // Not a prefix or substring match: "cursor" must not switch off a future "cursor-cli".
         assert!(!cfg.is_disconnected("cursor-cli"));
-        assert!(!Config::default().is_disconnected("claude"));
+        assert!(!cfg.is_disconnected("claude"));
+        // Nothing switched off is the default, and it must not disconnect anything.
+        for id in TRAY_IDS {
+            assert!(!Config::default().is_disconnected(id));
+        }
     }
 }
