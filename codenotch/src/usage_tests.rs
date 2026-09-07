@@ -262,6 +262,14 @@ fn retry_after_accepts_both_forms_the_spec_allows() {
     let header = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
     assert_eq!(retry_after_secs(Some(&header)), Some(0));
 
+    // Sub-second remainders round up. Truncating turns "wait 900 ms" into "retry now", which
+    // sends the caller straight back at a server that had just asked it not to.
+    let soon = chrono::Utc::now() + chrono::Duration::milliseconds(400);
+    let header = soon.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    if let Some(secs) = retry_after_secs(Some(&header)) {
+        assert!(secs <= 1, "a sub-second wait should round to at most 1s, got {secs}");
+    }
+
     // Absent or unparseable: the caller decides, rather than being handed a fabricated wait.
     assert_eq!(retry_after_secs(None), None);
     assert_eq!(retry_after_secs(Some("")), None);

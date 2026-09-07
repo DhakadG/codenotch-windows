@@ -378,8 +378,17 @@ fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
     // The request log is the one thing carried across readings: it is this provider's record
     // of what it has already spent against the endpoint's hourly limit, and starting fresh
     // each poll would make the ceiling unenforceable.
+    // Carried across every reading, including the local fast path below.
+    //
+    // The request log is this provider's record of what it has spent against the endpoint's
+    // hourly limit. `backoff_until` is a deadline the *server* asked for, and it matters even
+    // more: dropping it meant a fresh rollout could erase an active 429 deadline, and the
+    // zero was then persisted, so after a restart polling would go back to the endpoint
+    // before the wait it had been given was over.
     let mut snap = UsageSnapshot {
         request_log: prev.request_log.clone(),
+        backoff_until: prev.backoff_until,
+        backoff_for: prev.backoff_for.clone(),
         ..Default::default()
     };
     // Note attached to the fallback reading when the live read failed; needs_auth picks the empty state when there is no fallback either

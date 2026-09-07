@@ -630,12 +630,18 @@ fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
             match load_tier(&c.access_token) {
             Ok(t) => {
                 tier = Some(t);
-                if let Some(w) = direct_quota(&c.access_token) {
-                    snap.status = "ok".into();
-                    snap.windows = w;
-                    snap.fetched_at = now_ms();
-                    snap.note = format!("{} · via Google", tier.clone().unwrap_or_default());
-                    return snap;
+                // The tier lookup and the quota call are two separate requests to Cloud
+                // Code, so the second is checked and recorded in its own right. Counting the
+                // pair as one entry let this path spend twice what the ceiling allowed.
+                if crate::usage::budget_check(&mut snap.request_log, now_ms()).is_ok() {
+                    snap.request_log.push(now_ms());
+                    if let Some(w) = direct_quota(&c.access_token) {
+                        snap.status = "ok".into();
+                        snap.windows = w;
+                        snap.fetched_at = now_ms();
+                        snap.note = format!("{} · via Google", tier.clone().unwrap_or_default());
+                        return snap;
+                    }
                 }
             }
             Err(e) if e == "needsAuth" => {

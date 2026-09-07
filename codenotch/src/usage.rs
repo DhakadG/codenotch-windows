@@ -504,7 +504,9 @@ pub(crate) fn retry_after_secs(header: Option<&str>) -> Option<u64> {
     let when = chrono::DateTime::parse_from_rfc2822(raw)
         .ok()
         .map(|d| d.timestamp_millis())?;
-    Some(((when - now_ms() as i64).max(0) / 1000) as u64)
+    // Round up. Truncating turns anything under a second into "retry now", so a caller told
+    // to wait 900 ms would go straight back at a server that had just asked it not to.
+    Some(((when - now_ms() as i64).max(0) as u64).div_ceil(1000))
 }
 
 pub(crate) fn prune_request_log(log: &mut Vec<u64>, now: u64) -> usize {
