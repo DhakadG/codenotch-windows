@@ -89,13 +89,151 @@ fn install_sets_a_timeout_so_a_wedged_hook_cannot_hang_claude_code() {
 }
 
 #[test]
-fn only_tool_events_get_a_matcher() {
+fn a_matcher_is_present_exactly_where_the_wiring_says() {
     let root = install_fresh();
     for (event, need_matcher, _) in WIRING {
         let has = root["hooks"][*event][0].get("matcher").is_some();
         assert_eq!(has, *need_matcher, "matcher presence wrong for {event}");
     }
-    assert_eq!(root["hooks"]["PreToolUse"][0]["matcher"], json!("*"));
+}
+
+#[test]
+fn no_hook_is_wired_to_a_per_tool_call_event() {
+    // The guard for the defect that made sessions freeze. Claude Code starts a POSIX shell
+    // for every hook invocation, and on a machine whose `bash` is the WSL one that shell took
+    // up to 4.2 seconds to start - against 57 ms for the messenger it runs. Wired to
+    // PreToolUse and PostToolUse, that cost was paid twice on every tool call.
+    //
+    // Anything that fires per tool call belongs nowhere near this list, however useful the
+    // event is: the transcript watcher already reports tool-level activity without spawning
+    // anything at all.
+    const PER_TOOL_CALL: &[&str] = &["PreToolUse", "PostToolUse"];
+    for (event, _, _) in WIRING {
+        assert!(
+            !PER_TOOL_CALL.contains(event),
+            "{event} fires on every tool call and must not be wired to a hook"
+        );
+    }
+    let root = install_fresh();
+    for event in PER_TOOL_CALL {
+        assert!(
+            ours(&root, event).is_empty(),
+            "{event} must not receive one of our entries"
+        );
+    }
+}
+
+#[test]
+fn upgrading_removes_our_entries_from_events_we_no_longer_wire() {
+    // The case that would have shipped the fix while the bug kept running. A settings.json
+    // written by an older build carries our PreToolUse and PostToolUse entries; dropping those
+    // events from WIRING only changes what a *fresh* install writes, so without the sweep the
+    // old entries would sit there untouched and Claude Code would still start a shell twice
+    // per tool call after upgrading.
+    let mut root = json!({
+        "hooks": {
+            "PreToolUse": [
+                { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo mine" }] },
+                { "matcher": "*", "hooks": [{ "type": "command", "command": "\"C:\\old\\codenotch-hook.exe\" running", "timeout": 5 }] }
+            ],
+            "PostToolUse": [
+                { "matcher": "*", "hooks": [{ "type": "command", "command": "\"C:\\old\\codenotch-hook.exe\" running", "timeout": 5 }] }
+            ]
+        }
+    });
+    merge_install(&mut root, HOOK);
+
+    // Ours are gone from both retired events...
+    assert!(ours(&root, "PreToolUse").is_empty(), "a stale PreToolUse entry survived the upgrade");
+    assert!(ours(&root, "PostToolUse").is_empty(), "a stale PostToolUse entry survived the upgrade");
+    // ...the user's own hook on a shared event is untouched...
+    let pre = entries(&root, "PreToolUse");
+    assert_eq!(pre.len(), 1);
+    assert_eq!(pre[0]["hooks"][0]["command"], json!("echo mine"));
+    // ...an event we emptied entirely is removed rather than left as a bare array...
+    assert!(
+        root["hooks"].get("PostToolUse").is_none(),
+        "PostToolUse held only our entry and should have been removed, not left empty"
+    );
+    // ...and the current wiring is installed.
+    for (event, _, _) in WIRING {
+        assert_eq!(ours(&root, event).len(), 1, "{event} should have been wired");
+    }
+}
+
+#[test]
+fn a_user_command_sharing_an_entry_with_ours_survives() {
+    // Claude Code allows several commands in one entry, so nothing stops a user putting one of
+    // theirs beside one of ours. Judging the entry as a whole and deleting it would delete
+    // their command too - silently, in a file this application does not own.
+    let mut root = json!({
+        "hooks": {
+            "PostToolUse": [{
+                "matcher": "*",
+                "hooks": [
+                    { "type": "command", "command": "echo user-audit" },
+                    { "type": "command", "command": "\"C:\\old\\codenotch-hook.exe\" running", "timeout": 5 }
+                ]
+            }]
+        }
+    });
+    assert_eq!(merge_uninstall(&mut root), 1);
+
+    let post = entries(&root, "PostToolUse");
+    assert_eq!(post.len(), 1, "the entry itself must survive");
+    let cmds = post[0]["hooks"].as_array().unwrap();
+    assert_eq!(cmds.len(), 1, "only our command should have been removed");
+    assert_eq!(cmds[0]["command"], json!("echo user-audit"));
+    // The matcher and any other keys on the entry are the user's and stay as they were.
+    assert_eq!(post[0]["matcher"], json!("*"));
+}
+
+#[test]
+fn installing_over_a_mixed_entry_keeps_the_user_command() {
+    // The same case reached through install rather than uninstall, since install now sweeps
+    // first. This is the path an upgrade actually takes.
+    let mut root = json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [
+                    { "type": "command", "command": "\"C:\\old\\codenotch-hook.exe\" running" },
+                    { "type": "command", "command": "echo keep-me" }
+                ]
+            }]
+        }
+    });
+    merge_install(&mut root, HOOK);
+    let pre = entries(&root, "PreToolUse");
+    assert_eq!(pre.len(), 1);
+    let cmds = pre[0]["hooks"].as_array().unwrap();
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(cmds[0]["command"], json!("echo keep-me"));
+}
+
+#[test]
+fn an_entry_the_user_left_empty_is_not_tidied_away() {
+    // Odd, but theirs. Removing it would be this application editing a file it does not own
+    // for cosmetic reasons.
+    let mut root = json!({ "hooks": { "PreCompact": [{ "hooks": [] }] } });
+    let before = root.clone();
+    assert_eq!(merge_uninstall(&mut root), 0);
+    assert_eq!(root, before);
+}
+
+#[test]
+fn upgrading_from_a_legacy_name_also_clears_the_retired_events() {
+    // Same path, but the stale entry was written under one of the earlier binary names. It is
+    // still ours, so it still has to go.
+    let mut root = json!({
+        "hooks": {
+            "PostToolUse": [
+                { "matcher": "*", "hooks": [{ "type": "command", "command": "\"C:\\old\\pacman-hook.exe\" running" }] }
+            ]
+        }
+    });
+    merge_install(&mut root, HOOK);
+    assert!(root["hooks"].get("PostToolUse").is_none());
 }
 
 #[test]
@@ -125,8 +263,14 @@ fn install_preserves_the_users_own_hooks_and_settings() {
     let mut root = json!({
         "model": "opus",
         "hooks": {
+            // An event we do wire, so the sharing behaviour is exercised.
+            "Stop": [
+                { "hooks": [{ "type": "command", "command": "echo audit" }] }
+            ],
+            // An event we never wire, and one that fires per tool call, so both kinds of
+            // "not ours" are covered.
             "PreToolUse": [
-                { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo audit" }] }
+                { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo pretool" }] }
             ],
             "PreCompact": [
                 { "hooks": [{ "type": "command", "command": "echo compacting" }] }
@@ -137,14 +281,16 @@ fn install_preserves_the_users_own_hooks_and_settings() {
 
     // Unrelated top-level settings are untouched.
     assert_eq!(root["model"], json!("opus"));
-    // An event we do not wire is untouched.
+    // Events we do not wire are untouched, including the user's own per-tool-call hook.
     assert_eq!(entries(&root, "PreCompact").len(), 1);
+    assert_eq!(entries(&root, "PreToolUse").len(), 1);
+    assert_eq!(entries(&root, "PreToolUse")[0]["hooks"][0]["command"], json!("echo pretool"));
     // An event we share keeps the user's entry, and ours is appended rather than inserted
     // ahead of it, so their ordering assumptions survive.
-    let pre = entries(&root, "PreToolUse");
-    assert_eq!(pre.len(), 2);
-    assert_eq!(pre[0]["hooks"][0]["command"], json!("echo audit"));
-    assert!(is_ours(&pre[1]));
+    let stop = entries(&root, "Stop");
+    assert_eq!(stop.len(), 2);
+    assert_eq!(stop[0]["hooks"][0]["command"], json!("echo audit"));
+    assert!(is_ours(&stop[1]));
 }
 
 #[test]

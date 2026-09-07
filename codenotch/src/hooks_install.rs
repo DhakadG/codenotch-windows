@@ -5,11 +5,27 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 /// (Claude Code event name, whether it needs a matcher, the internal event reported to Codenotch)
+///
+/// `PreToolUse` and `PostToolUse` are deliberately absent, and this is the most important
+/// decision in this file.
+///
+/// Claude Code runs a hook command through a POSIX shell, and the cost of starting that shell
+/// is the cost of the hook - not the program it runs. Measured on a Windows machine where the
+/// `bash` on PATH is the WSL one: `bash -c true` averaged 673 ms and peaked at 4.2 seconds,
+/// against 57 ms for the messenger itself. Wired to the two tool events, with a `*` matcher,
+/// that was paid twice on *every single tool call*, which is why sessions visibly froze while
+/// this app was installed and recovered the moment it was removed.
+///
+/// The remaining five fire a handful of times per session - when it starts, when a prompt is
+/// submitted, when Claude wants attention, when it stops, when it ends - so the shell cost is
+/// paid a handful of times instead of hundreds. Tool-level activity is not lost either: the
+/// transcript watcher already reports it, independently of hooks, which is why the notch
+/// showed live session state during the period when no hooks were installed at all.
+///
+/// Anything added here should be judged by how often it fires, not by how useful it is.
 const WIRING: &[(&str, bool, &str)] = &[
     ("SessionStart", false, "session_start"),
     ("UserPromptSubmit", false, "running"),
-    ("PreToolUse", true, "running"),
-    ("PostToolUse", true, "running"),
     ("Notification", false, "attention"),
     ("Stop", false, "done"),
     ("SessionEnd", false, "session_end"),
@@ -98,6 +114,23 @@ fn merge_install(root: &mut Value, hook_exe: &str) {
         root["hooks"] = json!({});
     }
 
+    // Sweep our entries out of *every* event first, not just the ones being written back.
+    //
+    // Without this, dropping an event from WIRING only changes what new installations get.
+    // An existing settings.json keeps whatever it was given by an older build, because the
+    // loop below never visits an event the current WIRING does not mention. That is not a
+    // theoretical leak: PreToolUse and PostToolUse were removed precisely because they made
+    // Claude Code start a shell on every tool call, and an upgrade that left them in place
+    // would have shipped the fix while the bug carried on running.
+    //
+    // Reusing the uninstall path means the two can never disagree about what counts as ours,
+    // and it inherits its rule about user entries: only our own are removed, and an event we
+    // emptied is dropped rather than left behind as a bare `[]`.
+    merge_uninstall(root);
+    if !root["hooks"].is_object() {
+        root["hooks"] = json!({});
+    }
+
     for (event, need_matcher, internal) in WIRING {
         let arr = root["hooks"][*event].as_array().cloned().unwrap_or_default();
         // Remove our own older entries first
@@ -118,6 +151,35 @@ fn merge_install(root: &mut Value, hook_exe: &str) {
 /// entries went. The inverse of [`merge_install`]: an event array that we emptied is
 /// removed entirely, so a settings file we had added `Stop` to does not keep a `"Stop": []`
 /// afterwards. Events the user configured themselves keep their remaining entries.
+/// Removes our commands from one entry, leaving anyone else's, and reports how many went.
+///
+/// An entry's `hooks` array can hold several commands, and nothing stops a user putting one
+/// of theirs beside one of ours - Claude Code's own documentation shows multiple commands per
+/// entry. Judging the entry as a whole and deleting it therefore deletes their command too,
+/// silently, in a file they own. Removal has to happen one command at a time.
+fn strip_ours(entry: &mut Value) -> usize {
+    let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+        return 0;
+    };
+    let before = hooks.len();
+    hooks.retain(|h| {
+        !h["command"]
+            .as_str()
+            .map(|c| HOOK_COMMAND_MARKERS.iter().any(|m| c.contains(m)))
+            .unwrap_or(false)
+    });
+    before - hooks.len()
+}
+
+/// True when an entry has no commands left and is therefore only an empty shell.
+fn is_empty_entry(entry: &Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(false)
+}
+
 fn merge_uninstall(root: &mut Value) -> usize {
     // get_mut, not `root["hooks"]`: indexing a Value mutably *inserts* a null for a missing
     // key, so uninstalling from a settings file that has no hooks section would write a
@@ -129,14 +191,32 @@ fn merge_uninstall(root: &mut Value) -> usize {
     let mut removed = 0;
     let mut emptied: Vec<String> = Vec::new();
     for (event, v) in hooks.iter_mut() {
-        if let Some(arr) = v.as_array() {
-            let filtered: Vec<Value> = arr.iter().filter(|e| !is_ours(e)).cloned().collect();
-            let dropped = arr.len() - filtered.len();
-            removed += dropped;
-            if filtered.is_empty() && dropped > 0 {
+        if let Some(arr) = v.as_array_mut() {
+            let mut dropped_commands = 0;
+            // Strip our commands from inside each entry rather than judging the entry as a
+            // whole. An entry may legitimately hold one of ours beside one of the user's, and
+            // deleting the entry would take theirs with it - silent data loss in a file this
+            // application does not own.
+            //
+            // `touched` records which entries we actually took something from, because only
+            // those may be removed when they end up empty. An entry that arrived empty was
+            // the user's to keep, odd as it is, and tidying it away would be this code editing
+            // a file it does not own for cosmetic reasons.
+            let mut touched = Vec::with_capacity(arr.len());
+            for entry in arr.iter_mut() {
+                let n = strip_ours(entry);
+                dropped_commands += n;
+                touched.push(n > 0);
+            }
+            let mut i = 0;
+            arr.retain(|e| {
+                let keep = !(touched[i] && is_empty_entry(e));
+                i += 1;
+                keep
+            });
+            removed += dropped_commands;
+            if arr.is_empty() && dropped_commands > 0 {
                 emptied.push(event.clone());
-            } else {
-                *v = json!(filtered);
             }
         }
     }
