@@ -501,6 +501,22 @@ pub fn start(app: AppHandle) {
             }
         }
         loop {
+            // Serve a young persisted reading rather than fetching on every start. The hook
+            // relaunches this app whenever it is not running, so without this each restart
+            // spent a request against chatgpt.com as well.
+            {
+                let st = app.state::<AppState>();
+                let prev = st.codex.lock().unwrap().clone();
+                if crate::usage::too_fresh(prev.fetched_at, now_ms()) {
+                    for _ in 0..60 {
+                        if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                    continue;
+                }
+            }
             let snap = read_once();
             let hold = snap.backoff_until.saturating_sub(now_ms()) / 1000;
             broadcast(&app, snap);

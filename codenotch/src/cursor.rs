@@ -264,6 +264,8 @@ pub fn parse_summary(v: &serde_json::Value) -> (Vec<LimitWindow>, String) {
 
 enum FetchErr {
     NeedsAuth,
+    /// Suggested wait in seconds, from Retry-After where the server sent one.
+    RateLimited(u64),
     Other(String),
 }
 
@@ -272,6 +274,12 @@ fn fetch_once(cookie: &str) -> Result<serde_json::Value, FetchErr> {
     match agent.get(ENDPOINT).set("Cookie", cookie).set("Accept", "application/json").call() {
         Ok(r) => r.into_json::<serde_json::Value>().map_err(|e| FetchErr::Other(format!("parse: {e}"))),
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => Err(FetchErr::NeedsAuth),
+        // 429 was previously indistinguishable from any other failure, so a rate-limited
+        // Cursor kept being asked every five minutes with no acknowledgement that it had
+        // said no. Named so the caller can hold off and say why.
+        Err(ureq::Error::Status(429, r)) => Err(FetchErr::RateLimited(
+            r.header("retry-after").and_then(|s| s.parse::<u64>().ok()).unwrap_or(300),
+        )),
         Err(ureq::Error::Status(code, _)) => Err(FetchErr::Other(format!("HTTP {code}"))),
         Err(e) => Err(FetchErr::Other(format!("{e}"))),
     }
@@ -321,6 +329,13 @@ fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
             snap.status = "needsAuth".into();
             snap.note = "Cursor session was rejected — sign in again in the editor".into();
         }
+        Err(FetchErr::RateLimited(secs)) => {
+            // Hold off rather than asking again on the next tick. A poll that keeps firing
+            // into a rate limit is how you stay rate limited.
+            snap.status = if snap.windows.is_empty() { "backoff" } else { "stale" }.into();
+            snap.note = format!("Cursor rate limited this reading, retrying in {secs}s");
+            snap.backoff_until = now_ms() + secs * 1000;
+        }
         Err(FetchErr::Other(msg)) => {
             // Stale beats invented: keep the old reading, marked stale
             snap.status = if snap.windows.is_empty() { "error" } else { "stale" }.into();
@@ -368,6 +383,19 @@ pub fn start(app: AppHandle) {
                 let s = st.cursor.lock().unwrap().clone();
                 s
             };
+            // A reading restored from disk is the same answer the endpoint would give. The
+            // hook restarts this app whenever it is not running, and without this every
+            // start spent a request here too - the same restart storm that rate-limited the
+            // Claude endpoint, just against a different host.
+            if crate::usage::too_fresh(prev.fetched_at, now_ms()) {
+                sleep_interruptible(60);
+                continue;
+            }
+            // Respect a backoff the server asked for, across restarts.
+            if prev.backoff_until > now_ms() {
+                sleep_interruptible(((prev.backoff_until - now_ms()) / 1000).clamp(1, 60));
+                continue;
+            }
             let snap = read_once(&prev);
             if snap.status == "error" || snap.status == "stale" {
                 crate::applog(&format!("cursor: {}", snap.note));

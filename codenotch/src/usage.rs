@@ -34,7 +34,18 @@ const NUDGE_EVERY_MS: u64 = 10 * 60 * 1000;
 /// - which the hook does whenever it is not running - became a tight loop against a limiter
 /// that answers with an hour of 429. Five minutes is what other readers of this endpoint
 /// settled on independently, and a usage percentage does not move meaningfully faster.
-const MIN_REFETCH_SECS: u64 = 300;
+pub const MIN_REFETCH_SECS: u64 = 300;
+
+/// Whether a persisted reading is young enough to serve instead of asking again.
+///
+/// Shared by every provider, because the problem is shared: the hook restarts this app
+/// whenever it is not running, and each start used to fetch from all four providers at once.
+/// A reading restored from disk is the same answer the endpoint would give, so honouring its
+/// age turns a restart storm into no requests at all. `fetched_at == 0` means there has never
+/// been a reading, which is exactly when one should be fetched.
+pub fn too_fresh(fetched_at: u64, now: u64) -> bool {
+    fetched_at > 0 && now.saturating_sub(fetched_at) / 1000 < MIN_REFETCH_SECS
+}
 /// Hard ceiling on requests to the usage endpoint in any rolling hour.
 ///
 /// The refetch floor already spaces normal polling to twelve an hour. This is the backstop

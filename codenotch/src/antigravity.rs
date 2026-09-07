@@ -693,6 +693,13 @@ pub fn start(app: AppHandle) {
                 let s = st.antigravity.lock().unwrap().clone();
                 s
             };
+            // Same restart-storm guard as the other providers. The local bridge is cheap,
+            // but the credential and Cloud Code fallbacks in read_once are not, and a
+            // relaunch per tool call would exercise them.
+            if crate::usage::too_fresh(prev.fetched_at, now_ms()) {
+                sleep_interruptible(60);
+                continue;
+            }
             let snap = read_once(&mut rt, &prev);
             broadcast(&app, snap);
             sleep_interruptible(POLL_SECS);
