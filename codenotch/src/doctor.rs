@@ -33,7 +33,27 @@ fn age_secs(t: SystemTime) -> u64 {
 
 pub fn run() -> String {
     let mut o = String::new();
-    o += &format!("== Codenotch doctor v{} ==\n", env!("CARGO_PKG_VERSION"));
+    // The exact binary first, so a report can never be attributed to the wrong build.
+    o += &format!("== doctor: {} ==\n", crate::version_line());
+
+    // What the app has actually spent against the usage endpoint's per-token limit, so
+    // "am I the reason for this 429" is answerable from the report rather than guessed at.
+    {
+        let u = crate::usage::load_persisted();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let recent = u
+            .request_log
+            .iter()
+            .filter(|t| now.saturating_sub(**t) < 60 * 60 * 1000)
+            .count();
+        o += &format!(
+            "usage budget: {recent} request(s) in the last hour, own ceiling {}\n",
+            crate::usage::MAX_REQUESTS_PER_HOUR
+        );
+    }
 
     let cfg = crate::config::load();
     o += &format!(

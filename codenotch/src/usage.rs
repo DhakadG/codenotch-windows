@@ -42,7 +42,7 @@ const MIN_REFETCH_SECS: u64 = 300;
 /// path that forgets the floor exists - so that no sequence of events can turn this app
 /// into the thing that rate-limits the user's account. Deliberately above normal usage and
 /// well below the point where the endpoint objects.
-const MAX_REQUESTS_PER_HOUR: usize = 20;
+pub const MAX_REQUESTS_PER_HOUR: usize = 20;
 const HOUR_MS: u64 = 60 * 60 * 1000;
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

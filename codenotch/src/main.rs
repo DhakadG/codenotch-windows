@@ -29,8 +29,32 @@ use tauri::{AppHandle, Emitter, Manager};
 
 /// Logical size of the notch window: the 70 pt pill column on the right plus room for the hover card on the left.
 pub const NOTCH_W: f64 = 340.0;
-/// Hand-bumped build tag, written to run.log at startup so a log can always be matched to the exe that wrote it.
-pub const BUILD: &str = "r31";
+/// Build identity, stamped by build.rs from the git commit rather than typed by hand.
+///
+/// Written to run.log at startup and printed by `codenotch.exe version`, so a running copy
+/// can always be matched to the source it was built from - and, just as importantly, so an
+/// installer that failed to replace the executable is immediately obvious instead of
+/// looking exactly like one that worked.
+pub const BUILD: &str = env!("CODENOTCH_BUILD");
+/// Unix seconds at which this binary was compiled.
+pub const BUILT_AT: &str = env!("CODENOTCH_BUILT_AT");
+
+/// One line identifying exactly what is running.
+pub fn version_line() -> String {
+    let built = BUILT_AT.parse::<i64>().ok().and_then(|s| {
+        chrono::DateTime::from_timestamp(s, 0).map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+    });
+    format!(
+        "Codenotch {} (build {}, compiled {})",
+        env!("CARGO_PKG_VERSION"),
+        BUILD,
+        built.unwrap_or_else(|| "unknown".into())
+    )
+}
 pub const NOTCH_H: f64 = 460.0; // 300 clipped the card once it held three window blocks plus the session list
 
 pub struct AppState {
@@ -592,6 +616,10 @@ fn main() {
             // scripted rather than only clicked.
             "refresh-creds" => {
                 report(Ok(usage::nudge_claude_credential()));
+                return;
+            }
+            "version" | "--version" | "-V" => {
+                report(Ok(version_line()));
                 return;
             }
             "autostart" => {
