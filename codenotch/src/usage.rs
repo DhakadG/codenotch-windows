@@ -44,6 +44,10 @@ const MIN_REFETCH_SECS: u64 = 300;
 /// well below the point where the endpoint objects.
 pub const MAX_REQUESTS_PER_HOUR: usize = 20;
 const HOUR_MS: u64 = 60 * 60 * 1000;
+/// How long `claude auth status` gets before it is killed. Measured at about half a second
+/// on a healthy install; ten is generous for a slow disk and still short enough that a
+/// wedged CLI cannot stall the poll thread or the tray menu.
+const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -109,6 +113,14 @@ pub struct UsageSnapshot {
     /// fetch. An in-memory counter resets with the process and so cannot see that at all.
     #[serde(default)]
     pub request_log: Vec<u64>,
+    /// Which credential earned `backoff_until`, as a non-secret fingerprint.
+    ///
+    /// `backoff_until` survives a restart but the in-memory note of *whose* backoff it was
+    /// did not, so a 429 against credential A followed by a restart and a fresh credential
+    /// B left the app waiting out A's deadline for no reason. Storing the fingerprint makes
+    /// the association survive too. It is a hash, never the token.
+    #[serde(default)]
+    pub backoff_for: String,
 }
 
 fn store_path() -> std::path::PathBuf {
@@ -216,9 +228,32 @@ pub fn nudge_claude_credential() -> String {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let out = match cmd.output() {
-        Ok(o) => o,
+    // `output()` waits forever. This runs on the poll thread and from the tray menu, so a
+    // `claude` that hangs - a stuck update check, a prompt nobody can see, a wedged network
+    // call - would take the notch's polling with it and freeze the menu handler. Spawn,
+    // wait with a deadline, and kill anything still running past it.
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => return format!("claude auth status failed to run: {e}"),
+    };
+    let deadline = std::time::Instant::now() + AUTH_STATUS_TIMEOUT;
+    let out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break child.wait_with_output().ok(),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return format!(
+                    "claude auth status did not finish within {}s and was stopped",
+                    AUTH_STATUS_TIMEOUT.as_secs()
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return format!("claude auth status could not be waited on: {e}"),
+        }
+    };
+    let Some(out) = out else {
+        return "claude auth status produced no output".into();
     };
 
     // `loggedIn:false` is a real sign-out and no amount of waiting will fix it, which is a
@@ -232,14 +267,22 @@ pub fn nudge_claude_credential() -> String {
     let changed = before != after;
     let still_expired = matches!(read_credentials(), Some((_, true)));
 
-    match (logged_in, changed, still_expired) {
-        (Some(false), _, _) => "claude reports signed out - run `claude` and sign in".into(),
-        (_, true, false) => "credential refreshed by Claude Code".into(),
-        (_, true, true) => "Claude Code rewrote the credential but it is still expired".into(),
-        (_, false, true) => {
+    let have_credential = after.is_some();
+    match (logged_in, changed, still_expired, have_credential) {
+        (Some(false), _, _, _) => "claude reports signed out - run `claude` and sign in".into(),
+        // Signed in as far as the CLI is concerned, yet nothing readable on disk. Without
+        // its own arm this fell through to "already valid", while the poll loop found no
+        // credential at all and quietly skipped every request - two components disagreeing,
+        // and the user told the reassuring half.
+        (_, _, _, false) => {
+            "Claude reports signed in, but Codenotch cannot find a usable credential - run `claude` once".into()
+        }
+        (_, true, false, _) => "credential refreshed by Claude Code".into(),
+        (_, true, true, _) => "Claude Code rewrote the credential but it is still expired".into(),
+        (_, false, true, _) => {
             "`claude auth status` did not refresh the expired credential - run `claude` once".into()
         }
-        (_, false, false) => "credential was already valid".into(),
+        (_, false, false, _) => "credential was already valid".into(),
     }
 }
 
@@ -404,6 +447,22 @@ fn fetch_once(token: &str) -> Result<Vec<LimitWindow>, FetchErr> {
     }
 }
 
+/// A short, non-secret fingerprint of a credential.
+///
+/// Used only to tell one token from another across restarts. It is deliberately not
+/// reversible and never leaves the machine; the whole point is to avoid persisting the
+/// token itself just to answer "is this still the credential that got rate limited?".
+fn credential_fingerprint(token: &str) -> String {
+    // FNV-1a. A cryptographic hash would be misleading here - this defends against nothing,
+    // it only distinguishes - and pulling in a dependency to do it would be worse.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in token.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
 /// Drops request timestamps older than an hour and reports how many remain.
 ///
 /// Kept separate from the check so the pruning is testable on its own, and so a caller
@@ -453,9 +512,6 @@ pub fn start(app: AppHandle) {
             let _ = app.emit("usage", &snap);
         }
         let mut consecutive_429: u32 = 0;
-        // The credential that earned the current backoff. When the file changes, whatever
-        // the server objected to has changed too, so the wait no longer applies.
-        let mut backoff_token: Option<String> = None;
         // When the expired-credential nudge last ran, so it stays occasional.
         let mut last_nudge: Option<u64> = None;
         // Set when an explicit refresh request was consumed by a wait, so the next pass
@@ -466,13 +522,29 @@ pub fn start(app: AppHandle) {
             // means the next request is a different request, and sitting out the remainder
             // of an hour-long Retry-After after the user has already fixed the problem is
             // the difference between "briefly unavailable" and "apparently broken".
-            if backoff_token.is_some() && read_credentials().map(|(t, _)| t) != backoff_token {
-                set_and_broadcast(&app, |u| {
-                    u.backoff_until = 0;
-                    u.note.clear();
-                });
-                backoff_token = None;
-                consecutive_429 = 0;
+            // Compare against the persisted fingerprint rather than an in-memory copy, so
+            // the association survives a restart. Without this a 429 earned by credential A
+            // outlived the process that learned about it: the deadline came back from disk,
+            // the note of whose it was did not, and a fresh credential B waited out A's
+            // hour for nothing.
+            {
+                let current = read_credentials().map(|(t, _)| credential_fingerprint(&t));
+                let st = app.state::<AppState>();
+                let mut u = st.usage.lock().unwrap();
+                let mismatch = u.backoff_until > 0
+                    && (u.backoff_for.is_empty() || Some(&u.backoff_for) != current.as_ref());
+                if mismatch {
+                    let snap = {
+                        u.backoff_until = 0;
+                        u.backoff_for.clear();
+                        u.note.clear();
+                        u.clone()
+                    };
+                    drop(u);
+                    persist(&snap);
+                    let _ = app.emit("usage", &snap);
+                    consecutive_429 = 0;
+                }
             }
             // The expired-credential case is settled before the backoff gate, not after.
             // A backoff only governs whether a *request* may be made, and an expired
@@ -511,7 +583,6 @@ pub fn start(app: AppHandle) {
                     };
                     u.backoff_until = 0;
                 });
-                backoff_token = None;
                 consecutive_429 = 0;
                 forced = sleep_interruptible(POLL_ACTIVE_SECS);
                 continue;
@@ -530,6 +601,19 @@ pub fn start(app: AppHandle) {
             // A reading restored from disk is still a reading. Honour its age rather than
             // re-fetching the moment the process starts, or every relaunch spends a request
             // on a number that has not changed.
+            // "No credential at all" is reported before the freshness gate, not after. The
+            // gate exists to avoid spending requests, and this case spends none - so
+            // sitting behind it only meant a signed-out user kept looking at a five minute
+            // old reading with no explanation of why it had stopped moving.
+            if read_credentials().is_none() {
+                set_and_broadcast(&app, |u| {
+                    u.status = if u.windows.is_empty() { "needsAuth".into() } else { "stale".into() };
+                    u.note = "No Claude Code credential found. Run `claude` in a terminal and sign in.".into();
+                });
+                forced = sleep_interruptible(POLL_ACTIVE_SECS);
+                continue;
+            }
+
             let age_secs = now.saturating_sub(fetched_at) / 1000;
             if fetched_at > 0 && age_secs < MIN_REFETCH_SECS && !forced {
                 forced = sleep_interruptible((MIN_REFETCH_SECS - age_secs).clamp(1, 30));
@@ -568,10 +652,15 @@ pub fn start(app: AppHandle) {
                     u.status = "needsAuth".into();
                     u.note = "No Claude Code credential found".into();
                 }),
-                // Unreachable in practice: the expired case is handled above, before the
-                // backoff gate. Kept so the match stays total and a future edit that moves
-                // that check cannot silently start sending dead tokens again.
-                Some((_, true)) => {}
+                // Reachable despite the check above: the credential is read again here, and
+                // in between it can have expired on the clock, or Claude Code can have
+                // replaced it with one that is already expired. Doing nothing in this arm
+                // was worse than the bug it guarded - a silent no-op tick - and sending the
+                // token is what earns a false 429. Report it and wait.
+                Some((_, true)) => set_and_broadcast(&app, |u| {
+                    u.status = if u.windows.is_empty() { "needsAuth".into() } else { "stale".into() };
+                    u.note = "Claude Code's saved credential has expired. Run `claude` in a terminal to refresh it.".into();
+                }),
                 // An expired token is never worth a request. Sending one to
                 // api.anthropic.com/api/oauth/usage does not come back as 401: the endpoint
                 // answers 429 with a Retry-After of an hour, so a single doomed request
@@ -580,8 +669,12 @@ pub fn start(app: AppHandle) {
                 Some((token, _)) => {
                     // On 401/403 re-read the credential and retry once (Claude Code may have just refreshed it)
                     let result = match fetch_once(&token) {
+                        // Retry once with a genuinely different, unexpired credential:
+                        // Claude Code may have refreshed it mid-flight. `false` matters -
+                        // retrying with a replacement that is itself expired just spends a
+                        // second request to earn the same rejection.
                         Err(FetchErr::NeedsAuth) => match read_credentials() {
-                            Some((t2, _)) if t2 != token => fetch_once(&t2),
+                            Some((t2, false)) if t2 != token => fetch_once(&t2),
                             _ => Err(FetchErr::NeedsAuth),
                         },
                         other => other,
@@ -590,13 +683,13 @@ pub fn start(app: AppHandle) {
                     match result {
                         Ok(windows) => {
                             consecutive_429 = 0;
-                            backoff_token = None;
                             set_and_broadcast(&app, |u| {
                                 u.status = "ok".into();
                                 u.windows = windows;
                                 u.fetched_at = now_ms();
                                 u.note.clear();
                                 u.backoff_until = 0;
+                                u.backoff_for.clear();
                             });
                         }
                         Err(FetchErr::NeedsAuth) => set_and_broadcast(&app, |u| {
@@ -606,8 +699,9 @@ pub fn start(app: AppHandle) {
                         Err(FetchErr::RateLimited(ra)) => {
                             consecutive_429 += 1;
                             let wait = backoff_secs(consecutive_429 - 1, ra);
-                            backoff_token = Some(token.clone());
+                            let fingerprint = credential_fingerprint(&token);
                             set_and_broadcast(&app, |u| {
+                                u.backoff_for = fingerprint;
                                 // The status is always set, never left as whatever the
                                 // previous iteration wrote. It used to be updated only when
                                 // there were windows to keep, so a needsAuth from an earlier

@@ -166,17 +166,48 @@ fn is_token_char(c: char) -> bool {
 }
 
 fn redact_line(line: &str) -> String {
-    // `Bearer <token>` first: the token that follows may be short enough to survive the
-    // length rule below, and the keyword alone is proof of what it is.
-    let lowered = line.to_ascii_lowercase();
-    if let Some(at) = lowered.find("bearer ") {
-        let (head, tail) = line.split_at(at + "bearer ".len());
-        let rest = tail.trim_start();
-        if !rest.is_empty() {
-            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            return format!("{head}[redacted]{}", &rest[end..]);
+    // `Bearer <token>` first, and for *every* occurrence. This used to redact only the
+    // first and return, so a line carrying two credentials - a request log showing an old
+    // and a retried header, say - printed the second one in full. A redactor that stops at
+    // the first match is worse than none, because it looks like it worked.
+    let mut line = std::borrow::Cow::Borrowed(line);
+    let mut from = 0usize;
+    loop {
+        let lowered = line.to_ascii_lowercase();
+        let Some(at) = lowered[from..].find("bearer ").map(|i| from + i) else {
+            break;
+        };
+        let after = at + "bearer ".len();
+        let rest = &line[after..];
+        let trimmed = rest.trim_start();
+        if trimmed.is_empty() {
+            break;
         }
+        let lead = rest.len() - trimmed.len();
+        let mut end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        // Give back trailing punctuation. A token written as `Bearer abc123, next` ends at
+        // the comma, not after it, and swallowing the separator mangles the line it was
+        // meant to keep readable.
+        while end > 0 {
+            let last = trimmed[..end].chars().next_back().unwrap_or(' ');
+            if matches!(last, ',' | ';' | ')' | ']' | '}' | '"' | '\'' | '.') {
+                end -= last.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let replaced = format!(
+            "{}{}[redacted]{}",
+            &line[..after],
+            &rest[..lead],
+            &trimmed[end..]
+        );
+        // Continue past what was just written, so a later credential on the same line is
+        // still found and the loop cannot rediscover the same keyword forever.
+        from = after + lead + "[redacted]".len();
+        line = std::borrow::Cow::Owned(replaced);
     }
+    let line = line.as_ref();
 
     let mut out = String::with_capacity(line.len());
     let mut run = String::new();

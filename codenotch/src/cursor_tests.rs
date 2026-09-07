@@ -171,8 +171,20 @@ fn a_plan_with_nothing_to_meter_says_so() {
 
 #[test]
 fn an_unknown_membership_type_still_produces_readable_copy() {
-    let (_, note) = parse_summary(&json!({}));
-    assert_eq!(note, "The this plan has nothing for Cursor to meter yet");
+    // The plan name is optional, and the sentence has to survive its absence. Substituting
+    // a placeholder into "the {} plan" used to print "The this plan has nothing...".
+    assert_eq!(
+        parse_summary(&json!({})).1,
+        "This plan has nothing for Cursor to meter yet"
+    );
+    assert_eq!(
+        parse_summary(&json!({ "membershipType": "" })).1,
+        "This plan has nothing for Cursor to meter yet"
+    );
+    assert_eq!(
+        parse_summary(&json!({ "isUnlimited": true })).1,
+        "Unlimited on this plan — nothing to meter"
+    );
 }
 
 #[test]

@@ -598,9 +598,6 @@ pub fn mark_user_quit() {
 
 fn main() {
     attach_console();
-    // Any start at all - tray, autostart, hook launch, or the user double-clicking - means
-    // the application is wanted again, so the quit marker never outlives one session.
-    let _ = std::fs::remove_file(quit_marker_path());
     let args: Vec<String> = std::env::args().collect();
     if let Some(cmd) = args.get(1) {
         match cmd.as_str() {
@@ -641,6 +638,13 @@ fn main() {
             _ => {}
         }
     }
+
+    // Only a real launch clears the quit marker, which is why this sits after the
+    // subcommands rather than before them. `doctor`, `version` and `refresh-creds` all exit
+    // without starting anything, and clearing the marker on their way past told the hook
+    // that the user had changed their mind - so running `codenotch.exe doctor` after
+    // quitting brought the whole application back on the next tool call.
+    let _ = std::fs::remove_file(quit_marker_path());
 
     let cfg = config::load();
     let port = cfg.port;

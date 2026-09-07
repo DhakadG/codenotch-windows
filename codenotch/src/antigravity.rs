@@ -233,6 +233,13 @@ fn local_agent() -> Option<ureq::Agent> {
 fn bridge_quota(ep: &Endpoint) -> Result<Vec<LimitWindow>, String> {
     let agent = local_agent().ok_or("TLS setup failed")?;
     let mut last = String::from("no port answered");
+    // Whether any port replied with a well-formed quota document that simply listed no
+    // groups. That is a working bridge reporting nothing to meter, which is a different
+    // outcome from every port refusing, timing out or returning something unparseable -
+    // and reporting it as "the quota RPC failed" sent people looking for a fault that was
+    // not there. Only settled after every port has been tried, so that a genuinely empty
+    // answer from the first port cannot mask real windows on the second.
+    let mut answered_empty = false;
     for port in &ep.ports {
         let url = format!("https://127.0.0.1:{port}{LS_SERVICE}");
         match agent
@@ -247,6 +254,7 @@ fn bridge_quota(ep: &Endpoint) -> Result<Vec<LimitWindow>, String> {
                     if !w.is_empty() {
                         return Ok(w);
                     }
+                    answered_empty = true;
                     last = format!("port {port}: no recognisable groups");
                 }
                 Err(e) => last = format!("port {port}: {e}"),
@@ -254,6 +262,9 @@ fn bridge_quota(ep: &Endpoint) -> Result<Vec<LimitWindow>, String> {
             Err(ureq::Error::Status(code, _)) => last = format!("port {port}: HTTP {code}"),
             Err(e) => last = format!("port {port}: {e}"),
         }
+    }
+    if answered_empty {
+        return Ok(Vec::new());
     }
     Err(last)
 }

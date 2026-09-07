@@ -220,11 +220,18 @@ pub fn parse_summary(v: &serde_json::Value) -> (Vec<LimitWindow>, String) {
     if !out.is_empty() {
         return (out, String::new());
     }
-    let membership = v.get("membershipType").and_then(|x| x.as_str()).unwrap_or("this");
-    let note = if v.get("isUnlimited").and_then(|x| x.as_bool()) == Some(true) {
-        format!("Unlimited on the {membership} plan — nothing to meter")
-    } else {
-        format!("The {membership} plan has nothing for Cursor to meter yet")
+    // Named plan or not, the sentence has to read. Substituting a placeholder into "the
+    // {} plan" produced "The this plan has nothing for Cursor to meter yet".
+    let membership = v
+        .get("membershipType")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty());
+    let unlimited = v.get("isUnlimited").and_then(|x| x.as_bool()) == Some(true);
+    let note = match (unlimited, membership) {
+        (true, Some(m)) => format!("Unlimited on the {m} plan — nothing to meter"),
+        (true, None) => "Unlimited on this plan — nothing to meter".to_string(),
+        (false, Some(m)) => format!("The {m} plan has nothing for Cursor to meter yet"),
+        (false, None) => "This plan has nothing for Cursor to meter yet".to_string(),
     };
     (out, note)
 }

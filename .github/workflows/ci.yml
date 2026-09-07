@@ -26,17 +26,23 @@ jobs:
     name: fmt, clippy, test, build
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The build needs the code, not the token. Left persisted, the checkout
+          # credential stays in .git/config for every later step, including
+          # third-party actions and build scripts - a write-capable token sitting
+          # where nothing needs it.
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt, clippy
 
       # Caches the registry, the git checkouts and target/. The first build compiles
       # SQLite from C, which is the slow part; without a cache every run pays for it.
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # `cargo fmt --check` is deliberately not a gate. The tree predates this workflow and
       # differs from rustfmt in 169 places, almost all of it in the original author's code.
@@ -72,7 +78,13 @@ jobs:
     name: dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The build needs the code, not the token. Left persisted, the checkout
+          # credential stays in .git/config for every later step, including
+          # third-party actions and build scripts - a write-capable token sitting
+          # where nothing needs it.
+          persist-credentials: false
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

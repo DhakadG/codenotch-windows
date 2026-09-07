@@ -23,6 +23,13 @@ fn settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
 }
 
+/// Substrings that identify a hook command as ours.
+///
+/// The session engine shipped under two earlier names before this app existed, and installs
+/// made by those builds are still out there. One list, used by both `is_ours` and
+/// `is_installed`, so the two can never disagree about what counts as installed.
+const HOOK_COMMAND_MARKERS: &[&str] = &["codenotch-hook", "eatbean-hook", "pacman-hook"];
+
 fn is_ours(entry: &Value) -> bool {
     entry["hooks"]
         .as_array()
@@ -30,7 +37,7 @@ fn is_ours(entry: &Value) -> bool {
             hs.iter().any(|h| {
                 h["command"]
                     .as_str()
-                    .map(|c| c.contains("codenotch-hook") || c.contains("eatbean-hook") || c.contains("pacman-hook"))
+                    .map(|c| HOOK_COMMAND_MARKERS.iter().any(|m| c.contains(m)))
                     .unwrap_or(false)
             })
         })
@@ -59,11 +66,21 @@ fn backup_and_write(path: &PathBuf, root: &Value) -> Result<(), String> {
     std::fs::write(path, txt).map_err(|e| e.to_string())
 }
 
+/// Whether any of our hook entries are present, under any name we have ever used.
+///
+/// This has to agree with `is_ours`, which also claims the two legacy names the session
+/// engine shipped under before it was called Codenotch. It used to test for the current
+/// name alone, which was harmless while the tray offered install *and* uninstall at all
+/// times - a user with only legacy entries could still remove them. Now that the menu shows
+/// one action or the other, a narrower predicate here would show "install" to exactly the
+/// people who need "uninstall", and put their entries out of reach: `merge_install` only
+/// rewrites the seven events in `WIRING`, so a legacy entry filed under any other event
+/// would stay in the file forever.
 pub fn is_installed() -> bool {
-    settings_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| t.contains("codenotch-hook"))
-        .unwrap_or(false)
+    let Some(text) = settings_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return false;
+    };
+    HOOK_COMMAND_MARKERS.iter().any(|m| text.contains(m))
 }
 
 /// Merges our wiring into an already-parsed settings document.

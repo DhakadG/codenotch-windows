@@ -51,6 +51,28 @@ fn a_bearer_token_is_redacted_whatever_its_shape() {
 }
 
 #[test]
+fn every_credential_on_a_line_is_redacted_not_just_the_first() {
+    // The regression this exists for: redaction stopped at the first match and returned, so
+    // a line carrying two credentials printed the second one in full. Half-redacted is
+    // worse than not redacted, because it looks like it worked.
+    assert_eq!(
+        redact("retry: Bearer aaa111 replaced Bearer bbb222 ok"),
+        "retry: Bearer [redacted] replaced Bearer [redacted] ok"
+    );
+    assert_eq!(
+        redact("Bearer aaa Bearer bbb Bearer ccc"),
+        "Bearer [redacted] Bearer [redacted] Bearer [redacted]"
+    );
+    // Mixed formats on one line: a bearer header and a prefixed key.
+    let mixed = redact("hdr: Bearer aaa111, key=sk-ant-api03-BBBB, done");
+    assert_eq!(mixed, "hdr: Bearer [redacted], key=[redacted], done");
+    // And a bearer token that is itself a JWT must not leave the JWT behind.
+    let out = redact("a Bearer eyJhbGci.eyJzdWIi.sig b Bearer second");
+    assert!(!out.contains("eyJ"), "JWT survived: {out}");
+    assert!(!out.contains("second"), "second token survived: {out}");
+}
+
+#[test]
 fn redaction_applies_to_every_line_not_just_the_first() {
     let s = "line one is fine\ntoken eyJhbGci.eyJzdWIi.sig\nline three is fine\n";
     let out = redact(s);
