@@ -131,14 +131,25 @@ jobs:
           Get-ChildItem target/release/bundle/nsis/*.exe |
             ForEach-Object { ./scripts/sign.ps1 -Path $_.FullName }
 
-      - name: Checksums
+      # Released artifacts carry the same identity as locally built ones. A downloaded
+      # installer whose name is only its version cannot be tied back to a commit, which is the
+      # whole reason scripts/build.ps1 exists - and a release is the copy most likely to be
+      # reported against, so it is the copy that most needs to say what it is.
+      - name: Name and checksum the artifacts
         shell: pwsh
         run: |
           $out = 'dist'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-          Copy-Item target/release/bundle/nsis/*.exe $out
+          $sha = git rev-parse --short=12 HEAD
+          $version = '${{ steps.version.outputs.version }}'
+          # A tagged build is by definition a clean checkout, so no dirty marker and no
+          # timestamp are needed: the commit alone identifies it.
+          Get-ChildItem target/release/bundle/nsis/*-setup.exe | ForEach-Object {
+            Copy-Item $_.FullName (Join-Path $out "Codenotch-$version+$sha-setup.exe")
+          }
           Get-ChildItem $out -Filter *.exe | ForEach-Object {
             $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)" | Out-File "$($_.FullName).sha256" -Encoding ascii
             "$h  $($_.Name)"
           } | Out-File "$out/SHA256SUMS.txt" -Encoding ascii
           Get-Content "$out/SHA256SUMS.txt"
