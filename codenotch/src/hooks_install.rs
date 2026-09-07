@@ -15,6 +15,10 @@ const WIRING: &[(&str, bool, &str)] = &[
     ("SessionEnd", false, "session_end"),
 ];
 
+#[cfg(test)]
+#[path = "hooks_install_tests.rs"]
+mod tests;
+
 fn settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
 }
@@ -62,6 +66,69 @@ pub fn is_installed() -> bool {
         .unwrap_or(false)
 }
 
+/// Merges our wiring into an already-parsed settings document.
+///
+/// Split out from [`install`] so the merge rules can be tested without a home directory:
+/// the caller owns every filesystem decision, this function owns every JSON decision.
+///
+/// Idempotent. Our own older entries are removed before the new ones are added, so
+/// installing twice leaves exactly one entry per event rather than two.
+fn merge_install(root: &mut Value, hook_exe: &str) {
+    if !root.is_object() {
+        *root = json!({});
+    }
+    if !root["hooks"].is_object() {
+        root["hooks"] = json!({});
+    }
+
+    for (event, need_matcher, internal) in WIRING {
+        let arr = root["hooks"][*event].as_array().cloned().unwrap_or_default();
+        // Remove our own older entries first
+        let mut arr: Vec<Value> = arr.into_iter().filter(|e| !is_ours(e)).collect();
+        let cmd = format!("\"{hook_exe}\" {internal}");
+        let mut entry = json!({
+            "hooks": [{ "type": "command", "command": cmd, "timeout": 5 }]
+        });
+        if *need_matcher {
+            entry["matcher"] = json!("*");
+        }
+        arr.push(entry);
+        root["hooks"][*event] = json!(arr);
+    }
+}
+
+/// Removes our wiring from an already-parsed settings document, returning how many
+/// entries went. The inverse of [`merge_install`]: an event array that we emptied is
+/// removed entirely, so a settings file we had added `Stop` to does not keep a `"Stop": []`
+/// afterwards. Events the user configured themselves keep their remaining entries.
+fn merge_uninstall(root: &mut Value) -> usize {
+    // get_mut, not `root["hooks"]`: indexing a Value mutably *inserts* a null for a missing
+    // key, so uninstalling from a settings file that has no hooks section would write a
+    // `"hooks": null` into it — an edit to the user's file made by the code whose whole job
+    // is to leave it as it found it.
+    let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return 0;
+    };
+    let mut removed = 0;
+    let mut emptied: Vec<String> = Vec::new();
+    for (event, v) in hooks.iter_mut() {
+        if let Some(arr) = v.as_array() {
+            let filtered: Vec<Value> = arr.iter().filter(|e| !is_ours(e)).cloned().collect();
+            let dropped = arr.len() - filtered.len();
+            removed += dropped;
+            if filtered.is_empty() && dropped > 0 {
+                emptied.push(event.clone());
+            } else {
+                *v = json!(filtered);
+            }
+        }
+    }
+    for event in emptied {
+        hooks.remove(&event);
+    }
+    removed
+}
+
 pub fn install() -> Result<String, String> {
     let path = settings_path().ok_or("cannot find the user directory")?;
     let hook_exe = std::env::current_exe()
@@ -74,28 +141,7 @@ pub fn install() -> Result<String, String> {
     }
 
     let mut root = load(&path);
-    if !root.is_object() {
-        root = json!({});
-    }
-    if !root["hooks"].is_object() {
-        root["hooks"] = json!({});
-    }
-
-    for (event, need_matcher, internal) in WIRING {
-        let arr = root["hooks"][*event].as_array().cloned().unwrap_or_default();
-        // Remove our own older entries first
-        let mut arr: Vec<Value> = arr.into_iter().filter(|e| !is_ours(e)).collect();
-        let cmd = format!("\"{}\" {}", hook_exe.display(), internal);
-        let mut entry = json!({
-            "hooks": [{ "type": "command", "command": cmd, "timeout": 5 }]
-        });
-        if *need_matcher {
-            entry["matcher"] = json!("*");
-        }
-        arr.push(entry);
-        root["hooks"][*event] = json!(arr);
-    }
-
+    merge_install(&mut root, &hook_exe.display().to_string());
     backup_and_write(&path, &root)?;
     Ok(format!("wrote {} ({} events)", path.display(), WIRING.len()))
 }
@@ -106,17 +152,10 @@ pub fn uninstall() -> Result<String, String> {
         return Ok("settings.json does not exist, nothing to uninstall".into());
     }
     let mut root = load(&path);
-    let Some(hooks) = root["hooks"].as_object_mut() else {
+    if !root["hooks"].is_object() {
         return Ok("no hooks configuration found".into());
-    };
-    let mut removed = 0;
-    for (_, v) in hooks.iter_mut() {
-        if let Some(arr) = v.as_array() {
-            let filtered: Vec<Value> = arr.iter().filter(|e| !is_ours(e)).cloned().collect();
-            removed += arr.len() - filtered.len();
-            *v = json!(filtered);
-        }
     }
+    let removed = merge_uninstall(&mut root);
     backup_and_write(&path, &root)?;
     Ok(format!("removed {removed} Codenotch hook(s)"))
 }
