@@ -89,13 +89,38 @@ fn install_sets_a_timeout_so_a_wedged_hook_cannot_hang_claude_code() {
 }
 
 #[test]
-fn only_tool_events_get_a_matcher() {
+fn a_matcher_is_present_exactly_where_the_wiring_says() {
     let root = install_fresh();
     for (event, need_matcher, _) in WIRING {
         let has = root["hooks"][*event][0].get("matcher").is_some();
         assert_eq!(has, *need_matcher, "matcher presence wrong for {event}");
     }
-    assert_eq!(root["hooks"]["PreToolUse"][0]["matcher"], json!("*"));
+}
+
+#[test]
+fn no_hook_is_wired_to_a_per_tool_call_event() {
+    // The guard for the defect that made sessions freeze. Claude Code starts a POSIX shell
+    // for every hook invocation, and on a machine whose `bash` is the WSL one that shell took
+    // up to 4.2 seconds to start - against 57 ms for the messenger it runs. Wired to
+    // PreToolUse and PostToolUse, that cost was paid twice on every tool call.
+    //
+    // Anything that fires per tool call belongs nowhere near this list, however useful the
+    // event is: the transcript watcher already reports tool-level activity without spawning
+    // anything at all.
+    const PER_TOOL_CALL: &[&str] = &["PreToolUse", "PostToolUse"];
+    for (event, _, _) in WIRING {
+        assert!(
+            !PER_TOOL_CALL.contains(event),
+            "{event} fires on every tool call and must not be wired to a hook"
+        );
+    }
+    let root = install_fresh();
+    for event in PER_TOOL_CALL {
+        assert!(
+            ours(&root, event).is_empty(),
+            "{event} must not receive one of our entries"
+        );
+    }
 }
 
 #[test]
@@ -125,8 +150,14 @@ fn install_preserves_the_users_own_hooks_and_settings() {
     let mut root = json!({
         "model": "opus",
         "hooks": {
+            // An event we do wire, so the sharing behaviour is exercised.
+            "Stop": [
+                { "hooks": [{ "type": "command", "command": "echo audit" }] }
+            ],
+            // An event we never wire, and one that fires per tool call, so both kinds of
+            // "not ours" are covered.
             "PreToolUse": [
-                { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo audit" }] }
+                { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo pretool" }] }
             ],
             "PreCompact": [
                 { "hooks": [{ "type": "command", "command": "echo compacting" }] }
@@ -137,14 +168,16 @@ fn install_preserves_the_users_own_hooks_and_settings() {
 
     // Unrelated top-level settings are untouched.
     assert_eq!(root["model"], json!("opus"));
-    // An event we do not wire is untouched.
+    // Events we do not wire are untouched, including the user's own per-tool-call hook.
     assert_eq!(entries(&root, "PreCompact").len(), 1);
+    assert_eq!(entries(&root, "PreToolUse").len(), 1);
+    assert_eq!(entries(&root, "PreToolUse")[0]["hooks"][0]["command"], json!("echo pretool"));
     // An event we share keeps the user's entry, and ours is appended rather than inserted
     // ahead of it, so their ordering assumptions survive.
-    let pre = entries(&root, "PreToolUse");
-    assert_eq!(pre.len(), 2);
-    assert_eq!(pre[0]["hooks"][0]["command"], json!("echo audit"));
-    assert!(is_ours(&pre[1]));
+    let stop = entries(&root, "Stop");
+    assert_eq!(stop.len(), 2);
+    assert_eq!(stop[0]["hooks"][0]["command"], json!("echo audit"));
+    assert!(is_ours(&stop[1]));
 }
 
 #[test]

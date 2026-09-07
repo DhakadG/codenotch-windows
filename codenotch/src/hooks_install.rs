@@ -5,11 +5,27 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 /// (Claude Code event name, whether it needs a matcher, the internal event reported to Codenotch)
+///
+/// `PreToolUse` and `PostToolUse` are deliberately absent, and this is the most important
+/// decision in this file.
+///
+/// Claude Code runs a hook command through a POSIX shell, and the cost of starting that shell
+/// is the cost of the hook - not the program it runs. Measured on a Windows machine where the
+/// `bash` on PATH is the WSL one: `bash -c true` averaged 673 ms and peaked at 4.2 seconds,
+/// against 57 ms for the messenger itself. Wired to the two tool events, with a `*` matcher,
+/// that was paid twice on *every single tool call*, which is why sessions visibly froze while
+/// this app was installed and recovered the moment it was removed.
+///
+/// The remaining five fire a handful of times per session - when it starts, when a prompt is
+/// submitted, when Claude wants attention, when it stops, when it ends - so the shell cost is
+/// paid a handful of times instead of hundreds. Tool-level activity is not lost either: the
+/// transcript watcher already reports it, independently of hooks, which is why the notch
+/// showed live session state during the period when no hooks were installed at all.
+///
+/// Anything added here should be judged by how often it fires, not by how useful it is.
 const WIRING: &[(&str, bool, &str)] = &[
     ("SessionStart", false, "session_start"),
     ("UserPromptSubmit", false, "running"),
-    ("PreToolUse", true, "running"),
-    ("PostToolUse", true, "running"),
     ("Notification", false, "attention"),
     ("Stop", false, "done"),
     ("SessionEnd", false, "session_end"),
