@@ -570,6 +570,12 @@ pub fn start(app: AppHandle) {
         // fetches even though the cached reading is still young.
         let mut forced = false;
         loop {
+            // Switched off in the tray: keep the last reading, spend nothing. Checked here
+            // rather than at start-up so switching it back on resumes without a restart.
+            if crate::config::is_disconnected("claude") {
+                forced = sleep_interruptible(60);
+                continue;
+            }
             // A backoff is tied to one credential. Claude Code rewriting .credentials.json
             // means the next request is a different request, and sitting out the remainder
             // of an hour-long Retry-After after the user has already fixed the problem is

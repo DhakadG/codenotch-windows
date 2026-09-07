@@ -712,6 +712,14 @@ pub fn start(app: AppHandle) {
         }
         let mut rt = Runtime { endpoint: None, ever_bridged: false };
         loop {
+            // Switched off in the tray: keep the last reading, spend nothing. Checked here
+            // rather than at start-up so switching it back on resumes without a restart.
+            // The id is "gemini" because that is what the tray and the page call this
+            // provider; the module is named after the application it reads.
+            if crate::config::is_disconnected("gemini") {
+                sleep_interruptible(60);
+                continue;
+            }
             let prev = {
                 let st = app.state::<AppState>();
                 let s = st.antigravity.lock().unwrap().clone();

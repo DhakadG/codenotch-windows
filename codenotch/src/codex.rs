@@ -549,6 +549,17 @@ pub fn start(app: AppHandle) {
             }
         }
         loop {
+            // Switched off in the tray: keep the last reading, spend nothing. Checked here
+            // rather than at start-up so switching it back on resumes without a restart.
+            if crate::config::is_disconnected("codex") {
+                for _ in 0..60 {
+                    if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                continue;
+            }
             // Serve a young persisted reading rather than fetching on every start. The hook
             // relaunches this app whenever it is not running, so without this each restart
             // spent a request against chatgpt.com as well.
