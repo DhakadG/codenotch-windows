@@ -461,8 +461,8 @@ function esc(s){const d=document.createElement('div');d.textContent=s||'';return
 /* Hover: stays expanded while either the pill or the card is under the cursor; collapses after a 250 ms grace period (upstream motion rule) */
 const card=document.getElementById('card'), pill=document.getElementById('pill');
 let hideTimer=null;
-function showCard(){clearTimeout(hideTimer);card.classList.add('show');renderCard();armWatchdog();} // show first, then render: placeCard needs offsetHeight
-function hideCard(){card.classList.remove('show');invoke('set_expanded',{on:false,rects:null}).catch(()=>{});}
+function showCard(){clearTimeout(hideTimer);card.classList.add("show");renderCard();armWatchdog();syncInteractive();} // show first, then render: placeCard needs offsetHeight
+function hideCard(){card.classList.remove("show");invoke("set_expanded",{on:false,rects:null}).catch(()=>{});syncInteractive();}
 function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(hideCard,250);}
 // ===== Diagnostics + geometry =====
 function jslog(m){invoke('log_js',{msg:String(m)}).catch(()=>{});}
@@ -474,9 +474,35 @@ function rectOf(el){const r=el.getBoundingClientRect(),k=window.devicePixelRatio
 function armWatchdog(){
   requestAnimationFrame(()=>{ // wait one frame so renderCard's new content is laid out before measuring
     if(!card.classList.contains('show'))return;
-    callq('set_expanded',{on:true,rects:[rectOf(pill),rectOf(card)]}).catch(()=>{});
+    // The menu joins the hot set while it is open: without it, moving the cursor from the card
+    // onto the menu counts as leaving, and pointer_left closes the very menu being aimed at.
+    callq('set_expanded',{on:true,rects:hotRects()}).catch(()=>{});
   });
 }
+/* Everything currently on screen, for both the collapse watchdog and click-through.
+   The pill is always there; the rest join while they are shown. */
+function hotRects(){
+  const out=[rectOf(pill)];
+  for(const id of ['card','ctx','notice']){
+    const el=document.getElementById(id);
+    if(el&&el.classList.contains('show')) out.push(rectOf(el));
+  }
+  return out;
+}
+/* Click-through: the window is 340 px wide but the pill uses 70 of them, so without this the
+   transparent remainder swallows every click meant for what is underneath. Reported after a
+   frame so freshly shown elements are laid out, and again on a slow timer as a backstop — a
+   missed call here means a dead pill, which is worse than one redundant invoke per second. */
+let interactiveSyncQueued=false;
+function syncInteractive(){
+  if(interactiveSyncQueued)return;
+  interactiveSyncQueued=true;
+  requestAnimationFrame(()=>{
+    interactiveSyncQueued=false;
+    invoke('set_interactive_rects',{rects:hotRects()}).catch(()=>{});
+  });
+}
+setInterval(syncInteractive,1000);
 // Viewport fit (pure front-end fallback, independent of Rust): the window is 340 × primary scale physical px,
 // so if this page's CSS viewport is not 340 wide the WebView's DPR disagrees with the monitor; CSS zoom pulls the layout back to the design size.
 function fitZoom(){
@@ -579,7 +605,7 @@ document.addEventListener('contextmenu',e=>{
   openMenu(e.clientX,e.clientY,cell?cell.dataset.p:null);
 });
 
-function closeMenu(){const m=document.getElementById('ctx');if(m)m.classList.remove('show');}
+function closeMenu(){const m=document.getElementById("ctx");if(m)m.classList.remove("show");syncInteractive();}
 function openMenu(x,y,provider){
   const m=document.getElementById('ctx');
   const p=provider?providers().find(q=>q.id===provider):null;
@@ -598,6 +624,7 @@ function openMenu(x,y,provider){
   const w=m.offsetWidth,h=m.offsetHeight;
   m.style.left=Math.max(4,Math.min(x,window.innerWidth-w-4))+'px';
   m.style.top=Math.max(4,Math.min(y,window.innerHeight-h-4))+'px';
+  syncInteractive();
   m.onclick=ev=>{
     const it=ev.target.closest('.ctx-item');if(!it)return;
     const r=rows[+it.dataset.i];closeMenu();
@@ -611,7 +638,8 @@ listen('drag_end',()=>{dragging=false;press=null;}).catch(()=>{});
 function notice(msg){
   const n=document.getElementById('notice');
   n.textContent=msg;n.classList.add('show');
-  clearTimeout(n._h);n._h=setTimeout(()=>n.classList.remove('show'),6000);
+  syncInteractive();
+  clearTimeout(n._h);n._h=setTimeout(()=>{n.classList.remove("show");syncInteractive();},6000);
 }
 
 listen('usage',e=>{usage=e.payload||usage;renderRing();if(card.classList.contains('show'))renderCard();})

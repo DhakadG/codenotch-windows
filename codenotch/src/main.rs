@@ -445,6 +445,28 @@ fn set_expanded(on: bool, rects: Option<Vec<[f64; 4]>>) {
     *HOT.lock().unwrap() = if on { Some(rects.unwrap_or_default()) } else { None };
 }
 
+/// Everything the page currently draws, in the same physical-pixel window coordinates as `HOT`:
+/// the pill, and the card, menu and notice while they are on screen.
+///
+/// The window is 340×460 but the pill only uses a 70 pt column of it, so the rest is a
+/// transparent sheet that used to swallow every click aimed at whatever sits underneath.
+///
+/// This is upstream's `interactiveRects` under a different mechanism. `NotchHostingView` on
+/// macOS overrides `hitTest` and returns nil outside those rectangles, so AppKit resolves the
+/// click to whatever is behind — exact, per event, free. WebView2 offers no equivalent hook, so
+/// the same rule is applied the only way Windows allows: the watchdog compares the system cursor
+/// against these rectangles and toggles `WS_EX_TRANSPARENT` on the whole window. Same rule, same
+/// rectangles, sampled rather than exact — hence the margin in `point_in_rects`.
+///
+/// Empty means "the page has not told us yet", and click-through stays off — a page that fails
+/// to report must leave the app usable, not make it impossible to click.
+static INTERACTIVE_RECTS: Mutex<Vec<[f64; 4]>> = Mutex::new(Vec::new());
+
+#[tauri::command]
+fn set_interactive_rects(rects: Vec<[f64; 4]>) {
+    *INTERACTIVE_RECTS.lock().unwrap() = rects;
+}
+
 /// The WebView zoom currently applied (1.0 = uncorrected)
 static ZOOM: Mutex<f64> = Mutex::new(1.0);
 
@@ -494,6 +516,42 @@ fn report_dpr(app: AppHandle, dpr: f64, w: f64, h: f64) {
     }
 }
 
+/// Whether a point lies in any of the rectangles, with a margin.
+///
+/// The margin matters for click-through rather than for hit-testing: the cursor is sampled on a
+/// timer, so a fast approach can be a few pixels short of the pill on the tick before the click
+/// arrives. Widening the interactive area slightly costs nothing — the widened band is
+/// transparent and does nothing on click — and it removes the dead first click.
+fn point_in_rects(x: f64, y: f64, rects: &[[f64; 4]], pad: f64) -> bool {
+    rects
+        .iter()
+        .any(|r| x >= r[0] - pad && y >= r[1] - pad && x < r[0] + r[2] + pad && y < r[1] + r[3] + pad)
+}
+
+/// Make the window transparent to the mouse everywhere the page draws nothing.
+///
+/// Called on every watchdog tick. It only touches the window when the answer changes, because
+/// `set_ignore_cursor_events` is a real window-style change and calling it at 20 Hz for no reason
+/// is exactly the kind of churn that makes an always-on-top overlay feel unstable.
+fn update_click_through(app: &AppHandle) {
+    // Never during a drag: the cursor leaves the pill as the window follows it, and turning the
+    // window click-through mid-drag would hand the button press to whatever is underneath.
+    if DRAGGING.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let rects = INTERACTIVE_RECTS.lock().unwrap().clone();
+    if rects.is_empty() {
+        return; // Page has not reported yet; leave the window fully clickable.
+    }
+    let Some(w) = app.get_webview_window("notch") else { return };
+    let (Ok(pos), Ok(cur)) = (w.outer_position(), app.cursor_position()) else { return };
+    let want_ignore = !point_in_rects(cur.x - pos.x as f64, cur.y - pos.y as f64, &rects, 6.0);
+    static IGNORING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if IGNORING.swap(want_ignore, std::sync::atomic::Ordering::SeqCst) != want_ignore {
+        let _ = w.set_ignore_cursor_events(want_ignore);
+    }
+}
+
 /// WebView2's mouseleave is unreliable inside a NOACTIVATE transparent window — a cursor that
 /// leaves quickly often produces no WM_MOUSELEAVE, and the card stays up. Rather than trust DOM
 /// events, the Rust side watches the system cursor while the card is expanded and emits
@@ -501,11 +559,25 @@ fn report_dpr(app: AppHandle, dpr: f64, w: f64, h: f64) {
 /// "Outside the window" is not the test, though: the window has a 340×460 transparent area, so
 /// the cursor is compared against the hot rectangles the page reports (pill, card, and the gap
 /// between them), and two consecutive misses (300 ms) count as leaving.
+///
+/// The same cursor reading drives click-through, on a shorter tick: the window is only
+/// interactive where the page actually draws something, so everything else falls through to
+/// whatever is underneath. See `INTERACTIVE_RECTS`.
 fn start_pointer_watchdog(app: AppHandle) {
     std::thread::spawn(move || {
         let mut miss = 0u8;
+        // Three 50 ms ticks per watchdog evaluation keeps the collapse timing exactly as it was
+        // (two misses = 300 ms) while click-through reacts within 50 ms. Anything slower is felt
+        // as a click that lands nowhere because the cursor arrived at the pill first.
+        let mut tick = 0u8;
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            update_click_through(&app);
+            tick += 1;
+            if tick < 3 {
+                continue;
+            }
+            tick = 0;
             let rects = match HOT.lock().unwrap().clone() {
                 Some(r) => r,
                 None => {
@@ -523,9 +595,7 @@ fn start_pointer_watchdog(app: AppHandle) {
                 .outer_size()
                 .map(|s| lx >= 0.0 && ly >= 0.0 && lx < s.width as f64 && ly < s.height as f64)
                 .unwrap_or(true);
-            let mut inside = in_window && rects.iter().any(|r| {
-                lx >= r[0] - PAD && ly >= r[1] - PAD && lx < r[0] + r[2] + PAD && ly < r[1] + r[3] + PAD
-            });
+            let mut inside = in_window && point_in_rects(lx, ly, &rects, PAD);
             // The gap between hot rectangles (pill and card) counts as inside: use the bounding box of all of them
             if !inside && in_window && rects.len() > 1 {
                 let x0 = rects.iter().map(|r| r[0]).fold(f64::MAX, f64::min);
@@ -758,6 +828,7 @@ fn main() {
             open_provider_page,
             refresh_usage,
             open_usage_page,
+            set_interactive_rects,
             set_expanded,
             report_dpr,
             log_js,
@@ -818,4 +889,28 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("Codenotch failed to start");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::point_in_rects;
+
+    /// The pill column of a 340x460 window at 100 %: x 270..340, vertically centred.
+    const PILL: [f64; 4] = [270.0, 180.0, 70.0, 100.0];
+
+    #[test]
+    fn interactive_rect_test_covers_the_pill_and_nothing_else() {
+        assert!(point_in_rects(300.0, 200.0, &[PILL], 0.0), "middle of the pill");
+        assert!(!point_in_rects(100.0, 200.0, &[PILL], 0.0), "transparent area left of it");
+        assert!(!point_in_rects(300.0, 50.0, &[PILL], 0.0), "transparent area above it");
+        // Half-open on the far edges, so two rectangles that share a boundary do not both claim it.
+        assert!(point_in_rects(270.0, 180.0, &[PILL], 0.0), "top-left corner is inside");
+        assert!(!point_in_rects(340.0, 200.0, &[PILL], 0.0), "right edge is not");
+        // The margin exists so a cursor sampled a few pixels short still counts as arriving.
+        assert!(point_in_rects(266.0, 200.0, &[PILL], 6.0));
+        assert!(!point_in_rects(263.0, 200.0, &[PILL], 6.0));
+        // No rectangles means nothing is interactive; the caller is what decides that click-through
+        // stays off in that case, and it must not be this returning true by accident.
+        assert!(!point_in_rects(300.0, 200.0, &[], 6.0));
+    }
 }
