@@ -1,0 +1,92 @@
+# CodeRabbit configuration
+# Guide:    https://docs.coderabbit.ai/guides/configure-coderabbit
+# Reference: https://docs.coderabbit.ai/reference/yaml-template
+#
+# Written because auto review was silently skipping every pull request in this repository:
+# by default CodeRabbit only reviews pull requests whose base is the default branch, and the
+# work here is staged through an integration branch. The result was pull requests that looked
+# reviewed - a first pass had run when they were opened - while later pushes went unreviewed
+# with no indication that anything had been skipped.
+
+language: en-US
+early_access: false
+
+reviews:
+  # Assertive rather than chill: this codebase reads other applications' credential stores and
+  # edits a file the user did not create, so the cost of a missed defect is higher than the
+  # cost of a comment that turns out not to matter.
+  profile: assertive
+  high_level_summary: true
+  review_status: true
+  poem: false
+  collapse_walkthrough: false
+  # Comments only. A bot holding a merge hostage on a solo repository stops being a reviewer
+  # and starts being a gate with nobody behind it.
+  request_changes_workflow: false
+
+  auto_review:
+    enabled: true
+    # The point of this file. Work is staged on `ship-it` and lands on `main` from there, and
+    # single-purpose branches target `ship-it` rather than the default branch. Without these
+    # patterns every one of those pull requests is skipped with only a note in the summary.
+    base_branches:
+      - main
+      - ship-it
+      - 'release/.*'
+    drafts: false
+
+  path_filters:
+    # Build output and vendored assets. Reviewing a 2.8 MB installer or a lock file spends the
+    # review budget on the one part of the diff nobody can act on.
+    - '!target/**'
+    - '!dist/**'
+    - '!Cargo.lock'
+    - '!codenotch/gen/**'
+    - '!codenotch/icons/**'
+    - '!codenotch/glyphs/*.svg'
+
+  path_instructions:
+    - path: 'codenotch/src/**/*.rs'
+      instructions: |
+        This application reads credentials that belong to other programs and never writes them.
+        Flag anything that mints, refreshes, rotates or persists a provider token, and anything
+        that sends a credential value to a log, a diagnostic or an error string.
+
+        Every provider talks to a rate-limited endpoint. Flag a new network call that is not
+        behind the existing refetch floor, request ceiling and backoff, and flag any polling
+        interval shortened without a stated reason - this project has already rate-limited its
+        own user twice by polling too eagerly.
+
+        Prefer keeping a stale reading over showing none, and never invent a percentage where
+        the provider publishes no denominator.
+
+    - path: 'codenotch-hook/src/**/*.rs'
+      instructions: |
+        This binary runs on Claude Code's critical path, before and after events in someone
+        else's editor. Every operation needs a bounded timeout, and the total must be bounded
+        too. Flag anything that blocks, waits on a reply it does not use, retries in a loop, or
+        spawns a process without a cooldown. Losing an event is acceptable; adding latency is
+        not.
+
+    - path: 'codenotch/src/hooks_install.rs'
+      instructions: |
+        This edits ~/.claude/settings.json, a file the user owns and did not create. Flag any
+        change that could remove or reorder an entry this application did not write, that
+        leaves the document structurally different after an install/uninstall round trip, or
+        that stops recognising one of the legacy hook command names.
+
+    - path: '.github/workflows/**'
+      instructions: |
+        These workflows publish signed installers. Flag unpinned action references, tokens with
+        wider permissions than the job needs, and any step that would let a release be
+        published without the checks that precede it having passed.
+
+    - path: 'codenotch/ui/notch.html'
+      instructions: |
+        This runs in a transparent, always-on-top WebView. Flag animation of any property other
+        than transform and opacity, and any per-frame work on the main thread: a repaint here
+        stutters the whole desktop compositor. Flag DOM rebuilds that would restart a running
+        CSS animation.
+
+chat:
+  auto_reply: true
