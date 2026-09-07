@@ -93,5 +93,101 @@ pub fn run() -> String {
             _ => o += "  (empty — the app has not run yet, which is normal on first use, or an older build without the watcher)\n",
         }
     }
-    o
+    redact(&o)
 }
+
+/// Last line of defence before diagnostics reach a screen, a log or a bug report.
+///
+/// Every probe is written not to return a credential, but `doctor` output is pasted into
+/// issues by people who cannot audit it first, so "no probe returns a secret" is a promise
+/// that needs a guard rather than a convention. Routing the whole assembled report through
+/// one function means a future probe cannot leak by forgetting to redact.
+///
+/// Replaces anything shaped like a credential with `[redacted]`:
+///   - JWTs, which every provider here issues (`eyJ…` header followed by a dot);
+///   - Anthropic and OpenAI style prefixed API keys (`sk-ant-…`, `sk-…`);
+///   - `Bearer <token>` in any casing.
+///
+/// Deliberately **not** redacted, and this is the whole design decision: anything that is
+/// merely long. A "redact runs over N characters" rule looks safer and is worse, because
+/// the things it eats are exactly what makes a diagnostic worth reading — session UUIDs
+/// (36 characters), and Claude Code's flattened project directory names, which routinely
+/// run past 70 characters with no separator a scanner can see. A report that hides which
+/// session it read cannot answer the question it was run to answer.
+///
+/// The guarantee therefore does not rest on this function alone. `doctor_tests` reads the
+/// real credential files on the machine and asserts that no token value in them appears
+/// anywhere in the report — an exact check rather than a shape-guessing one.
+///
+/// Also not redacted: file paths (they carry the user name, but the user is the one
+/// running and reading this), port numbers, plan names and timestamps.
+fn redact(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, line) in s.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&redact_line(line));
+    }
+    if s.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// True for the character set a base64url token is built from.
+///
+/// Note what is absent: `=`, `+` and `/`. They are part of base64, but including them
+/// merges a token into whatever precedes it — `key=sk-ant-…` becomes one run beginning
+/// `key`, which then matches no prefix and is printed in full. Since redaction keys off
+/// prefixes rather than length, the padding characters buy nothing and cost correctness.
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+fn redact_line(line: &str) -> String {
+    // `Bearer <token>` first: the token that follows may be short enough to survive the
+    // length rule below, and the keyword alone is proof of what it is.
+    let lowered = line.to_ascii_lowercase();
+    if let Some(at) = lowered.find("bearer ") {
+        let (head, tail) = line.split_at(at + "bearer ".len());
+        let rest = tail.trim_start();
+        if !rest.is_empty() {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            return format!("{head}[redacted]{}", &rest[end..]);
+        }
+    }
+
+    let mut out = String::with_capacity(line.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.is_empty() {
+            return;
+        }
+        let looks_like_a_key = run.starts_with("sk-ant-") || run.starts_with("sk-");
+        let looks_like_a_jwt = run.starts_with("eyJ") && run.matches('.').count() >= 1;
+        if looks_like_a_key || looks_like_a_jwt {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in line.chars() {
+        // A dot is part of the run only while the run could still be a JWT; otherwise a
+        // sentence would be swallowed whole.
+        let in_run = is_token_char(c) || (c == '.' && run.starts_with("eyJ"));
+        if in_run {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
+#[cfg(test)]
+#[path = "doctor_tests.rs"]
+mod tests;
