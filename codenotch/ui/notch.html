@@ -242,7 +242,19 @@ function headlineOf(snap){
   if(metered.length) return metered.reduce((a,b)=> b.used>a.used?b:a);
   return snap.windows[0];
 }
-function staleOf(snap){ if(snap.status==='stale') return true; return snap.fetched_at>0 && (Date.now()-snap.fetched_at)>5*60*1000; }
+/* How old a reading may be before the cell is dimmed as stale.
+
+   Comfortably above the interval at which a reading is actually refetched, on purpose. With
+   the two equal, a ring dims the moment the first refresh is skipped or fails - which reads
+   as `nothing is being read any more` when what happened is one missed attempt out of many
+   that will keep being made. The upstream macOS app documents the same trap and keeps the
+   same margin.
+
+   This has to be revisited whenever MIN_REFETCH_SECS moves. Raising that floor to ten
+   minutes against a five minute staleness threshold would have left every ring permanently
+   dimmed while showing a perfectly current number. */
+const STALE_AFTER_MS=20*60*1000;
+function staleOf(snap){ if(snap.status==='stale') return true; return snap.fetched_at>0 && (Date.now()-snap.fetched_at)>STALE_AFTER_MS; }
 let stateSnap={sessions:[],agg:'idle'};
 
 function svgArc(r,frac,color,width,extra=''){
@@ -259,7 +271,7 @@ function headline(){ // the cell shows the most constrained window — the one t
 
 function isStale(){
   if(usage.status==='stale') return true;
-  return usage.fetched_at>0 && (Date.now()-usage.fetched_at)>5*60*1000;
+  return usage.fetched_at>0 && (Date.now()-usage.fetched_at)>STALE_AFTER_MS;
 }
 
 /* How long the window behind a reading is, inferred from which window it is.
