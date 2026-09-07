@@ -10,7 +10,7 @@
 
     This copies each build to:
 
-        dist/Codenotch-<version>+<shortsha>[-dirty]-<yyyyMMdd-HHmmss>-setup.exe
+        dist/Codenotch-<version>+<shortsha>[-dirty]-<yyyyMMdd-HHmmssfff>-setup.exe
 
     The same identity the binary reports from `codenotch.exe version`, so an installer, a
     running process and a log line can always be matched to each other and to a commit.
@@ -30,7 +30,9 @@
     Negative values are rejected.
 
 .PARAMETER SkipBuild
-    File an installer that has already been built, without rebuilding.
+    File an installer that has already been built, without rebuilding. The compiled binary's
+    stamped identity is still checked against the current source, so a leftover installer from
+    another commit cannot be filed under today's name.
 #>
 [CmdletBinding()]
 param(
@@ -53,9 +55,48 @@ function Get-SourceIdentity {
     return $sha
 }
 
+# A hash of what the source *is*, not what it is called.
+#
+# Get-SourceIdentity is a label, and two different trees can share one: an already-dirty
+# worktree reads `<sha>-dirty` before a build and `<sha>-dirty` after it, whatever was edited
+# in between. Comparing labels therefore catches a mid-build change only when the tree started
+# clean, which is the case where it matters least. Mixing HEAD with the full working-tree delta
+# changes the value for any edit to a tracked file, while the label stays the same.
+function Get-SourceFingerprint {
+    $head = (git rev-parse HEAD 2>$null)
+    if (-not $head) { return 'nogit' }
+    # `git diff HEAD` covers modified tracked files; `status --porcelain` adds untracked and
+    # staged paths, which a diff alone does not show.
+    $delta = (((git diff HEAD 2>$null) + (git status --porcelain 2>$null)) -join "`n")
+    $bytes = [Text.Encoding]::UTF8.GetBytes("$head`n$delta")
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return (-join ($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }))
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
+# Does the compiled binary carry the build identity we are about to name it after?
+#
+# Read out of the file rather than by running `codenotch.exe version`. The release binary is
+# built for the Windows subsystem, so it has no console of its own and attaches to its
+# parent's; invoked from a script with redirected output it frequently prints nothing at all,
+# which would turn "cannot read the identity" into a routine false alarm. The string build.rs
+# stamps is compiled in, so looking for it in the bytes is both reliable and cheap.
+function Test-BinaryMatchesSource {
+    param([Parameter(Mandatory)][string]$Expected)
+
+    $exe = Join-Path $repo 'target\release\codenotch.exe'
+    if (-not (Test-Path $exe)) { return $false }
+    $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+    return $text.Contains($Expected)
+}
+
 $conf = Get-Content 'codenotch\tauri.conf.json' -Raw | ConvertFrom-Json
 $version = $conf.version
 $sha = Get-SourceIdentity
+$fingerprint = Get-SourceFingerprint
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmssfff'
 
 if (-not $SkipBuild) {
@@ -69,14 +110,20 @@ if (-not $SkipBuild) {
     }
 }
 
-# The identity was captured before the build. If the tree changed or HEAD moved while cargo
-# was running, the binary was compiled from something other than what that identity names -
-# and an installer labelled with the wrong commit is worse than one labelled with none, because
-# it will be believed. build.rs stamps the binary from its own reading, so the two would also
-# disagree with each other.
-$after = Get-SourceIdentity
-if ($after -ne $sha) {
-    throw "the source changed during the build: started at $sha, now $after. Re-run once the tree is settled."
+# Did the source stay put while cargo was running? An installer labelled with the wrong commit
+# is worse than one labelled with none, because it will be believed. The fingerprint is
+# compared rather than the label, so an edit inside an already-dirty tree is caught too.
+$afterFingerprint = Get-SourceFingerprint
+if ($afterFingerprint -ne $fingerprint) {
+    throw 'the source changed while the build was running, so the artifact would not match the identity it is about to be given. Re-run once the tree is settled.'
+}
+
+# What the binary itself says. build.rs stamps this at compile time, so it is the one claim
+# that travels with the artifact - and the only way to notice that -SkipBuild is about to file
+# an installer left over from some other commit under today's name.
+if (-not (Test-BinaryMatchesSource -Expected $sha)) {
+    $hint = if ($SkipBuild) { ' Drop -SkipBuild to rebuild it.' } else { '' }
+    throw "target\release\codenotch.exe does not carry build identity '$sha', so this installer was not built from the current tree.$hint"
 }
 
 $built = Get-ChildItem 'target\release\bundle\nsis\*-setup.exe' -ErrorAction SilentlyContinue |
