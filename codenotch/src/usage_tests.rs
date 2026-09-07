@@ -262,19 +262,40 @@ fn retry_after_accepts_both_forms_the_spec_allows() {
     let header = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
     assert_eq!(retry_after_secs(Some(&header)), Some(0));
 
-    // Sub-second remainders round up. Truncating turns "wait 900 ms" into "retry now", which
-    // sends the caller straight back at a server that had just asked it not to.
-    let soon = chrono::Utc::now() + chrono::Duration::milliseconds(400);
-    let header = soon.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-    if let Some(secs) = retry_after_secs(Some(&header)) {
-        assert!(secs <= 1, "a sub-second wait should round to at most 1s, got {secs}");
-    }
-
     // Absent or unparseable: the caller decides, rather than being handed a fabricated wait.
     assert_eq!(retry_after_secs(None), None);
     assert_eq!(retry_after_secs(Some("")), None);
     assert_eq!(retry_after_secs(Some("soon")), None);
     assert_eq!(retry_after_secs(Some("-5")), None);
+}
+
+#[test]
+fn a_sub_second_wait_rounds_up_to_one() {
+    // Against a fixed clock, so the assertion is exact. The first version of this test used
+    // the wall clock and accepted `secs <= 1`, which the truncating implementation it was
+    // written to guard also satisfies - it would have passed on the bug. A test that cannot
+    // fail on the defect it names is worse than no test, because it reports a safety it never
+    // checked.
+    //
+    // The header carries whole seconds, so the fractional remainder comes from `now` sitting
+    // part-way through a second - exactly how it arises in practice.
+    let at = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:01Z").unwrap();
+    let header = at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let target = at.timestamp_millis() as u64;
+
+    for remaining_ms in [1u64, 400, 999] {
+        assert_eq!(
+            retry_after_secs_at(Some(&header), target - remaining_ms),
+            Some(1),
+            "{remaining_ms} ms remaining must round up to 1s, not down to 0"
+        );
+    }
+    // A whole second stays a whole second rather than being rounded to two.
+    assert_eq!(retry_after_secs_at(Some(&header), target - 1000), Some(1));
+    assert_eq!(retry_after_secs_at(Some(&header), target - 1001), Some(2));
+    // Exactly at the deadline, and past it, the wait is over.
+    assert_eq!(retry_after_secs_at(Some(&header), target), Some(0));
+    assert_eq!(retry_after_secs_at(Some(&header), target + 5_000), Some(0));
 }
 
 // ---------------- The request budget ----------------

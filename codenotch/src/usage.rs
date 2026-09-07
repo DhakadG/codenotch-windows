@@ -491,6 +491,16 @@ fn credential_fingerprint(token: &str) -> String {
 ///
 /// A date in the past yields zero rather than an error: the wait has already elapsed.
 pub(crate) fn retry_after_secs(header: Option<&str>) -> Option<u64> {
+    retry_after_secs_at(header, now_ms())
+}
+
+/// The same, against a caller-supplied clock.
+///
+/// Split out so the date form can be tested exactly rather than approximately. With the wall
+/// clock the only safe assertion is a range, and a range wide enough to be stable is also wide
+/// enough to pass under the truncating behaviour this is meant to prevent - a test that cannot
+/// fail on the bug it guards is worse than none, because it reports safety it has not checked.
+pub(crate) fn retry_after_secs_at(header: Option<&str>, now: u64) -> Option<u64> {
     let raw = header?.trim();
     if raw.is_empty() {
         return None;
@@ -506,7 +516,7 @@ pub(crate) fn retry_after_secs(header: Option<&str>) -> Option<u64> {
         .map(|d| d.timestamp_millis())?;
     // Round up. Truncating turns anything under a second into "retry now", so a caller told
     // to wait 900 ms would go straight back at a server that had just asked it not to.
-    Some(((when - now_ms() as i64).max(0) as u64).div_ceil(1000))
+    Some(((when - now as i64).max(0) as u64).div_ceil(1000))
 }
 
 pub(crate) fn prune_request_log(log: &mut Vec<u64>, now: u64) -> usize {
