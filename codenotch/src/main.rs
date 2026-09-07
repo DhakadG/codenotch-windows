@@ -1,4 +1,10 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
+// These two lints flag the shape of the module documentation, not the code: continuation
+// lines in the numbered lists that explain each provider's data paths. Reflowing that prose
+// would be churn of exactly the kind we chose to avoid by leaving `cargo fmt` out of CI,
+// and it would bury a real diff under whitespace in review. The docs render correctly as
+// written; revisit if they ever stop doing so.
+#![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
 mod autostart;
 mod config;
