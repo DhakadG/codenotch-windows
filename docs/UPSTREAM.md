@@ -93,6 +93,42 @@ Only five events are wired now — session start, prompt submitted, attention, s
 end — all of which fire a handful of times per session. Tool-level activity is not lost: the
 transcript watcher reports it without spawning anything.
 
+### Click-through, by sampling instead of hit testing
+
+Upstream's `NotchHostingView.hitTest` returns nil outside the rectangles the view reports as
+interactive, so AppKit resolves a click over the panel's transparent area to whatever is
+underneath. It is exact, it happens per event, and it costs nothing.
+
+WebView2 offers no equivalent hook. The same rule is applied here by comparing the system
+cursor against the same rectangles on a 50 ms tick and toggling `WS_EX_TRANSPARENT` on the
+whole window. Same rectangles, same rule, sampled rather than exact - which is why the test
+carries a small margin: the cursor can be a few pixels short of the pill on the tick before
+the click arrives, and without the margin the first click of an approach is lost.
+
+Until this existed the window's 270 px of transparent area swallowed every click aimed at what
+was behind it, which from the outside looked like a dead strip down the right of the screen.
+
+### Individually switchable parts of a cell
+
+A `Show` submenu for the percentage, the countdown, the pace mark and the activity arc.
+
+Upstream has nothing like it, and that reads as a decision rather than a gap: its settings are
+about what the notch *is* - which edge, how visible, which providers connected - not about
+which decorations a cell carries. This comes from the taskbar mod, where every element of a
+bar is switchable, and it earns its place for the mod's reason: 70 pt is not much room, and
+what counts as the useful part differs per person.
+
+All default to on, so the app looks unchanged for anyone who does not go looking.
+
+### A countdown on the pill itself
+
+Upstream puts reset copy in the tooltip card only. The mod puts a countdown on the bar, and
+that is the version ported here, because the pace mark on the ring already makes the same
+point graphically and the number is what makes it precise.
+
+It truncates where the card's copy rounds: rounding up claims more time than there is, and the
+two sit inches apart on screen.
+
 ### Build identity
 
 `build.rs` stamps the commit, a dirty flag and the compile time into the binary; installers
