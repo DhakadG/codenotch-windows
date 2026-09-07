@@ -1,21 +1,23 @@
-# 提供商图标来源
+# Provider marks
 
-本目录的 SVG 取自 npm 包 `@lobehub/icons-static-svg` 1.95.0（https://github.com/lobehub/lobe-icons ，MIT License），未做任何修改：
+The SVG files in this directory come from the npm package `@lobehub/icons-static-svg` 1.95.0
+(https://github.com/lobehub/lobe-icons, MIT License) and are unmodified:
 
-| 文件 | 包内原文件 | 显示于 |
+| File | Original file in the package | Shown in |
 |---|---|---|
 | claude.svg | icons/claude.svg | Claude cell |
-| codex.svg | icons/openai.svg | Codex cell（与上游 codenotch 的 glyph 选择一致：OpenAI 标） |
-| codex-alt.svg | icons/codex.svg | 备选：Codex 自己的标 |
+| codex.svg | icons/openai.svg | Codex cell (the OpenAI mark, matching upstream Codenotch's glyph choice) |
+| codex-alt.svg | icons/codex.svg | alternative: Codex's own mark |
 | cursor.svg | icons/cursor.svg | Cursor cell |
 | gemini.svg | icons/antigravity.svg | Antigravity cell |
-| gemini-alt.svg | icons/gemini.svg | 备选：Gemini 火花 |
+| gemini-alt.svg | icons/gemini.svg | alternative: the Gemini spark |
 
-MIT License — Copyright (c) LobeHub. 详见该仓库 LICENSE。
+MIT License — Copyright (c) LobeHub. See that repository's LICENSE.
 
-**商标声明**：这些标识分别是 Anthropic、OpenAI、Anysphere (Cursor)、Google 的商标，
-在此仅用于指代对应产品的用量数据（本项目为个人自用、非商业）。若向上游仓库提交 PR 或对外分发，
-请由仓库作者按各家品牌规范决定是否保留。
+**Trademarks**: these marks are trademarks of Anthropic, OpenAI, Anysphere (Cursor) and Google
+respectively, and are used here only to identify the product whose usage is displayed. Whether
+they stay in a distributed build is the repository owner's call under each brand's guidelines;
+they can be swapped for generated glyphs without touching any code.
 
-覆盖方式：把同名 .svg/.png 放到 `%APPDATA%\codenotch\glyphs\` 即优先于内置图标；
-托盘「立即刷新用量」后生效。
+**Overrides**: a file of the same name (`.svg` or `.png`) in `%APPDATA%\codenotch\glyphs\` takes
+precedence over the built-in mark; it is picked up after "Refresh usage now" in the tray menu.

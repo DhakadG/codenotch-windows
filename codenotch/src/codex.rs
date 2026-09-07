@@ -1,24 +1,29 @@
-//! Codex 用量适配器——按上游 Codenotch 的接口事实独立实现。
+//! Codex usage adapter, implemented from the upstream Codenotch's documented behaviour.
 //!
-//! 两条数据路径（上游 1.5.0 同款取舍）：
-//!   1. 活读：借 Codex 自己的登录态（`~/.codex/auth.json` → `tokens.access_token` +
-//!      `tokens.account_id`）直接 GET `https://chatgpt.com/backend-api/wham/usage`，回复
-//!      `rate_limit.{primary_window,secondary_window}` 带 `used_percent / limit_window_seconds /
-//!      reset_at(秒) | reset_after_seconds`，顶层另有 `plan_type`。这是"现在"的数字，不起任何
-//!      进程；token 只读、不刷新、不写回，401/403 就报 needsAuth，让 Codex 自己去续。
-//!      （早先走 `codex app-server` JSON-RPC：每 5 分钟拉一棵 node 进程树、还得 taskkill 收尾，
-//!      而且它的回复只带 weekly 一个窗口——换端点后 5h 窗口才回来。）
-//!   2. 兜底：Codex 会把每回合看到的限额快照写进线程 rollout 日志
-//!      `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`，行形如
+//! Two data paths (the same trade-off upstream made in 1.5.0):
+//!   1. Live: borrow the session Codex keeps in `~/.codex/auth.json` (`tokens.access_token` +
+//!      `tokens.account_id`) and GET `https://chatgpt.com/backend-api/wham/usage`. The reply carries
+//!      `rate_limit.{primary_window,secondary_window}` with `used_percent / limit_window_seconds /
+//!      reset_at (seconds) | reset_after_seconds`, plus a top-level `plan_type`. That is the number
+//!      for *now*, and it starts no process. The token is read only — never refreshed, never written
+//!      back; 401/403 becomes needsAuth and Codex renews it on its own.
+//!      (The earlier `codex app-server` JSON-RPC route spawned a node process tree every five
+//!      minutes, needed taskkill to clean up, and only ever reported the weekly window; the
+//!      five-hour window came back with the endpoint.)
+//!   2. Fallback: Codex writes the limits it saw on each turn into the thread's rollout log
+//!      `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, as lines like
 //!      `{"timestamp":"…","type":"event_msg","payload":{"type":"token_count","rate_limits":{
 //!         "primary":{"used_percent":0.0,"window_minutes":300,"resets_at":1790585719},
 //!         "secondary":{…}|null,"plan_type":"free"}}}`
-//!      重置时刻是 **resets_at 绝对秒**（文档写的 resets_in_seconds 也兼容）。这是"上次用时"的
-//!      数字——文件读取永远瞬间成功，所以必须按行内 timestamp 标 stale（>5min）。
-//!   上游用 state_5.sqlite 的线程索引找最新 rollout；我们直接按目录日期倒序 + mtime 找，
-//!   零 SQLite 依赖（immutable/WAL 的坑整个绕开）。
+//!      The reset is **resets_at, absolute seconds** (the documented resets_in_seconds is accepted
+//!      too). This is the number from the *last run* — reading a file always succeeds instantly, so
+//!      the reading is marked stale by the line's own timestamp (> 5 min).
+//!   Upstream finds the newest rollout through the thread index in state_5.sqlite; this port walks
+//!   the dated directories newest-first and picks by mtime, with no SQLite involved (and none of
+//!   the immutable/WAL pitfalls).
 //!
-//! 凭证只借不管：数字来自 Codex 自己的登录态和它自己的端点；既没登录也没会话记录就是 absent（cell 不显示）。
+//! Credentials are borrowed, never managed: the numbers come from Codex's own sign-in and Codex's
+//! own endpoint. No sign-in and no session history at all means absent (no cell is shown).
 
 use crate::usage::{LimitWindow, UsageSnapshot};
 use crate::AppState;
@@ -27,14 +32,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
-const POLL_SECS: u64 = 300; // Codex 没有会话态可依据，固定 5min（上游节奏；托盘刷新可打断）
+const POLL_SECS: u64 = 300; // Codex has no session state to key off, so a fixed 5 min (upstream cadence; a tray refresh interrupts it)
 const TAIL_BYTES: u64 = 256 * 1024;
 const CURRENT_FOR_MS: u64 = 5 * 60 * 1000;
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/wham/usage";
-const BACKOFF_MIN_SECS: u64 = 60; // 429 时至少等这么久，Retry-After 只作下限
+const BACKOFF_MIN_SECS: u64 = 60; // wait at least this long after a 429; Retry-After only raises it
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// 服务端给的重试截止（ms epoch）：手动刷新、重启都不能绕过它
+/// Retry deadline given by the server (ms epoch): neither a manual refresh nor a restart may bypass it
 static BACKOFF_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn request_refresh() {
@@ -76,10 +81,10 @@ fn persist(s: &UsageSnapshot) {
     }
 }
 
-// ---------------- 可执行文件定位 ----------------
+// ---------------- Locating the executable ----------------
 
-/// 候选顺序：npm 全局包内的原生 exe（最干净，不经 cmd/node 包装）→ ~/.codex/bin →
-/// PATH 上的 codex.exe / codex.cmd。
+/// Candidates in order: the native exe inside the global npm package (cleanest — no cmd/node
+/// wrapper) → ~/.codex/bin → codex.exe / codex.cmd on PATH.
 pub fn find_executable() -> Option<PathBuf> {
     let mut cands: Vec<PathBuf> = Vec::new();
     if let Some(appdata) = dirs::config_dir() {
@@ -93,7 +98,7 @@ pub fn find_executable() -> Option<PathBuf> {
             }
         }
         if let Ok(rd) = std::fs::read_dir(pkg.join("vendor")) {
-            // 新版包把原生 exe 放在 vendor/<triple>/codex/codex.exe
+            // Newer packages keep the native exe at vendor/<triple>/codex/codex.exe
             for e in rd.flatten() {
                 let p = e.path().join("codex").join("codex.exe");
                 if p.exists() {
@@ -116,7 +121,7 @@ pub fn find_executable() -> Option<PathBuf> {
     cands.into_iter().find(|p| p.is_file())
 }
 
-// ---------------- 活读：usage 端点 ----------------
+// ---------------- Live: the usage endpoint ----------------
 
 fn auth_path() -> Option<PathBuf> {
     codex_home().map(|h| h.join("auth.json"))
@@ -125,20 +130,20 @@ fn auth_path() -> Option<PathBuf> {
 struct Credential {
     access_token: String,
     account_id: String,
-    /// id_token 里的 chatgpt_plan_type（pro / plus / free…），只作标签
+    /// chatgpt_plan_type from the id_token (pro / plus / free…), used only as a label
     plan: Option<String>,
-    /// access_token 的 exp 已过：请求照发（服务端说了算），只影响 401 时的提示语
+    /// The access_token's exp has passed: the request is still sent (the server decides); this only changes the 401 wording
     expired: bool,
 }
 
-/// JWT 第二段（base64url）→ claims。只取标签和本地过期提示，不做任何校验——那是服务端的事
+/// Second JWT segment (base64url) → claims. Used only for labels and a local expiry hint; nothing is verified here — that is the server's job
 fn jwt_claims(token: &str) -> Option<serde_json::Value> {
     let part = token.split('.').nth(1)?;
     let raw = crate::antigravity::b64_decode(part)?;
     serde_json::from_slice(&raw).ok()
 }
 
-/// 只读 Codex 的登录态；缺文件、缺字段都视为"没登录"
+/// Reads Codex's sign-in state; a missing file or missing field both mean "not signed in"
 fn load_credential() -> Option<Credential> {
     let text = std::fs::read_to_string(auth_path()?).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -167,7 +172,7 @@ fn load_credential() -> Option<Credential> {
 
 enum LiveErr {
     NeedsAuth,
-    /// 建议等待秒数（已含 BACKOFF_MIN_SECS 下限）
+    /// Suggested wait in seconds (BACKOFF_MIN_SECS already applied)
     RateLimited(u64),
     Other(String),
 }
@@ -184,7 +189,7 @@ fn fetch_usage(cred: &Credential) -> Result<serde_json::Value, LiveErr> {
     match resp {
         Ok(r) => r.into_json().map_err(|e| LiveErr::Other(format!("parse: {e}"))),
         Err(ureq::Error::Status(code @ (401 | 403), r)) => {
-            // 401 是 token 的事；403 也可能是边缘节点拦了 UA——把状态码和响应体开头记下来，别把两者混成一句"请登录"
+            // 401 is about the token; 403 can also be an edge node rejecting the user agent — record the status and the start of the body rather than folding both into "please sign in"
             let head: String = r
                 .into_string()
                 .unwrap_or_default()
@@ -192,7 +197,7 @@ fn fetch_usage(cred: &Credential) -> Result<serde_json::Value, LiveErr> {
                 .filter(|c| !c.is_control())
                 .take(160)
                 .collect();
-            crate::applog(&format!("codex: usage 端点 HTTP {code}: {head}"));
+            crate::applog(&format!("codex: usage endpoint HTTP {code}: {head}"));
             Err(LiveErr::NeedsAuth)
         }
         Err(ureq::Error::Status(429, r)) => {
@@ -204,7 +209,7 @@ fn fetch_usage(cred: &Credential) -> Result<serde_json::Value, LiveErr> {
     }
 }
 
-/// 上游同款标签规则：Codex 只按时长命名窗口，"5h limit" 比 "primary" 有信息量
+/// Upstream's label rule: Codex names windows only by length, and "5h limit" says more than "primary"
 fn label_for(window_minutes: Option<f64>, id: &str) -> String {
     match window_minutes {
         Some(m) if m > 0.0 => {
@@ -235,9 +240,11 @@ fn num(v: Option<&serde_json::Value>) -> Option<f64> {
     v.and_then(|x| x.as_f64())
 }
 
-/// usage 回复 → 窗口。`additional_rate_limits`、`code_review_rate_limit` 计的是别的东西，不进环。
-/// 窗口 id 记"来自哪个字段"（primary/secondary），标签按时长推——账号不同，primary 未必是 5h
-/// （免费档见过 30 天），按固定时长认窗口会把真实在用的窗口整个丢掉。
+/// Usage reply → windows. `additional_rate_limits` and `code_review_rate_limit` meter something
+/// else and stay out of the rings. The window id records which field it came from
+/// (primary/secondary) and the label is derived from the length — the primary window is not
+/// always five hours (a free plan has shown 30 days), and recognising only fixed lengths would
+/// drop a window that is genuinely in use.
 fn windows_from_usage(v: &serde_json::Value) -> Vec<LimitWindow> {
     let now = now_ms();
     let mut out = Vec::new();
@@ -258,9 +265,9 @@ fn windows_from_usage(v: &serde_json::Value) -> Vec<LimitWindow> {
     out
 }
 
-// ---------------- 兜底：rollout 快照 ----------------
+// ---------------- Fallback: the rollout snapshot ----------------
 
-/// 最近改动的 rollout：sessions/YYYY/MM/DD 目录名倒序，只看最近 3 个"有文件的日子"
+/// The most recently modified rollout: dated directories newest-first, looking only at the three most recent days that have files
 pub fn newest_rollout() -> Option<PathBuf> {
     let root = codex_home()?.join("sessions");
     let mut days: Vec<PathBuf> = Vec::new();
@@ -315,11 +322,11 @@ pub fn tail_text(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&raw).into_owned())
 }
 
-/// rollout 尾部最后一条 rate_limits 快照 → (窗口, 记录时刻 ms, plan)
+/// The last rate_limits snapshot at the tail of a rollout → (windows, recorded-at ms, plan)
 pub fn snapshot_from_rollout(text: &str) -> Option<(Vec<LimitWindow>, Option<u64>, Option<String>)> {
     for line in text.lines().rev().filter(|l| l.contains("rate_limits")) {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        // rate_limits 可能在顶层，也可能在 payload 下
+        // rate_limits may sit at the top level or under payload
         let rl = v
             .get("rate_limits")
             .or_else(|| v.pointer("/payload/rate_limits"))
@@ -354,9 +361,9 @@ pub fn snapshot_from_rollout(text: &str) -> Option<(Vec<LimitWindow>, Option<u64
     None
 }
 
-// ---------------- 汇总 ----------------
+// ---------------- Putting it together ----------------
 
-/// Codex 在这台机上存在吗（装了 CLI 或有过会话）——都没有则 cell 不显示
+/// Is Codex present on this machine (CLI installed, signed in, or has had sessions)? If not, no cell is shown
 pub fn present() -> bool {
     find_executable().is_some()
         || auth_path().map(|p| p.is_file()).unwrap_or(false)
@@ -365,7 +372,7 @@ pub fn present() -> bool {
 
 fn read_once() -> UsageSnapshot {
     let mut snap = UsageSnapshot::default();
-    // 活读失败时附在兜底读数上的说明；needs_auth 决定"连兜底都没有"时显示哪种空态
+    // Note attached to the fallback reading when the live read failed; needs_auth picks the empty state when there is no fallback either
     let mut live_note: Option<String> = None;
     let mut needs_auth = false;
     let held_until = BACKOFF_UNTIL.load(std::sync::atomic::Ordering::Relaxed);
@@ -377,7 +384,7 @@ fn read_once() -> UsageSnapshot {
         match load_credential() {
             None => {
                 if auth_path().map(|p| p.is_file()).unwrap_or(false) {
-                    crate::applog("codex: auth.json 里没有可用的 access_token/account_id，退回 rollout");
+                    crate::applog("codex: auth.json has no usable access_token/account_id, falling back to the rollout");
                 }
             }
             Some(cred) => match fetch_usage(&cred) {
@@ -392,7 +399,7 @@ fn read_once() -> UsageSnapshot {
                         return snap;
                     }
                     let keys: Vec<String> = v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
-                    crate::applog(&format!("codex: usage 回复里没有窗口（顶层键 {keys:?}），退回 rollout"));
+                    crate::applog(&format!("codex: usage reply has no windows (top-level keys {keys:?}), falling back to the rollout"));
                     live_note = Some("Codex reported no usage windows".into());
                 }
                 Err(LiveErr::NeedsAuth) => {
@@ -408,23 +415,23 @@ fn read_once() -> UsageSnapshot {
                     BACKOFF_UNTIL.store(until, std::sync::atomic::Ordering::Relaxed);
                     snap.backoff_until = until;
                     live_note = Some(format!("Rate limited — retrying in {secs}s"));
-                    crate::applog(&format!("codex: usage 端点 429，{secs}s 后重试"));
+                    crate::applog(&format!("codex: usage endpoint returned 429, retrying in {secs}s"));
                 }
                 Err(LiveErr::Other(e)) => {
-                    crate::applog(&format!("codex: 活读失败（{e}），退回 rollout"));
+                    crate::applog(&format!("codex: live read failed ({e}), falling back to the rollout"));
                     live_note = Some(format!("Live read failed ({e})"));
                 }
             },
         }
     }
-    // 兜底：rollout
+    // Fallback: rollout
     match newest_rollout().and_then(|p| tail_text(&p)).and_then(|t| snapshot_from_rollout(&t)) {
         Some((windows, recorded, plan)) => {
             let rec = recorded.unwrap_or(0);
             let fresh = rec > 0 && now_ms().saturating_sub(rec) <= CURRENT_FOR_MS;
             snap.status = if fresh { "ok" } else { "stale" }.into();
             snap.windows = windows;
-            snap.fetched_at = rec; // 以"记录时刻"为准，UI 据此显示 Updated N ago
+            snap.fetched_at = rec; // the recorded time is what counts; the UI shows Updated N ago from it
             snap.note = match plan {
                 Some(p) => format!("{} · from last Codex run", cap(&p)),
                 None => "from last Codex run".into(),
@@ -476,7 +483,7 @@ pub fn start(app: AppHandle) {
         }
         if !present() {
             broadcast(&app, UsageSnapshot { status: "absent".into(), ..Default::default() });
-            // 没装 Codex：每 10 分钟看一眼有没有装上
+            // Codex is not installed: look again every 10 minutes
             loop {
                 for _ in 0..600 {
                     if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -503,16 +510,16 @@ pub fn start(app: AppHandle) {
     });
 }
 
-/// doctor 用：不含任何秘密
+/// For doctor: contains no secrets
 pub fn probe() -> String {
     let auth = match load_credential() {
         Some(c) => format!(
-            "auth.json 可用{}{}",
-            if c.expired { "（access_token 已过期）" } else { "" },
-            c.plan.map(|p| format!("，plan={p}")).unwrap_or_default()
+            "auth.json usable{}{}",
+            if c.expired { " (access_token expired)" } else { "" },
+            c.plan.map(|p| format!(", plan={p}")).unwrap_or_default()
         ),
-        None if auth_path().map(|p| p.is_file()).unwrap_or(false) => "auth.json 存在但缺 token".to_string(),
-        None => "auth.json 不存在".to_string(),
+        None if auth_path().map(|p| p.is_file()).unwrap_or(false) => "auth.json present but has no token".to_string(),
+        None => "auth.json not found".to_string(),
     };
     let exe = find_executable();
     let roll = newest_rollout();
@@ -521,12 +528,12 @@ pub fn probe() -> String {
         .and_then(|p| std::fs::metadata(p).ok())
         .and_then(|m| m.modified().ok())
         .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .map(|d| format!("{} 分钟前", d.as_secs() / 60))
+        .map(|d| format!("{} min ago", d.as_secs() / 60))
         .unwrap_or_else(|| "?".into());
     format!(
-        "Codex: {auth} | 可执行 {} | 最新 rollout {}（改动于 {}）",
-        exe.map(|p| p.display().to_string()).unwrap_or_else(|| "未找到".into()),
-        roll.map(|p| p.display().to_string()).unwrap_or_else(|| "无".into()),
+        "Codex: {auth} | executable {} | newest rollout {} (modified {})",
+        exe.map(|p| p.display().to_string()).unwrap_or_else(|| "not found".into()),
+        roll.map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()),
         age
     )
 }

@@ -1,5 +1,5 @@
-//! 四态状态机：attention > running > done > idle（注意力成本排序）
-//! done 驻留：仅被该会话新的 UserPromptSubmit、用户手动 ✕、或 >24h 陈旧清理清除。
+//! Four-state machine: attention > running > done > idle (ordered by attention cost).
+//! done persists: it is cleared only by a new UserPromptSubmit for that session, the user's ✕, or the > 24 h stale sweep.
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -10,9 +10,9 @@ pub const ST_ATTENTION: &str = "attention";
 pub const ST_DONE: &str = "done";
 pub const ST_IDLE: &str = "idle";
 
-const RUNNING_STALE_MS: u64 = 30 * 60 * 1000; // 无事件 30min 的 running 视为异常退出
-const DONE_STALE_MS: u64 = 24 * 3600 * 1000; // 陈旧 done 24h 后清理
-const IDLE_DROP_MS: u64 = 10 * 60 * 1000; // idle 10min 后从列表移除
+const RUNNING_STALE_MS: u64 = 30 * 60 * 1000; // running with no event for 30 min is treated as an abnormal exit
+const DONE_STALE_MS: u64 = 24 * 3600 * 1000; // stale done entries are removed after 24 h
+const IDLE_DROP_MS: u64 = 10 * 60 * 1000; // idle entries leave the list after 10 min
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -26,16 +26,16 @@ pub struct Session {
     pub id: String,
     pub title: String,
     pub state: String,
-    /// 本轮活动开始时间（ms epoch）
+    /// Start of the current activity (ms epoch)
     pub started: u64,
-    /// done 时冻结的总耗时（ms）
+    /// Total elapsed time frozen at done (ms)
     pub total: u64,
     pub last: String,
-    /// attention 时的提示内容（权限请求/提问摘要）
+    /// What attention is about (permission request / question summary)
     pub attn: String,
-    /// 用户最近一次输入（面板副标题："你: …"，agent-notch 式——展示你的话而非代理动作）
+    /// The user's latest input (card subtitle: "you: …" — show what you said rather than the agent's action)
     pub prompt: String,
-    /// 会话实际使用的模型（transcript assistant 条目 message.model）
+    /// The model the session actually uses (message.model of a transcript assistant entry)
     pub model: String,
     #[serde(skip)]
     pub ppid: u32,
@@ -43,12 +43,12 @@ pub struct Session {
     pub last_event: u64,
     #[serde(skip)]
     pub cwd: String,
-    /// 最近一次真实 hook 事件的时间；有新鲜 hook 数据时忽略 watcher 推断
+    /// Time of the last real hook event; watcher inference is ignored while hook data is fresh
     #[serde(skip)]
     pub last_hook: u64,
 }
 
-/// hook 数据在此时间窗内视为新鲜，watcher 推断退让
+/// Hook data is considered fresh within this window, and watcher inference yields to it
 const HOOK_FRESH_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,11 +56,11 @@ pub struct Snapshot {
     pub sessions: Vec<Session>,
     pub agg: String,
     pub counts: HashMap<String, usize>,
-    /// 用户设置的语言（可能是 "auto"，面板按钮高亮用）
+    /// The language the user chose (may be "auto"; used to highlight the menu item)
     pub lang: String,
-    /// Rust 侧解析后的实际语言（WebView2 的 navigator.language 不可靠）
+    /// The actual language resolved on the Rust side (WebView2's navigator.language is unreliable)
     pub lang_resolved: String,
-    /// 是否允许拖动/滚轮调宽（bar 前端据此启用手势）
+    /// Whether dragging / wheel resizing is allowed (the page enables the gestures from it)
     pub drag: bool,
 }
 
@@ -79,7 +79,7 @@ pub struct HookEvent {
     pub tool_name: String,
     pub tool_cmd: String,
     pub model: String,
-    /// "hook"（真实事件）或 "watch"（transcript 推断，桌面版兜底）
+    /// "hook" (a real event) or "watch" (transcript inference, the desktop app's fallback)
     pub src: &'static str,
 }
 
@@ -126,7 +126,7 @@ impl Store {
                 cwd: ev.cwd.clone(),
                 last_hook: 0,
             });
-        // 数据源仲裁：有新鲜 hook 数据的会话不接受 watcher 推断
+        // Source arbitration: a session with fresh hook data does not accept watcher inference
         if ev.src == "watch" && s.last_hook > 0 && now.saturating_sub(s.last_hook) < HOOK_FRESH_MS {
             return false;
         }
@@ -189,7 +189,7 @@ impl Store {
             }
             _ => {}
         }
-        // 只有可见内容变化才广播，避免 watcher 高频 append 造成风暴
+        // Broadcast only on a visible change, so the watcher's rapid appends cannot cause a storm
         (
             s.state.clone(),
             s.last.clone(),
@@ -207,7 +207,7 @@ impl Store {
         self.map.values().any(|s| s.state == ST_DONE)
     }
 
-    /// 看过即清：匹配谓词的 done 会话转 idle（随后由 sweep 自然清理）
+    /// Seen-clears-it: done sessions matching the predicate become idle (and the sweep removes them later)
     pub fn ack_done<F: Fn(&Session) -> bool>(&mut self, f: F) -> bool {
         let now = now_ms();
         let mut changed = false;
@@ -221,7 +221,7 @@ impl Store {
         changed
     }
 
-    /// 陈旧清理，返回是否有变化
+    /// Stale sweep; returns whether anything changed
     pub fn sweep(&mut self) -> bool {
         let now = now_ms();
         let mut changed = false;

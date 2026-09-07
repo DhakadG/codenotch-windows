@@ -1,10 +1,10 @@
-//! 把 codenotch-hook.exe 合并写入 ~/.claude/settings.json（不覆盖用户已有 hooks）。
-//! 识别标记：command 里包含 "codenotch-hook"。写入前自动备份。
+//! Merges codenotch-hook.exe into ~/.claude/settings.json without overwriting the user's own hooks.
+//! Identification: the command contains "codenotch-hook". A backup is written first.
 
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-/// (Claude Code 事件名, 是否需要 matcher, 上报给 Codenotch 的内部事件)
+/// (Claude Code event name, whether it needs a matcher, the internal event reported to Codenotch)
 const WIRING: &[(&str, bool, &str)] = &[
     ("SessionStart", false, "session_start"),
     ("UserPromptSubmit", false, "running"),
@@ -63,14 +63,14 @@ pub fn is_installed() -> bool {
 }
 
 pub fn install() -> Result<String, String> {
-    let path = settings_path().ok_or("找不到用户目录")?;
+    let path = settings_path().ok_or("cannot find the user directory")?;
     let hook_exe = std::env::current_exe()
         .map_err(|e| e.to_string())?
         .parent()
-        .ok_or("无法定位程序目录")?
+        .ok_or("cannot locate the program directory")?
         .join("codenotch-hook.exe");
     if !hook_exe.exists() {
-        return Err(format!("缺少 {}", hook_exe.display()));
+        return Err(format!("missing {}", hook_exe.display()));
     }
 
     let mut root = load(&path);
@@ -83,7 +83,7 @@ pub fn install() -> Result<String, String> {
 
     for (event, need_matcher, internal) in WIRING {
         let arr = root["hooks"][*event].as_array().cloned().unwrap_or_default();
-        // 先清掉旧的自己
+        // Remove our own older entries first
         let mut arr: Vec<Value> = arr.into_iter().filter(|e| !is_ours(e)).collect();
         let cmd = format!("\"{}\" {}", hook_exe.display(), internal);
         let mut entry = json!({
@@ -97,17 +97,17 @@ pub fn install() -> Result<String, String> {
     }
 
     backup_and_write(&path, &root)?;
-    Ok(format!("已写入 {}（共 {} 个事件）", path.display(), WIRING.len()))
+    Ok(format!("wrote {} ({} events)", path.display(), WIRING.len()))
 }
 
 pub fn uninstall() -> Result<String, String> {
-    let path = settings_path().ok_or("找不到用户目录")?;
+    let path = settings_path().ok_or("cannot find the user directory")?;
     if !path.exists() {
-        return Ok("settings.json 不存在，无需卸载".into());
+        return Ok("settings.json does not exist, nothing to uninstall".into());
     }
     let mut root = load(&path);
     let Some(hooks) = root["hooks"].as_object_mut() else {
-        return Ok("未发现 hooks 配置".into());
+        return Ok("no hooks configuration found".into());
     };
     let mut removed = 0;
     for (_, v) in hooks.iter_mut() {
@@ -118,5 +118,5 @@ pub fn uninstall() -> Result<String, String> {
         }
     }
     backup_and_write(&path, &root)?;
-    Ok(format!("已移除 {removed} 条 Codenotch hook"))
+    Ok(format!("removed {removed} Codenotch hook(s)"))
 }

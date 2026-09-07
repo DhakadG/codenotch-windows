@@ -1,22 +1,25 @@
-//! Cursor 用量适配器——按上游 Codenotch 的接口事实独立实现。
+//! Cursor usage adapter, implemented from the upstream Codenotch's documented behaviour.
 //!
-//! 数据路（上游同款取舍，"借编辑器自己的会话"）：
-//!   1. 凭证：Cursor 编辑器把登录态存在它从 VS Code 继承的全局状态库
-//!      `%APPDATA%\Cursor\User\globalStorage\state.vscdb`（SQLite，表 ItemTable(key,value)）：
-//!      `cursorAuth/accessToken` + `cursorAuth/stripeMembershipAuthId`，
-//!      两者拼成 Cookie `WorkosCursorSessionToken=<authId>::<token>`。
-//!      非秘密的身份缓存：`cursorAuth/cachedEmail`、`cursorAuth/stripeMembershipType`（只取 plan 显示）。
-//!   2. 端点：`GET https://cursor.com/api/usage-summary`（Cookie + Accept: application/json，15s）。
-//!      响应：{ billingCycleEnd, membershipType, isUnlimited,
+//! Data path (same trade-off as upstream: borrow the editor's own session):
+//!   1. Credential: the editor keeps its sign-in in the global state database it inherited from
+//!      VS Code, `%APPDATA%\Cursor\User\globalStorage\state.vscdb` (SQLite, table ItemTable(key,value)):
+//!      `cursorAuth/accessToken` + `cursorAuth/stripeMembershipAuthId`, joined into the cookie
+//!      `WorkosCursorSessionToken=<authId>::<token>`. Non-secret identity cache:
+//!      `cursorAuth/cachedEmail`, `cursorAuth/stripeMembershipType` (only the plan is shown).
+//!   2. Endpoint: `GET https://cursor.com/api/usage-summary` (Cookie + Accept: application/json, 15 s).
+//!      Reply: { billingCycleEnd, membershipType, isUnlimited,
 //!              individualUsage: { plan: { totalPercentUsed, apiPercentUsed, used, limit, breakdown },
 //!                                 onDemand: { enabled, used, limit } } }
-//!      Cursor 计的是"额度百分比"不是请求数：仪表盘的 "Included usage · N% used" = totalPercentUsed；
-//!      免费版 used/limit 恒为 0（额度以 breakdown.bonus 形式到账），读 used/limit 会把 10% 报成 0%。
-//!      0 是读数不是缺失（上游教训）。apiPercentUsed>0 时单列 "API usage"；onDemand 有真实 limit 时列 "On demand"。
+//!      Cursor meters a percentage of the allowance, not requests: the dashboard's
+//!      "Included usage · N% used" is totalPercentUsed. On the free plan used/limit are always 0
+//!      (the allowance arrives as breakdown.bonus), so reading used/limit would report 10 % as 0 %.
+//!      0 is a reading, not a gap (upstream's lesson). "API usage" is listed separately when
+//!      apiPercentUsed > 0; "On demand" when onDemand has a real limit.
 //!
-//! SQLite 打开纪律：先 `mode=ro`（能看到 WAL 里编辑器刚轮换的 token），失败再 `immutable=1`
-//! （编辑器退出、-shm 消失后 mode=ro 会打不开；此时 WAL 已 checkpoint，忽略它零代价）。
-//! 我们只读，永不写；token 值不进日志/事件/UI。
+//! SQLite opening rule: `mode=ro` first (it sees the token the editor just rotated into the WAL),
+//! then `immutable=1` (once the editor has exited and the -shm is gone, mode=ro fails to open; by
+//! then the WAL has been checkpointed, so ignoring it costs nothing).
+//! Read only, never written; token values never reach logs, events or the UI.
 
 use crate::usage::{LimitWindow, UsageSnapshot};
 use crate::AppState;
@@ -40,7 +43,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Windows: %APPDATA%\Cursor\User\globalStorage\state.vscdb（macOS 对应 ~/Library/Application Support/Cursor/...）
+/// Windows: %APPDATA%\Cursor\User\globalStorage\state.vscdb (macOS: ~/Library/Application Support/Cursor/...)
 pub fn store_url() -> Option<PathBuf> {
     dirs::config_dir().map(|c| c.join("Cursor").join("User").join("globalStorage").join("state.vscdb"))
 }
@@ -72,9 +75,9 @@ pub fn present() -> bool {
     store_url().map(|p| p.is_file()).unwrap_or(false)
 }
 
-// ---------------- SQLite 只读 ----------------
+// ---------------- SQLite, read only ----------------
 
-/// mode=ro 优先，immutable=1 兜底（见文件头）
+/// mode=ro first, immutable=1 as the fallback (see the module doc)
 fn open_ro(path: &std::path::Path) -> Option<rusqlite::Connection> {
     use rusqlite::OpenFlags;
     if !path.is_file() {
@@ -84,12 +87,12 @@ fn open_ro(path: &std::path::Path) -> Option<rusqlite::Connection> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
-        // 真正验证一下能读（-shm 缺失时 open 可能成功而首次查询失败）
+        // Actually verify that reads work (with the -shm missing, open can succeed and the first query fail)
         if c.prepare("SELECT 1 FROM ItemTable LIMIT 1").and_then(|mut s| s.query([]).map(|_| ())).is_ok() {
             return Some(c);
         }
     }
-    // URI 形式才能带 immutable=1；Windows 路径要转成 file:///C:/... 且 \ → /
+    // Only the URI form takes immutable=1; a Windows path becomes file:///C:/... with \ → /
     let mut uri = String::from("file:///");
     uri.push_str(&path.to_string_lossy().replace('\\', "/").trim_start_matches('/').replace('#', "%23").replace('?', "%3F"));
     uri.push_str("?immutable=1");
@@ -111,7 +114,7 @@ struct Creds {
     plan: Option<String>,
 }
 
-/// 每次都重读：编辑器会轮换 token，抱着旧值等于自己把自己登出
+/// Re-read every time: the editor rotates the token, and holding on to an old value signs us out
 fn read_credentials() -> Option<Creds> {
     let path = store_url()?;
     let conn = open_ro(&path)?;
@@ -121,23 +124,23 @@ fn read_credentials() -> Option<Creds> {
     Some(Creds { cookie: format!("WorkosCursorSessionToken={auth_id}::{token}"), plan })
 }
 
-/// doctor 用：不含秘密值
+/// For doctor: contains no secret values
 pub fn probe() -> String {
-    let Some(p) = store_url() else { return "Cursor: 无法定位 %APPDATA%".into() };
+    let Some(p) = store_url() else { return "Cursor: cannot locate %APPDATA%".into() };
     if !p.is_file() {
-        return format!("Cursor: 未找到 {}（未安装或未登录）", p.display());
+        return format!("Cursor: {} not found (not installed, or not signed in)", p.display());
     }
     match read_credentials() {
         Some(c) => format!(
-            "Cursor: 会话已借到（cookie {} 字符，plan={}）",
+            "Cursor: session borrowed (cookie {} chars, plan={})",
             c.cookie.len(),
             c.plan.unwrap_or_else(|| "?".into())
         ),
-        None => format!("Cursor: {} 存在但读不到 cursorAuth/*（编辑器未登录，或 SQLite 打开失败）", p.display()),
+        None => format!("Cursor: {} exists but cursorAuth/* could not be read (editor not signed in, or SQLite failed to open)", p.display()),
     }
 }
 
-// ---------------- 解析 ----------------
+// ---------------- Parsing ----------------
 
 fn pct(v: Option<&serde_json::Value>) -> Option<f64> {
     v.and_then(|x| x.as_f64()).map(|p| (p / 100.0).clamp(0.0, 1.0))
@@ -149,13 +152,13 @@ fn parse_iso(v: Option<&serde_json::Value>) -> Option<u64> {
         .map(|d| d.timestamp_millis().max(0) as u64)
 }
 
-/// usage-summary → (窗口, 说明)。窗口为空时说明为"为何没得量"（Unlimited / 免费无额度）
+/// usage-summary → (windows, note). When there are no windows the note says why (Unlimited / free plan without an allowance)
 pub fn parse_summary(v: &serde_json::Value) -> (Vec<LimitWindow>, String) {
     let resets_at = parse_iso(v.get("billingCycleEnd"));
     let usage = v.get("individualUsage").cloned().unwrap_or(serde_json::Value::Null);
     let plan = usage.get("plan").cloned().unwrap_or(serde_json::Value::Null);
     let mut out = Vec::new();
-    // 头条=仪表盘那个数；0 也是读数
+    // Headline = the dashboard number; 0 is a reading too
     if let Some(total) = pct(plan.get("totalPercentUsed")) {
         out.push(LimitWindow { id: "included".into(), label: "Included usage".into(), used: total, resets_at, ..Default::default() });
     }
@@ -199,7 +202,7 @@ enum FetchErr {
 fn fetch_once(cookie: &str) -> Result<serde_json::Value, FetchErr> {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
     match agent.get(ENDPOINT).set("Cookie", cookie).set("Accept", "application/json").call() {
-        Ok(r) => r.into_json::<serde_json::Value>().map_err(|e| FetchErr::Other(format!("解析失败: {e}"))),
+        Ok(r) => r.into_json::<serde_json::Value>().map_err(|e| FetchErr::Other(format!("parse: {e}"))),
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => Err(FetchErr::NeedsAuth),
         Err(ureq::Error::Status(code, _)) => Err(FetchErr::Other(format!("HTTP {code}"))),
         Err(e) => Err(FetchErr::Other(format!("{e}"))),
@@ -244,7 +247,7 @@ fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
             snap.note = "Cursor session was rejected — sign in again in the editor".into();
         }
         Err(FetchErr::Other(msg)) => {
-            // 陈旧优于编造：保留旧读数标 stale
+            // Stale beats invented: keep the old reading, marked stale
             snap.status = if snap.windows.is_empty() { "error" } else { "stale" }.into();
             snap.note = msg;
         }
@@ -278,7 +281,7 @@ pub fn start(app: AppHandle) {
         if !present() {
             broadcast(&app, UsageSnapshot { status: "absent".into(), ..Default::default() });
             loop {
-                sleep_interruptible(600); // 没装 Cursor：每 10 分钟看一眼
+                sleep_interruptible(600); // Cursor is not installed: look again every 10 minutes
                 if present() {
                     break;
                 }

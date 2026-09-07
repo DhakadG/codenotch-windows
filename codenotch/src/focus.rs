@@ -1,5 +1,5 @@
-//! 跳回准确终端：从会话的 Claude CLI 进程 PID 沿父链找到宿主终端窗口，
-//! SetForegroundWindow + FlashWindowEx。失败返回 false（前端提示）。
+//! Jump back to the right terminal: from the session's Claude CLI process PID, walk the parent chain
+//! to the hosting terminal window, then SetForegroundWindow + FlashWindowEx. Returns false on failure (the page reports it).
 
 #[cfg(windows)]
 pub fn focus_terminal(claude_pid: u32) -> bool {
@@ -18,7 +18,7 @@ pub fn focus_terminal(claude_pid: u32) -> bool {
         return false;
     }
 
-    // 1) 全量 pid -> ppid 快照
+    // 1) Full pid -> ppid snapshot
     let mut ppid_map: HashMap<u32, u32> = HashMap::new();
     unsafe {
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
@@ -39,7 +39,7 @@ pub fn focus_terminal(claude_pid: u32) -> bool {
         let _ = windows::Win32::Foundation::CloseHandle(snap);
     }
 
-    // 2) claude 的祖先链（含自身），最多 8 层：node → shell → WindowsTerminal/conhost 宿主…
+    // 2) claude's ancestor chain (itself included), at most 8 levels: node → shell → WindowsTerminal/conhost host…
     let mut chain: Vec<u32> = vec![claude_pid];
     let mut cur = claude_pid;
     for _ in 0..8 {
@@ -52,7 +52,7 @@ pub fn focus_terminal(claude_pid: u32) -> bool {
         }
     }
 
-    // 3) 枚举可见顶层窗口
+    // 3) Enumerate visible top-level windows
     struct Cand {
         hwnd: isize,
         pid: u32,
@@ -75,8 +75,8 @@ pub fn focus_terminal(claude_pid: u32) -> bool {
         wins.push(Cand { hwnd: h, pid: p });
     }
 
-    // 4) 打分：窗口 PID 在祖先链上（越靠上=真终端宿主，得分越高）；
-    //    或窗口 PID 的父进程在链上（经典 conhost 场景）。
+    // 4) Score: the window's PID is on the ancestor chain (higher up = the real terminal host = higher
+    //    score), or the window PID's parent is on the chain (the classic conhost case).
     let score_of = |pid: u32| -> Option<usize> {
         if let Some(i) = chain.iter().position(|&c| c == pid) {
             return Some(i);
@@ -119,12 +119,12 @@ pub fn focus_terminal(_claude_pid: u32) -> bool {
     false
 }
 
-// ---------------- 看过即清 / 桌面版跳回 共用的进程与前台工具 ----------------
+// ---------------- Process and foreground helpers shared by seen-clears-it and the desktop jump-back ----------------
 
 #[cfg(windows)]
 pub struct ProcMaps {
     pub ppid: std::collections::HashMap<u32, u32>,
-    pub name: std::collections::HashMap<u32, String>, // 小写 exe 名
+    pub name: std::collections::HashMap<u32, String>, // lower-case exe name
 }
 
 #[cfg(windows)]
@@ -193,7 +193,7 @@ pub fn chain_of(pid: u32, ppid: &std::collections::HashMap<u32, u32>) -> Vec<u32
     chain
 }
 
-/// 前台进程是否属于某会话的终端窗口（自身在链上，或其父在链上——conhost 场景）
+/// Whether the foreground process belongs to a session's terminal window (itself on the chain, or its parent — the conhost case)
 #[cfg(windows)]
 pub fn pid_hits_chain(pid: u32, chain: &[u32], maps: &ProcMaps) -> bool {
     chain.contains(&pid)
@@ -204,7 +204,7 @@ pub fn pid_hits_chain(pid: u32, chain: &[u32], maps: &ProcMaps) -> bool {
             .unwrap_or(false)
 }
 
-/// 聚焦 Claude 桌面版主窗口（桌面版会话的"跳回"目标：进程名含 claude 的最大可见窗口）
+/// Focus the Claude desktop app's main window (the jump-back target for desktop sessions: the largest visible window whose process name contains claude)
 #[cfg(windows)]
 pub fn focus_claude_desktop() -> bool {
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};

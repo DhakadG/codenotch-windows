@@ -1,10 +1,12 @@
-//! transcript 监视器：Claude Code **桌面版** 的兜底数据源。
-//! 背景：桌面版 Windows 下 settings.json hooks 存在不触发的已知 bug（2026-05），
-//! 因此监视 ~/.claude/projects/**/*.jsonl 的追加行为，推断会话状态：
-//!   - 文件在追加                          → running
-//!   - 末行=assistant 纯文本 且静默 >2.5s  → done
-//!   - 末行=assistant tool_use 且静默 >20s → attention（等待批准，推断，可能误报慢工具）
-//! 仲裁：state.rs 里有新鲜 hook 数据（5min 内）的会话忽略本推断（CLI 走 hook 更准）。
+//! Transcript watcher: the fallback data source for the Claude Code **desktop app**.
+//! Background: on Windows the desktop app has a known bug (2026-05) where settings.json hooks do
+//! not fire, so the appends to ~/.claude/projects/**/*.jsonl are watched instead and the session
+//! state is inferred from them:
+//!   - the file is being appended                              → running
+//!   - last line = plain assistant text, quiet for > 2.5 s     → done
+//!   - last line = assistant tool_use, quiet for > 20 s        → attention (waiting for approval; inferred, a slow tool can be misread)
+//! Arbitration: a session with fresh hook data in state.rs (within 5 min) ignores this inference
+//! (the CLI's hooks are more accurate).
 
 use crate::state::HookEvent;
 use crate::AppState;
@@ -18,16 +20,17 @@ use tauri::{AppHandle, Manager};
 
 const QUIET_DONE_MS: u64 = 2_500;
 const QUIET_ATTN_MS: u64 = 20_000;
-/// 末条为 user 且长静默：可能是强制停止/放弃的回合，不能一直绿着
-/// （阈值要容忍长思考——太短会把"深度思考中"误判为完成）
+/// Last entry is a user message and the file has been quiet for a long time: probably a stopped or
+/// abandoned turn, and the light must not stay green forever (the threshold tolerates long thinking —
+/// too short and "thinking hard" reads as done)
 const QUIET_USER_DONE_MS: u64 = 75_000;
-/// 自愈扫描周期与新鲜窗口：不赌 notify 事件一个不漏
+/// Self-healing rescan period and freshness window: never assume notify delivers every event
 const RESCAN_SECS: u64 = 45;
 const FRESH_WINDOW_MS: u64 = 10 * 60 * 1000;
-/// 单条消息（含整文件写入）常超 16KB，尾窗必须够大，否则末行截断解析失败=永远哑火
+/// A single message (including whole-file writes) often exceeds 16 KB; the tail window must be large enough, or a truncated last line fails to parse and the watcher stays silent forever
 const TAIL_BYTES: u64 = 256 * 1024;
 
-/// 运行日志：%APPDATA%\codenotch\watch.log（启动时清空，方便排查）
+/// Run log: %APPDATA%\codenotch\watch.log (cleared at startup to keep troubleshooting simple)
 pub fn wlog(msg: &str) {
     let Some(dir) = dirs::config_dir() else { return };
     let p = dir.join("codenotch").join("watch.log");
@@ -53,8 +56,8 @@ struct Trk {
     cwd: String,
     last_append: u64,
     kind: Kind,
-    sent: &'static str, // 上次已推送的状态，防重复
-    /// 末条 user 消息含中断标记（"[Request interrupted...]"）——强停快速判完
+    sent: &'static str, // last state pushed, to avoid repeats
+    /// The last user entry carries an interruption marker ("[Request interrupted...]") — a forced stop is judged done quickly
     interrupted: bool,
     prompt: String,
     model: String,
@@ -67,8 +70,8 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 监视根目录：CLI 的 ~/.claude/projects + 桌面端（Cowork）的会话镜像目录
-/// （桌面端每个会话有独立的 .claude/projects，位于 %APPDATA%\Claude\local-agent-mode-sessions 下）
+/// Watch roots: the CLI's ~/.claude/projects plus the desktop app's (Cowork) session mirrors
+/// (each desktop session has its own .claude/projects under %APPDATA%\Claude\local-agent-mode-sessions)
 pub fn roots() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Some(h) = dirs::home_dir() {
@@ -77,8 +80,8 @@ pub fn roots() -> Vec<PathBuf> {
     if let Some(c) = dirs::config_dir() {
         v.push(c.join("Claude").join("local-agent-mode-sessions"));
     }
-    // 桌面版若为打包应用（MSIX），其 AppData 被虚拟化，真实落盘在
-    // %LOCALAPPDATA%\Packages\<含 claude/anthropic 的包>\LocalCache\Roaming\Claude\...
+    // If the desktop app is packaged (MSIX), its AppData is virtualised and the real files live under
+    // %LOCALAPPDATA%\Packages\<package containing claude/anthropic>\LocalCache\Roaming\Claude\...
     if let Some(local) = dirs::data_local_dir() {
         if let Ok(rd) = std::fs::read_dir(local.join("Packages")) {
             for e in rd.flatten() {
@@ -98,7 +101,7 @@ pub fn roots() -> Vec<PathBuf> {
     v
 }
 
-/// 只接受真正的会话 transcript：必须在 .claude 目录树内，排除审计日志与子代理
+/// Accept only real session transcripts: inside a .claude tree, excluding audit logs and sub-agents
 pub fn is_session_jsonl(p: &Path) -> bool {
     if p.extension().map(|e| e == "jsonl").unwrap_or(false) == false {
         return false;
@@ -129,30 +132,31 @@ pub fn start(app: AppHandle) {
         }) else {
             return;
         };
-        // 清空上次日志
+        // Clear the previous log
         if let Some(dir) = dirs::config_dir() {
             let _ = std::fs::write(dir.join("codenotch").join("watch.log"), "");
         }
-        wlog(&format!("watcher 启动 v{}", env!("CARGO_PKG_VERSION")));
+        wlog(&format!("watcher started v{}", env!("CARGO_PKG_VERSION")));
         let mut pending: Vec<PathBuf> = roots();
         let mut watching = 0usize;
         let mut last_retry = std::time::Instant::now();
         pending.retain(|r| {
             if r.exists() && w.watch(r, RecursiveMode::Recursive).is_ok() {
                 watching += 1;
-                wlog(&format!("正在监视: {}", r.display()));
+                wlog(&format!("watching: {}", r.display()));
                 false
             } else {
-                wlog(&format!("暂不可用(将每60s重试): {}", r.display()));
+                wlog(&format!("not available yet (retrying every 60 s): {}", r.display()));
                 true
             }
         });
         let mut tracks: HashMap<PathBuf, Trk> = HashMap::new();
-        rescan(&app, &mut tracks); // 启动即扫一次：接管启动前就在活跃的会话
+        rescan(&app, &mut tracks); // scan once at startup: adopt sessions that were already active
         let mut last_scan = std::time::Instant::now();
-        // 节流（系统级卡顿根因）——桌面版流式输出时 transcript 每秒触发几十次
-        // modify 事件，此前每个事件都做一次 256KB 尾读 + JSON 解析，与 Claude 桌面版争抢
-        // 同一文件的 IO/CPU。现在同一文件 INGEST_MIN_GAP 内只 ingest 一次，其余合并成脏标记。
+        // Throttling (this was the system-wide lag): while the desktop app streams, the transcript
+        // fires dozens of modify events per second, and each one used to do a 256 KB tail read plus
+        // JSON parse, competing with the Claude desktop app for the same file's I/O and CPU. Now a
+        // file is ingested at most once per INGEST_MIN_GAP; the rest collapse into a dirty flag.
         const INGEST_MIN_GAP: Duration = Duration::from_millis(800);
         let mut last_ingest: HashMap<PathBuf, std::time::Instant> = HashMap::new();
         let mut dirty: std::collections::HashSet<PathBuf> = Default::default();
@@ -164,7 +168,7 @@ pub fn start(app: AppHandle) {
                             dirty.insert(p);
                         }
                     }
-                    // 把队列里已积压的事件一口气吸干，避免逐条唤醒
+                    // Drain the events already queued in one go instead of waking up for each
                     while let Ok(Ok(ev)) = rx.try_recv() {
                         for p in ev.paths {
                             if is_session_jsonl(&p) {
@@ -199,33 +203,33 @@ pub fn start(app: AppHandle) {
                 }
             }
             evaluate(&app, &mut tracks);
-            // 周期自愈扫描：新会话目录 / notify 漏事件兜底
+            // Periodic self-healing rescan: new session directories, and a safety net for missed notify events
             if last_scan.elapsed() > Duration::from_secs(RESCAN_SECS) {
                 last_scan = std::time::Instant::now();
                 rescan(&app, &mut tracks);
             }
-            // 尚未存在的根目录每 60s 重试（如从未跑过 CLI）
+            // Roots that do not exist yet are retried every 60 s (e.g. the CLI has never run)
             if !pending.is_empty() && last_retry.elapsed() > Duration::from_secs(60) {
                 last_retry = std::time::Instant::now();
                 pending.retain(|r| {
                     !(r.exists() && w.watch(r, RecursiveMode::Recursive).is_ok())
                 });
             }
-            let _ = watching; // 全部失败也保持线程存活，等待重试
+            let _ = watching; // keep the thread alive even if everything failed, and wait for the retry
         }
     });
 }
 
 pub struct TailInfo {
-    /// 最新一条对话主体条目（user/assistant，跳过记账行）
+    /// Latest conversation entry (user/assistant, skipping bookkeeping lines)
     pub entry: serde_json::Value,
-    /// 最近一次真正的用户输入（跳过 tool_result 型 user 条目）
+    /// Most recent real user input (skipping tool_result-type user entries)
     pub prompt: String,
-    /// 会话实际模型（assistant 条目 message.model）
+    /// The session's actual model (message.model of an assistant entry)
     pub model: String,
 }
 
-/// 用户输入文本提取：content 为字符串，或数组中的 text 块；含 tool_result 的不算
+/// User input text: content is a string, or the text blocks of an array; entries with tool_result do not count
 fn user_text(v: &serde_json::Value) -> Option<String> {
     let c = v.pointer("/message/content")?;
     if let Some(s) = c.as_str() {
@@ -253,8 +257,8 @@ fn user_text(v: &serde_json::Value) -> Option<String> {
     None
 }
 
-/// 读文件尾部，向前回溯：主体条目 + 最近用户输入 + 模型，一次拿齐
-/// （末行可能是半行/被尾窗截断的巨行/记账行——统统向前回退）
+/// Reads the file tail and walks backwards: main entry + latest user input + model, all in one pass
+/// (the last line may be partial, a huge line cut by the tail window, or bookkeeping — all of those step back)
 pub fn tail_info(path: &Path) -> Option<TailInfo> {
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -298,18 +302,18 @@ pub fn tail_info(path: &Path) -> Option<TailInfo> {
     })
 }
 
-/// doctor 用的简化入口
+/// Simplified entry point for doctor
 pub fn tail_entry(path: &Path) -> Option<serde_json::Value> {
     tail_info(path).map(|t| t.entry)
 }
 
-/// 更新跟踪信息，并推送 running
+/// Updates the tracking info and pushes running
 fn ingest(app: &AppHandle, tracks: &mut HashMap<PathBuf, Trk>, path: &Path) {
     let Some(info) = tail_info(path) else {
         return;
     };
     let v = info.entry;
-    // transcript 字段是 camelCase（sessionId），与 hook stdin 的 snake_case 不同！
+    // Transcript fields are camelCase (sessionId), unlike the snake_case of the hook stdin!
     let session = v
         .get("sessionId")
         .and_then(|x| x.as_str())
@@ -327,9 +331,9 @@ fn ingest(app: &AppHandle, tracks: &mut HashMap<PathBuf, Trk>, path: &Path) {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    // 桌面端会话的 cwd 是内部 outputs 路径，对用户无意义，换成友好标签
+    // A desktop session's cwd is an internal outputs path that means nothing to the user; use a friendly label
     if cwd.contains("local-agent-mode-sessions") {
-        cwd = "Claude桌面".to_string();
+        cwd = "Claude desktop".to_string();
     }
     let typ = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
     let kind = match typ {
@@ -379,14 +383,15 @@ fn ingest(app: &AppHandle, tracks: &mut HashMap<PathBuf, Trk>, path: &Path) {
     if !info.model.is_empty() {
         t.model = info.model;
     }
-    // 每次追加都推 running（prompt/model 更新也随之送达）；
-    // 是否真广播由 state.apply 的可见变更检测去重
+    // Push running on every append (prompt/model updates travel with it);
+    // whether it is actually broadcast is decided by state.apply's visible-change check
     t.sent = "running";
     push(app, "running", t);
 }
 
-/// 自愈扫描：走一遍根目录，凡 mtime 比我们记录的 last_append 新且在新鲜窗口内的
-/// 会话文件都补一次 ingest——新会话目录、notify 丢事件都由它兜底
+/// Self-healing rescan: walk the roots and re-ingest every session file whose mtime is newer than
+/// our recorded last_append and inside the freshness window — new session directories and lost
+/// notify events are both covered by it
 fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth > 10 {
         return;
@@ -420,7 +425,7 @@ fn rescan(app: &AppHandle, tracks: &mut HashMap<PathBuf, Trk>) {
             continue;
         };
         if now.saturating_sub(mtime) > FRESH_WINDOW_MS {
-            continue; // 只关心近期活跃的
+            continue; // only recently active ones matter
         }
         let known = tracks.get(&p).map(|t| t.last_append).unwrap_or(0);
         if mtime > known {
@@ -429,7 +434,7 @@ fn rescan(app: &AppHandle, tracks: &mut HashMap<PathBuf, Trk>) {
     }
 }
 
-/// 静默判定：done / attention（推断）
+/// Quiet-time decision: done / attention (inferred)
 fn evaluate(app: &AppHandle, tracks: &mut HashMap<PathBuf, Trk>) {
     let now = now_ms();
     for t in tracks.values_mut() {
@@ -446,17 +451,17 @@ fn evaluate(app: &AppHandle, tracks: &mut HashMap<PathBuf, Trk>) {
                 t.sent = "attention";
                 push(app, "attention", t);
             }
-            // 强制停止：末条 user 带中断标记，快速判完
+            // Forced stop: the last user entry carries the interruption marker, judged done quickly
             Kind::User if t.interrupted && quiet > QUIET_DONE_MS && t.sent != "done" => {
                 t.sent = "done";
                 push(app, "done", t);
             }
-            // 末条 user 长静默（75s）：回合被放弃/停止（阈值容忍长思考）
+            // Last user entry and long silence (75 s): the turn was abandoned or stopped (the threshold tolerates long thinking)
             Kind::User if quiet > QUIET_USER_DONE_MS && t.sent != "done" => {
                 t.sent = "done";
                 push(app, "done", t);
             }
-            // 安全阀：其他类型 5 分钟无动静，不能让绿灯永远亮着
+            // Safety valve: any other type silent for 5 minutes must not keep the green light on forever
             Kind::Other if quiet > 5 * 60_000 && t.sent != "done" => {
                 t.sent = "done";
                 push(app, "done", t);
@@ -469,9 +474,9 @@ fn evaluate(app: &AppHandle, tracks: &mut HashMap<PathBuf, Trk>) {
 static PUSH_LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn push(app: &AppHandle, e: &str, t: &Trk) {
-    // 前 30 条推送落日志，供 doctor/排查（之后静音防日志膨胀）
+    // The first 30 pushes go to the log for doctor/troubleshooting (then silence, to keep the log small)
     if PUSH_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
-        wlog(&format!("推送 {} session={} cwd={}", e, t.session, t.cwd));
+        wlog(&format!("push {} session={} cwd={}", e, t.session, t.cwd));
     }
     let ev = HookEvent {
         e: e.to_string(),

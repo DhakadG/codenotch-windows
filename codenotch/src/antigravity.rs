@@ -1,26 +1,39 @@
-//! Antigravity（Google 的 IDE，Gemini 额度）用量适配器——按上游 Codenotch 的接口事实独立实现。
+//! Antigravity (Google's IDE, Gemini quota) usage adapter, implemented from the upstream
+//! Codenotch's documented behaviour.
 //!
-//! Google 不对第三方公布用量：`cloudcode-pa` 的 `retrieveUserQuotaSummary` 对个人账号答 403 #3501
-//! "no valid license"（它看"谁在问"，我们不能冒充 Antigravity）。上游的解法也是 Antigravity 自己的解法：
-//! 问本机正在运行的 language_server——它握着凭证和客户端身份，由它去问 Google。
+//! Google publishes no usage numbers to third parties: `cloudcode-pa`'s `retrieveUserQuotaSummary`
+//! answers a personal account with 403 #3501 "no valid license" (it looks at *who* is asking, and
+//! impersonating Antigravity is off the table). Upstream's answer is Antigravity's own answer: ask
+//! the language_server running on this machine — it holds the credential and the client identity
+//! and asks Google itself.
 //!
-//! 数据路（按诚实度排序，上游同款）：
-//!   1. 本机桥：找到 `language_server*` 进程（命令行带 `--csrf_token <t>`，端口 `--https_server_port 0`
-//!      运行时随机，只能从监听表找；它开两个端口只有一个答这个 RPC，逐个试），
+//! Data paths, most honest first (same as upstream):
+//!   1. Local bridge: find the `language_server*` process (its command line carries
+//!      `--csrf_token <t>`; the port is `--https_server_port 0`, i.e. random at runtime, and can
+//!      only be found in the listening table; it opens two ports and only one answers this RPC,
+//!      so both are tried),
 //!      POST `https://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`
-//!      头 `x-codeium-csrf-token: <t>`（Antigravity 基于 Codeium 栈，头名没改），体 `{"forceRefresh":true}`
-//!      （否则服务端从 QuotaSummaryCache 回旧值）。自签证书 → 仅对 127.0.0.1 放行校验。
-//!      响应 `{response:{groups:[{displayName, buckets:[{bucketId, displayName, remainingFraction, resetTime}]}]}}`，
-//!      **报的是剩余**，used = 1 - remainingFraction；标签用 group.displayName（bucket 只会说 "Weekly Limit Remaining"）。
-//!   2. 桥过去答过、现在不答 = Antigravity 关了（端口每次启动都变）：保留上次百分比标 stale，不换成计数。
-//!   3. 凭证路（有 Google token 时）：Windows 凭据管理器 target `gemini:antigravity`（Go keyring：service:user），
-//!      值为 JSON `{auth_method, token:{access_token, expiry(RFC3339 带偏移)}}`，macOS 上会带 `go-keyring-base64:` 前缀，
-//!      两种都认。POST `:loadCodeAssist`（`{"metadata":{"pluginType":"GEMINI"}}`，不是 ANTIGRAVITY）拿 tier 名；
-//!      再试 `:retrieveUserQuotaSummary`（空体 `{}`），有授权账号才 200，解析时自我怀疑（无正 limit 或 used>1.5×limit 丢弃）。
-//!   4. 兜底：数 `~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl` 里 `source=="MODEL"` 的
-//!      当天步数（created_at 是 UTC，按本地日比较）。这是**计数不是百分比**——没有公布的分母，环只画轨道。
+//!      with header `x-codeium-csrf-token: <t>` (Antigravity sits on the Codeium stack; the header
+//!      name never changed) and body `{"forceRefresh":true}` (otherwise the server answers from
+//!      QuotaSummaryCache). Self-signed certificate → verification is relaxed for 127.0.0.1 only.
+//!      Reply `{response:{groups:[{displayName, buckets:[{bucketId, displayName, remainingFraction, resetTime}]}]}}`
+//!      — it reports what **remains**, so used = 1 - remainingFraction; the label is
+//!      group.displayName (buckets only ever say "Weekly Limit Remaining").
+//!   2. Bridge answered before and does not now = Antigravity is closed (the port changes on every
+//!      launch): keep the last percentage marked stale rather than switching to a count.
+//!   3. Credential path (when a Google token exists): Windows Credential Manager target
+//!      `gemini:antigravity` (Go keyring: service:user), value JSON
+//!      `{auth_method, token:{access_token, expiry (RFC3339 with offset)}}`; on macOS it carries a
+//!      `go-keyring-base64:` prefix, and both forms are accepted. POST `:loadCodeAssist`
+//!      (`{"metadata":{"pluginType":"GEMINI"}}`, not ANTIGRAVITY) for the tier name; then try
+//!      `:retrieveUserQuotaSummary` (empty body `{}`), which is 200 only for licensed accounts, and
+//!      parse it defensively (no positive limit, or used > 1.5×limit → discard).
+//!   4. Fallback: count today's `source=="MODEL"` steps in
+//!      `~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl` (created_at is UTC,
+//!      compared by local day). This is a **count, not a percentage** — there is no published
+//!      denominator, so the ring draws only its track.
 //!
-//! 只读、不缓存 token 值、任何日志不带 token。
+//! Read only; token values are never cached and never appear in any log.
 
 use crate::usage::{LimitWindow, UsageSnapshot};
 use crate::AppState;
@@ -75,12 +88,12 @@ fn persist(s: &UsageSnapshot) {
     }
 }
 
-/// 装了 Antigravity 吗：状态目录存在，或凭据管理器里有它的 token
+/// Is Antigravity installed: the state directory exists, or Credential Manager holds its token
 pub fn present() -> bool {
     state_root().map(|p| p.is_dir()).unwrap_or(false) || read_credential_raw().is_some()
 }
 
-// ---------------- 1. 本机桥 ----------------
+// ---------------- 1. Local bridge ----------------
 
 #[derive(Clone, Debug, PartialEq)]
 struct Endpoint {
@@ -99,10 +112,10 @@ fn run_hidden(program: &str, args: &[&str]) -> String {
     cmd.output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
 }
 
-/// 进程表是唯一真相：token 在命令行上，端口没写在任何文件里
+/// The process table is the only source of truth: the token is on the command line and the port is written nowhere
 #[cfg(windows)]
 fn discover() -> Option<Endpoint> {
-    // PowerShell 的 CIM 查询：每行 "pid<TAB>commandline"
+    // PowerShell CIM query: one "pid<TAB>commandline" per line
     let table = run_hidden(
         "powershell",
         &[
@@ -146,7 +159,7 @@ fn flag_value(line: &str, flag: &str) -> Option<String> {
     parts.get(i + 1).map(|s| s.trim_matches('"').to_string())
 }
 
-/// netstat -ano：`TCP 127.0.0.1:PORT 0.0.0.0:0 LISTENING PID`
+/// netstat -ano: `TCP 127.0.0.1:PORT 0.0.0.0:0 LISTENING PID`
 #[cfg(windows)]
 fn listening_ports(pid: u32) -> Vec<u16> {
     let out = run_hidden("netstat", &["-ano", "-p", "TCP"]);
@@ -167,7 +180,7 @@ fn listening_ports(pid: u32) -> Vec<u16> {
     ports
 }
 
-/// 仅信任回环：自签证书只在 127.0.0.1 放行（不用于任何公网请求）
+/// Loopback only: the self-signed certificate is accepted for 127.0.0.1 alone (never used for any public request)
 fn local_agent() -> Option<ureq::Agent> {
     let tls = native_tls::TlsConnector::builder()
         .danger_accept_invalid_certs(true)
@@ -178,7 +191,7 @@ fn local_agent() -> Option<ureq::Agent> {
 }
 
 fn bridge_quota(ep: &Endpoint) -> Result<Vec<LimitWindow>, String> {
-    let agent = local_agent().ok_or("TLS 初始化失败")?;
+    let agent = local_agent().ok_or("TLS setup failed")?;
     let mut last = String::from("no port answered");
     for port in &ep.ports {
         let url = format!("https://127.0.0.1:{port}{LS_SERVICE}");
@@ -194,7 +207,7 @@ fn bridge_quota(ep: &Endpoint) -> Result<Vec<LimitWindow>, String> {
                     if !w.is_empty() {
                         return Ok(w);
                     }
-                    last = format!("port {port}: 无可识别的 groups");
+                    last = format!("port {port}: no recognisable groups");
                 }
                 Err(e) => last = format!("port {port}: {e}"),
             },
@@ -211,7 +224,7 @@ fn parse_iso(v: Option<&serde_json::Value>) -> Option<u64> {
         .map(|d| d.timestamp_millis().max(0) as u64)
 }
 
-/// 服务端报"剩余"，notch 显示"已用"：在这里翻转，不让视图层知道提供商差异
+/// The server reports what remains and the notch shows what is used: flip it here so the view never learns about provider differences
 pub fn windows_from_bridge(v: &serde_json::Value) -> Vec<LimitWindow> {
     let mut out = Vec::new();
     let Some(groups) = v.pointer("/response/groups").and_then(|g| g.as_array()) else { return out };
@@ -236,7 +249,7 @@ pub fn windows_from_bridge(v: &serde_json::Value) -> Vec<LimitWindow> {
     out
 }
 
-// ---------------- 3. 凭证路 ----------------
+// ---------------- 3. Credential path ----------------
 
 struct Creds {
     access_token: String,
@@ -244,7 +257,7 @@ struct Creds {
     auth_method: String,
 }
 
-/// Windows 凭据管理器：通用凭据 target = "gemini:antigravity"（Go keyring 的 service:user 命名）
+/// Windows Credential Manager: generic credential with target = "gemini:antigravity" (Go keyring's service:user naming)
 #[cfg(windows)]
 fn read_credential_raw() -> Option<Vec<u8>> {
     use windows::core::PCWSTR;
@@ -274,10 +287,10 @@ fn read_credential_raw() -> Option<Vec<u8>> {
     None
 }
 
-/// 原始 JSON 或 `go-keyring-base64:` 前缀的 base64（也兼容 UTF-16 存储）
+/// Raw JSON, or base64 with a `go-keyring-base64:` prefix (UTF-16 storage is accepted too)
 fn decode_credential(raw: &[u8]) -> Option<Creds> {
     let mut text = String::from_utf8(raw.to_vec()).unwrap_or_else(|_| {
-        // 有些写入方把 blob 存成 UTF-16LE
+        // Some writers store the blob as UTF-16LE
         let u16s: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         String::from_utf16_lossy(&u16s)
     });
@@ -296,7 +309,7 @@ fn decode_credential(raw: &[u8]) -> Option<Creds> {
     Some(Creds { access_token: access, expired, auth_method })
 }
 
-/// 零依赖 base64（标准表，容忍 URL-safe 与缺省 padding）
+/// Dependency-free base64 (standard alphabet, tolerant of URL-safe characters and missing padding)
 pub(crate) fn b64_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let mut buf = 0u32;
@@ -326,7 +339,7 @@ fn read_credentials() -> Option<Creds> {
     decode_credential(&read_credential_raw()?)
 }
 
-/// tier 名（"Personal"/"Pro"…）；401/403 → NeedsAuth
+/// Tier name ("Personal"/"Pro"…); 401/403 → NeedsAuth
 fn load_tier(token: &str) -> Result<String, String> {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
     match agent
@@ -355,7 +368,7 @@ fn load_tier(token: &str) -> Result<String, String> {
     }
 }
 
-/// 授权账号的直连配额；个人账号 403 → None（不是错误）
+/// Direct quota for licensed accounts; a personal account gets 403 → None (not an error)
 fn direct_quota(token: &str) -> Option<Vec<LimitWindow>> {
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
     let r = agent
@@ -382,7 +395,7 @@ fn direct_quota(token: &str) -> Option<Vec<LimitWindow>> {
             let limit = b.get("limit").and_then(|x| x.as_f64())?;
             let used = b.get("used").and_then(|x| x.as_f64())?;
             if limit <= 0.0 || used < 0.0 || used > limit * 1.5 {
-                return None; // 自我怀疑：形状不对就不画环
+                return None; // defensive: a reply of the wrong shape draws no ring
             }
             let label = b
                 .get("displayName")
@@ -406,9 +419,9 @@ fn direct_quota(token: &str) -> Option<Vec<LimitWindow>> {
     }
 }
 
-// ---------------- 4. 兜底计数 ----------------
+// ---------------- 4. Fallback count ----------------
 
-/// 当天 MODEL 步数（UTC 时间戳按本地日比较）
+/// Today's MODEL steps (UTC timestamps compared by local day)
 pub fn requests_today() -> (u64, Option<u64>) {
     use chrono::{Datelike, Local, TimeZone};
     let Some(root) = state_root().map(|r| r.join("brain")) else { return (0, None) };
@@ -437,13 +450,13 @@ pub fn requests_today() -> (u64, Option<u64>) {
                     count += 1;
                 }
             }
-            let _ = today.year(); // 保持 Datelike 引入有用
+            let _ = today.year(); // keeps the Datelike import in use
         }
     }
     (count, latest)
 }
 
-// ---------------- 汇总 ----------------
+// ---------------- Putting it together ----------------
 
 struct Runtime {
     endpoint: Option<Endpoint>,
@@ -452,7 +465,7 @@ struct Runtime {
 
 fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
     let mut snap = UsageSnapshot::default();
-    // 1. 本机桥（缓存的端点先试；端口每次启动都变，失效属正常）
+    // 1. Local bridge (the cached endpoint first; the port changes on every launch, so a miss is normal)
     let mut bridge_err = String::new();
     let mut tried = false;
     if let Some(ep) = rt.endpoint.clone() {
@@ -488,16 +501,16 @@ fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
         }
     }
     if tried && !bridge_err.is_empty() {
-        crate::applog(&format!("antigravity: 本机桥失败（{bridge_err}）"));
+        crate::applog(&format!("antigravity: local bridge failed ({bridge_err})"));
     }
-    // 2. 曾经桥通过：保留上次百分比标 stale，不降级成计数（8%→31 看着像坏了）
+    // 2. The bridge worked before: keep the last percentage marked stale instead of degrading to a count (8% → 31 looks broken)
     if rt.ever_bridged && !prev.windows.is_empty() {
         snap = prev.clone();
         snap.status = "stale".into();
         snap.note = "Antigravity is closed — last reading kept".into();
         return snap;
     }
-    // 3. 凭证路
+    // 3. Credential path
     let mut tier: Option<String> = None;
     match read_credentials() {
         Some(c) if !c.expired => match load_tier(&c.access_token) {
@@ -519,12 +532,12 @@ fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
             Err(e) => crate::applog(&format!("antigravity: loadCodeAssist {e}")),
         },
         Some(c) => {
-            // 过期≠登出：Antigravity 下次运行会自己刷新；tier 用 auth_method 顶一下
+            // Expired ≠ signed out: Antigravity refreshes it on its next run; auth_method stands in for the tier
             tier = Some(if c.auth_method == "consumer" { "Personal".into() } else { c.auth_method.clone() });
         }
         None => {}
     }
-    // 4. 计数兜底（derived：卡片加 ~ 前缀，环只画轨道）
+    // 4. Count fallback (derived: the card gets a ~ prefix and the ring draws only its track)
     let (n, latest) = requests_today();
     snap.status = "ok".into();
     snap.fetched_at = latest.unwrap_or_else(now_ms);
@@ -589,23 +602,23 @@ pub fn start(app: AppHandle) {
     });
 }
 
-/// doctor 用：不含秘密
+/// For doctor: contains no secrets
 pub fn probe() -> String {
     let root = state_root().map(|p| p.display().to_string()).unwrap_or_default();
     let has_root = state_root().map(|p| p.is_dir()).unwrap_or(false);
     let cred = read_credentials();
     let ep = discover();
     format!(
-        "Antigravity: 状态目录 {}（{}） | 凭据管理器 gemini:antigravity {} | language_server {}",
+        "Antigravity: state dir {} ({}) | Credential Manager gemini:antigravity {} | language_server {}",
         root,
-        if has_root { "存在" } else { "不存在" },
+        if has_root { "present" } else { "missing" },
         match cred {
-            Some(c) => format!("已找到（{}，{}）", c.auth_method, if c.expired { "已过期" } else { "未过期" }),
-            None => "未找到".into(),
+            Some(c) => format!("found ({}, {})", c.auth_method, if c.expired { "expired" } else { "valid" }),
+            None => "not found".into(),
         },
         match ep {
-            Some(e) => format!("在跑，端口 {:?}", e.ports),
-            None => "未运行".into(),
+            Some(e) => format!("running, ports {:?}", e.ports),
+            None => "not running".into(),
         }
     )
 }

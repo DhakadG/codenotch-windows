@@ -1,5 +1,6 @@
-//! `codenotch.exe doctor deep`：给"在干活吗"探测找信号用的深度诊断。
-//! 只打印结构、时间和很短的标量；任何长字符串只报长度，不会把 token / 对话内容打出来。
+//! `codenotch.exe doctor deep`: deep diagnostics for finding "is it working?" signals.
+//! Prints only structure, times and very short scalars; long strings are reported as lengths, so no
+//! token or conversation content ever appears.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,7 +13,7 @@ fn mtime_ms(p: &Path) -> Option<u64> {
     std::fs::metadata(p).ok()?.modified().ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis() as u64)
 }
 
-/// 最近 `within_s` 秒内改动过的文件（限深度），按新旧排序
+/// Files modified within the last `within_s` seconds (depth-limited), sorted newest first
 fn recent_files(root: &Path, depth: usize, within_s: u64, out: &mut Vec<(u64, PathBuf)>) {
     let Ok(rd) = std::fs::read_dir(root) else { return };
     let now = now_ms();
@@ -51,17 +52,17 @@ fn short(v: &rusqlite::types::Value) -> String {
     }
 }
 
-/// 一个 SQLite 库的结构 + 每张表按"时间样"列取最新一行（短值）
+/// Structure of one SQLite database plus, per table, the newest row by a time-like column (short values)
 fn dump_sqlite(path: &Path) -> String {
     use rusqlite::OpenFlags;
-    let mut o = format!("--- {} ({}，改动于 {}s 前)\n", path.display(), if path.is_file() { "存在" } else { "不存在" }, now_ms().saturating_sub(mtime_ms(path).unwrap_or(0)) / 1000);
+    let mut o = format!("--- {} ({}, modified {}s ago)\n", path.display(), if path.is_file() { "present" } else { "missing" }, now_ms().saturating_sub(mtime_ms(path).unwrap_or(0)) / 1000);
     if !path.is_file() {
         return o;
     }
     let conn = match rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX) {
         Ok(c) => c,
         Err(e) => {
-            o += &format!("  打不开: {e}\n");
+            o += &format!("  cannot open: {e}\n");
             return o;
         }
     };
@@ -75,8 +76,8 @@ fn dump_sqlite(path: &Path) -> String {
             .and_then(|mut s| s.query_map([], |r| r.get::<_, String>(1)).map(|rows| rows.flatten().collect()))
             .unwrap_or_default();
         let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM \"{t}\""), [], |r| r.get(0)).unwrap_or(-1);
-        o += &format!("  表 {t} ({count} 行): {}\n", cols.join(", "));
-        // 时间样列：updated/created/_at/time/recency
+        o += &format!("  table {t} ({count} rows): {}\n", cols.join(", "));
+        // Time-like columns: updated/created/_at/time/recency
         let timeish: Vec<&String> = cols
             .iter()
             .filter(|c| {
@@ -95,7 +96,7 @@ fn dump_sqlite(path: &Path) -> String {
                             let v: rusqlite::types::Value = row.get(i).unwrap_or(rusqlite::types::Value::Null);
                             parts.push(format!("{}={}", cols.get(i).cloned().unwrap_or_default(), short(&v)));
                         }
-                        o += &format!("    最新一行(按 {tc}): {}\n", parts.join(" | "));
+                        o += &format!("    newest row (by {tc}): {}\n", parts.join(" | "));
                     }
                 }
             }
@@ -104,15 +105,15 @@ fn dump_sqlite(path: &Path) -> String {
     o
 }
 
-/// JSON 文件：只打印标量键（短字符串/数字/布尔），长字符串报长度，嵌套只报类型
+/// JSON file: prints only scalar keys (short strings/numbers/booleans); long strings as lengths, nested values as their type
 fn dump_json_scalars(path: &Path) -> String {
-    let mut o = format!("--- {} (改动于 {}s 前)\n", path.display(), now_ms().saturating_sub(mtime_ms(path).unwrap_or(0)) / 1000);
+    let mut o = format!("--- {} (modified {}s ago)\n", path.display(), now_ms().saturating_sub(mtime_ms(path).unwrap_or(0)) / 1000);
     let Ok(t) = std::fs::read_to_string(path) else {
-        o += "  读不到\n";
+        o += "  unreadable\n";
         return o;
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else {
-        o += "  非 JSON\n";
+        o += "  not JSON\n";
         return o;
     };
     fn walk(v: &serde_json::Value, prefix: &str, depth: usize, o: &mut String) {
@@ -134,11 +135,11 @@ fn dump_json_scalars(path: &Path) -> String {
 }
 
 pub fn run() -> String {
-    let mut o = String::from("== doctor deep：活动态信号侦察 ==\n（请在 Codex 桌面版和 Claude 桌面版都正在工作时运行）\n\n");
+    let mut o = String::from("== doctor deep: working-state signal survey ==\n(run it while both the Codex desktop app and the Claude desktop app are working)\n\n");
     let home = dirs::home_dir().unwrap_or_default();
     let local = dirs::data_local_dir().unwrap_or_default();
 
-    o += "## 最近 120 s 内改动过的文件\n";
+    o += "## Files modified in the last 120 s\n";
     let mut recent = Vec::new();
     recent_files(&home.join(".codex"), 2, 120, &mut recent);
     if let Ok(rd) = std::fs::read_dir(local.join("Packages")) {
@@ -153,13 +154,13 @@ pub fn run() -> String {
     recent_files(&dirs::config_dir().unwrap_or_default().join("Cursor").join("User").join("globalStorage"), 1, 120, &mut recent);
     recent.sort();
     for (age, p) in recent.iter().take(60) {
-        o += &format!("  {age:>4}s 前  {}\n", p.display());
+        o += &format!("  {age:>4}s ago  {}\n", p.display());
     }
     if recent.is_empty() {
-        o += "  （没有）\n";
+        o += "  (none)\n";
     }
 
-    o += "\n## Codex 的 SQLite 库\n";
+    o += "\n## Codex SQLite databases\n";
     for rel in [
         "state_5.sqlite",
         "thread_history_1.sqlite",
@@ -170,23 +171,23 @@ pub fn run() -> String {
         o += &dump_sqlite(&home.join(".codex").join(rel));
     }
 
-    o += "\n## Codex 全局状态 JSON（仅标量键）\n";
+    o += "\n## Codex global state JSON (scalar keys only)\n";
     o += &dump_json_scalars(&home.join(".codex").join(".codex-global-state.json"));
 
-    o += "\n## Codex session_index.jsonl 末行（键名）\n";
+    o += "\n## Last line of Codex session_index.jsonl (key names)\n";
     if let Ok(t) = std::fs::read_to_string(home.join(".codex").join("session_index.jsonl")) {
         if let Some(last) = t.lines().rev().find(|l| !l.trim().is_empty()) {
             match serde_json::from_str::<serde_json::Value>(last) {
                 Ok(v) => {
                     let keys: Vec<String> = v.as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
-                    o += &format!("  键: {}\n", keys.join(", "));
+                    o += &format!("  keys: {}\n", keys.join(", "));
                 }
-                Err(_) => o += "  非 JSON\n",
+                Err(_) => o += "  not JSON\n",
             }
         }
     }
 
-    o += "\n## Codex 进程（含命令行前 120 字符）\n";
+    o += "\n## Codex processes (first 120 characters of the command line)\n";
     #[cfg(windows)]
     {
         let mut cmd = std::process::Command::new("powershell");

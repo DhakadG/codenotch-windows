@@ -1,17 +1,26 @@
-//! 非 Claude 提供商的"在干活吗"探测（Claude 走 hooks + transcript watcher 的四态引擎，不在这里）。
+//! "Is it working?" for the non-Claude providers (Claude's local sessions go through the hooks +
+//! transcript-watcher engine, not here).
 //!
-//! 三家都没有像 Claude Code 那样的状态字段，能拿到什么就如实标注什么（上游同款取舍）：
-//!   - Cursor：编辑器状态库 `state.vscdb` 的 `composerHeaders` 行（JSON）——`unfinishedRunAt` 在一轮运行中
-//!     被设置、结束即清；`hasBlockingPendingActions` / `hasPendingPlan` = 在等你。这是**真状态**。
-//!     库是 WAL 模式：必须用普通只读打开（immutable 会忽略 WAL，看到的是上次 checkpoint 的旧世界）。
-//!   - Codex：桌面版在 `~/.codex/thread_history_1.sqlite` 的 `thread_turns` 里维护回合状态
-//!     （status=inProgress 且 completed_at 为空 = 正在跑）——真状态；CLI / VS Code 扩展退回按 rollout
-//!     尾条目判步骤，静默阈值按步骤类型放宽。
-//!   - Claude 云端会话：本地无 transcript，按桌面应用进程的网络收发速率推断（标 ~）。
-//!   - Antigravity：transcript.jsonl 在一轮运行中被追加（每步只在完成后才写，status 全是 DONE 没法用），
-//!     最近 45 s 内写过 = 在干活（模型两步之间可能想很久，窗口放宽）。
-//! 轮询 2 s（上游节奏），只在有变化时广播。成本纪律：数据库连接持久化、库文件 mtime 没变不重查、
-//! rollout 尾部 mtime 没变不重读、PowerShell 只在找网络进程 pid 时偶尔起一次、线程降优先级。
+//! None of the three has a state field like Claude Code's, so each is labelled with whatever it
+//! can honestly provide (the same trade-off upstream made):
+//!   - Cursor: the `composerHeaders` rows (JSON) in the editor's `state.vscdb` — `unfinishedRunAt`
+//!     is set for the duration of a run and cleared when it ends; `hasBlockingPendingActions` /
+//!     `hasPendingPlan` = waiting on you. This is **real state**. The database is in WAL mode, so
+//!     it must be opened as a plain read-only connection (immutable ignores the WAL and shows the
+//!     world as of the last checkpoint).
+//!   - Codex: the desktop app keeps turn state in `thread_turns` inside
+//!     `~/.codex/thread_history_1.sqlite` (status = inProgress with an empty completed_at = running)
+//!     — real state. The CLI / VS Code extension fall back to classifying the last entry of the
+//!     rollout, with a silence threshold that depends on the entry type.
+//!   - Claude cloud sessions: no local transcript, so they are inferred from the desktop app's
+//!     network throughput (marked ~).
+//!   - Antigravity: transcript.jsonl is appended during a run (each step is written only once it
+//!     completes, so status is always DONE and useless); written within the last 45 s = working
+//!     (the model can think for a long time between steps, hence the wide window).
+//! Polled every 2 s (upstream cadence), broadcast only on change. Cost discipline: database
+//! connections stay open, nothing is re-queried unless the file's mtime changed, the rollout tail
+//! is re-read only when its mtime changed, PowerShell runs only occasionally to find the network
+//! process pid, and the thread runs at lowered priority.
 
 use crate::AppState;
 use serde::Serialize;
@@ -23,7 +32,7 @@ const ANTIGRAVITY_STALE_MS: u64 = 45_000;
 
 #[derive(Clone, Serialize, Debug, PartialEq)]
 pub struct Activity {
-    /// claude 之外的提供商 id：codex / cursor / gemini
+    /// Provider id other than claude: codex / cursor / gemini
     pub provider: String,
     /// busy | waiting
     pub state: String,
@@ -51,8 +60,9 @@ fn mtime_ms(p: &std::path::Path) -> Option<u64> {
 }
 
 
-/// 持久连接 + 变更门控：只有库文件（含 -wal）的 mtime 变了才重新查询，否则直接复用上次结果。
-/// Cursor 的 state.vscdb 有 2 GB 以上，每 2 s 重新打开并全表扫描会拖慢整机（实测输入都卡）。
+/// Persistent connection + change gating: the query runs again only when the database file (or its
+/// -wal) changed mtime; otherwise the last result is reused. Cursor's state.vscdb is over 2 GB, and
+/// reopening it every 2 s for a table scan slowed the whole machine (typing lagged).
 struct DbCache {
     path: std::path::PathBuf,
     conn: Option<rusqlite::Connection>,
@@ -73,7 +83,7 @@ impl DbCache {
         };
         (mtime_ms(&self.path).unwrap_or(0), mtime_ms(&wal).unwrap_or(0))
     }
-    /// 变了（或首次）才调用 f；f 返回 None 表示查询失败 → 丢弃连接下次重开
+    /// Calls f only when something changed (or on the first run); f returning None means the query failed → drop the connection and reopen next time
     fn refresh<F: FnOnce(&rusqlite::Connection) -> Option<Vec<Activity>>>(&mut self, f: F) -> Vec<Activity> {
         let sig = self.signature();
         if self.checked_once && sig == self.sig {
@@ -99,7 +109,7 @@ impl DbCache {
     }
 }
 
-/// 探测线程的全部可复用状态
+/// Everything the probe thread keeps between ticks
 struct Ctx {
     cursor: DbCache,
     codex_turns: DbCache,
@@ -153,7 +163,7 @@ fn cursor_activity(ctx: &mut Ctx) -> Vec<Activity> {
             } else if running.is_some() {
                 "busy"
             } else {
-                continue; // 四十条闲置的历史对话不是四十件正在发生的事
+                continue; // forty idle past conversations are not forty things happening now
             };
             let since = running
                 .or_else(|| v.get("lastUpdatedAt").and_then(|x| x.as_f64()))
@@ -179,13 +189,15 @@ fn cursor_activity(ctx: &mut Ctx) -> Vec<Activity> {
 
 // ---------------- Codex ----------------
 
-/// rollout 尾部最后一条"有意义"的记录说明 Codex 正处在哪一步。
-/// 行形如 {"timestamp","type":"response_item"|"turn_context"|"event_msg"|…,"payload":{…}}；
-/// task_started/task_complete 这类事件不落盘，所以只能靠条目类型 + 静默时长判断：
-///   函数调用（工具在跑，或在等你批准）→ 忙，最多认 10 分钟；
-///   工具输出 / 用户消息 / 回合上下文 / 推理 → 模型在想下一步，静默 <120 s 算忙（长思考要容忍）；
-///   助手消息 → 可能是终答也可能是过程旁白，静默 <4 s 算忙；
-///   turn_aborted → 闲。token_count 之类的记账行跳过。
+/// The last meaningful entry at the tail of a rollout says which step Codex is on.
+/// Lines look like {"timestamp","type":"response_item"|"turn_context"|"event_msg"|…,"payload":{…}};
+/// task_started/task_complete events are not always written, so the decision rests on the entry
+/// type plus how long the file has been silent:
+///   function call (a tool is running, or waiting for your approval) → busy, for up to 10 minutes;
+///   tool output / user message / turn context / reasoning → the model is deciding the next step,
+///   busy while silent for < 120 s (long thinking has to be tolerated);
+///   assistant message → could be the final answer or narration along the way, busy while silent for < 4 s;
+///   turn_aborted → idle. Bookkeeping lines such as token_count are skipped.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum CodexStep {
     Tool,
@@ -214,17 +226,17 @@ fn codex_last_step(text: &str) -> Option<(CodexStep, u64)> {
                 "message" => match p.get("role").and_then(|x| x.as_str()).unwrap_or("") {
                     "assistant" => Some(CodexStep::AsstMsg),
                     "user" => Some(CodexStep::Thinking),
-                    _ => None, // system/developer 消息不说明状态
+                    _ => None, // system/developer messages say nothing about state
                 },
                 _ => None,
             },
             "event_msg" => match pt {
-                "turn_aborted" | "task_complete" => Some(CodexStep::Aborted), // 新版会落盘 task_complete：明确结束
+                "turn_aborted" | "task_complete" => Some(CodexStep::Aborted), // newer builds do write task_complete: an explicit end
                 "task_started" | "item_started" | "exec_command_begin" => Some(CodexStep::Thinking),
                 "user_message" => Some(CodexStep::Thinking),
                 "agent_message" => Some(CodexStep::AsstMsg),
                 "agent_reasoning" | "agent_reasoning_raw_content" => Some(CodexStep::Thinking),
-                _ => None, // token_count 等记账行
+                _ => None, // token_count and other bookkeeping lines
             },
             _ => None,
         };
@@ -235,10 +247,11 @@ fn codex_last_step(text: &str) -> Option<(CodexStep, u64)> {
     None
 }
 
-/// 桌面版 Codex 的真状态：`~/.codex/thread_history_1.sqlite` 表 `thread_turns`
-/// （status = inProgress / completed…，started_at 秒，completed_at 空 = 还在跑）。
-/// 这是应用自己维护的回合表，比看文件 mtime 可靠得多。防"崩溃后永远 inProgress"：
-/// 该线程最近 10 分钟内没有新 item（`thread_items.created_at_ms`）且回合已开始超过 2 分钟 → 视为陈旧。
+/// The desktop app's real state: table `thread_turns` in `~/.codex/thread_history_1.sqlite`
+/// (status = inProgress / completed…, started_at in seconds, empty completed_at = still running).
+/// The app maintains this turn table itself, which is far more reliable than a file mtime. Guard
+/// against "inProgress forever after a crash": no new item for the thread in the last 10 minutes
+/// (`thread_items.created_at_ms`) while the turn started more than 2 minutes ago → treated as stale.
 fn codex_turns_in_progress(ctx: &mut Ctx) -> Vec<Activity> {
     let now = now_ms();
     if ctx.codex_names.is_none() {
@@ -257,7 +270,7 @@ fn codex_turns_in_progress(ctx: &mut Ctx) -> Vec<Activity> {
                 rusqlite::types::Value::Real(f) => (f * if f > 10_000_000_000.0 { 1.0 } else { 1000.0 }) as u64,
                 _ => 0,
             };
-            // 该线程最近一条 item：新鲜度 + 是否在等批准
+            // The thread's latest item: freshness, and whether it is waiting for approval
             let (last_ms, last_type): (Option<i64>, Option<String>) = conn
                 .query_row(
                     "SELECT created_at_ms, item_type FROM thread_items WHERE thread_id = ?1 ORDER BY created_at_ms DESC LIMIT 1",
@@ -306,12 +319,12 @@ fn codex_turns_in_progress(ctx: &mut Ctx) -> Vec<Activity> {
 }
 
 fn codex_activity(ctx: &mut Ctx) -> Vec<Activity> {
-    // 1. 桌面版真状态
+    // 1. The desktop app's real state
     let turns = codex_turns_in_progress(ctx);
     if !turns.is_empty() {
         return turns;
     }
-    // 2. CLI / 扩展：rollout 路径 30 s 找一次；文件 mtime 没变就不重读 256 KB 尾部
+    // 2. CLI / extension: locate the rollout every 30 s; skip the 256 KB tail read when its mtime has not changed
     let now = now_ms();
     if now.saturating_sub(ctx.rollout_checked_at) > 30_000 || ctx.rollout_path.is_none() {
         ctx.rollout_checked_at = now;
@@ -320,7 +333,7 @@ fn codex_activity(ctx: &mut Ctx) -> Vec<Activity> {
     let Some(p) = ctx.rollout_path.clone() else { return vec![] };
     let mtime = mtime_ms(&p).unwrap_or(0);
     if mtime == ctx.rollout_sig {
-        // 内容没变：只重算"静默是否超时"
+        // Content unchanged: only re-evaluate whether the silence has timed out
         return ctx
             .rollout_last
             .iter()
@@ -348,12 +361,13 @@ fn codex_activity(ctx: &mut Ctx) -> Vec<Activity> {
     ctx.rollout_last.clone()
 }
 
-// ---------------- Claude 桌面版（云端会话）：网络活动启发式 ----------------
+// ---------------- Claude desktop (cloud sessions): network-activity heuristic ----------------
 
-/// 云端会话不落本地 transcript，四态引擎看不见。退而求其次：Claude 桌面应用的进程在流式
-/// 输出时会持续从网络收数据（Winsock 走 AFD 的 IOCTL，计入进程 IO 计数的 Other 项）。
-/// 每 2 s 采样所有 claude.exe 的 Other+Read 传输量，速率超过阈值即"在流式输出"。
-/// 明确标为推断（~），阈值可在校准后调整；前 60 次采样写 run.log 供校准。
+/// Cloud sessions leave no local transcript, so the four-state engine cannot see them. Next best
+/// thing: while output is streaming, the Claude desktop app keeps receiving data from the network
+/// (Winsock goes through AFD IOCTLs, which land in the Other counter of the process I/O counters).
+/// Sampled every 2 s; a rate above the threshold means "streaming". Explicitly marked as inferred
+/// (~); the first 60 samples go to run.log so the threshold can be calibrated.
 struct IoSample {
     at: u64,
     other: u64,
@@ -361,13 +375,15 @@ struct IoSample {
 }
 static CLAUDE_IO: std::sync::Mutex<Option<IoSample>> = std::sync::Mutex::new(None);
 static CLAUDE_LAST_ACTIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-const CLAUDE_RATE_BPS: f64 = 2_500.0; // 只看网络服务进程的 socket 收发；空闲心跳远低于此，流式输出高于此
-const CLAUDE_HOLD_MS: u64 = 10_000; // 工具调用之间常有 2–4 s 的零流量间隙，10 s 保持避免闪断
+const CLAUDE_RATE_BPS: f64 = 2_500.0; // socket traffic of the network service process only; the idle heartbeat is far below this, streaming far above
+const CLAUDE_HOLD_MS: u64 = 10_000; // tool calls often leave 2–4 s gaps with zero traffic; holding for 10 s avoids flicker
 static CLAUDE_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Claude 桌面应用（Electron）的网络服务子进程 pid：命令行含 `network.mojom.NetworkService`。
-/// 所有 socket 收发都经它，GPU/渲染进程的 IOCTL 噪声（显卡驱动调用也计入 Other）与它无关。
-/// 找一次缓存起来，进程消失或每 5 分钟重找；用 PowerShell 查命令行，代价只在重找时付。
+/// Pid of the Claude desktop app's (Electron) network service child: its command line contains
+/// `network.mojom.NetworkService`. All socket traffic goes through it, so the IOCTL noise of the
+/// GPU/renderer processes (driver calls count as Other too) stays out. Found once and cached;
+/// looked up again when the process disappears or every 5 minutes. The command line comes from
+/// PowerShell, so that cost is paid only on a lookup.
 static CLAUDE_NET_PID: std::sync::Mutex<(u32, u64)> = std::sync::Mutex::new((0, 0));
 
 #[cfg(windows)]
@@ -379,11 +395,11 @@ fn claude_net_pid(maps: &crate::focus::ProcMaps) -> Option<u32> {
         if pid != 0 && maps.name.get(&pid).map(|n| n == "claude.exe").unwrap_or(false) && now.saturating_sub(at) < 5 * 60_000 {
             return Some(pid);
         }
-        // 找不到也要缓存 60 s：否则每 2 s 起一次 PowerShell（每次几百毫秒 CPU）就是新的卡顿源
+        // Cache a miss for 60 s too: otherwise a PowerShell run every 2 s (a few hundred ms of CPU each) becomes the next source of lag
         if pid == 0 && at != 0 && now.saturating_sub(at) < 60_000 {
             return None;
         }
-        // Claude 桌面版根本没开：不必起 PowerShell
+        // Claude desktop is not running at all: no need for PowerShell
         if !maps.name.values().any(|n| n == "claude.exe") {
             return None;
         }
@@ -462,7 +478,7 @@ fn claude_activity() -> Vec<Activity> {
     if SAMPLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 240 {
         crate::applog(&format!("claude io: net {:.0} B/s, disk {:.0} B/s", rate_other, rate_read));
     }
-    // 连续两次采样（≈4 s）都超阈值才算，单次尖峰（心跳、同步）不算
+    // Two consecutive samples (≈4 s) above the threshold; a single spike (heartbeat, sync) does not count
     if rate_other >= CLAUDE_RATE_BPS {
         if CLAUDE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1 {
             CLAUDE_LAST_ACTIVE.store(now, std::sync::atomic::Ordering::Relaxed);
@@ -498,7 +514,7 @@ fn antigravity_activity() -> Vec<Activity> {
     vec![Activity { provider: "gemini".into(), state: "busy".into(), name: "Antigravity".into(), detail: "Working".into(), since: at }]
 }
 
-// ---------------- 汇总 ----------------
+// ---------------- Putting it together ----------------
 
 #[derive(Clone, Copy, Default)]
 pub struct Presence {
@@ -526,10 +542,10 @@ fn read_all(p: Presence, ctx: &mut Ctx) -> Vec<Activity> {
     all
 }
 
-/// doctor 用：Codex 活动态判定的原材料
+/// For doctor: the raw material behind the Codex working-state decision
 pub fn probe() -> String {
     let now = now_ms();
-    let Some(p) = crate::codex::newest_rollout() else { return "Codex 活动态: 未找到 rollout".into() };
+    let Some(p) = crate::codex::newest_rollout() else { return "Codex activity: no rollout found".into() };
     let age = now.saturating_sub(mtime_ms(&p).unwrap_or(0)) / 1000;
     let step = crate::codex::tail_text(&p).and_then(|t| codex_last_step(&t));
     let tail: Vec<String> = crate::codex::tail_text(&p)
@@ -548,15 +564,15 @@ pub fn probe() -> String {
                                 v.pointer("/payload/role").and_then(|x| x.as_str()).unwrap_or("-")
                             )
                         })
-                        .unwrap_or_else(|_| "（非 JSON 行）".into())
+                        .unwrap_or_else(|_| "(not a JSON line)".into())
                 })
                 .collect()
         })
         .unwrap_or_default();
     format!(
-        "Codex 活动态: rollout={} 改动于 {age}s 前 | 末步判定={:?} | 尾 6 行(type/payload.type/role)=[{}]",
+        "Codex activity: rollout={} modified {age}s ago | last step={:?} | last 6 lines (type/payload.type/role)=[{}]",
         p.display(),
-        step.map(|(s, ts)| format!("{s:?} @{}s前", now.saturating_sub(ts) / 1000)),
+        step.map(|(s, ts)| format!("{s:?} @{}s ago", now.saturating_sub(ts) / 1000)),
         tail.join(", ")
     )
 }
@@ -573,20 +589,20 @@ pub fn lower_thread_priority() {}
 
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
-        lower_thread_priority(); // 探测永远让位于前台输入
+        lower_thread_priority(); // the probe always yields to foreground input
         let mut ctx = Ctx::new();
         let mut last: Vec<Activity> = Vec::new();
         let mut pres = presence();
         let mut tick: u32 = 0;
         loop {
-            // 存在性探测（找 exe、查凭据）每分钟一次就够；2 s 的节拍只做 stat 和一条查询
+            // Presence checks (finding the exe, reading credentials) once a minute are plenty; the 2 s tick does only stats and a query
             if tick % 30 == 0 {
                 pres = presence();
             }
             tick = tick.wrapping_add(1);
             let found = read_all(pres, &mut ctx);
             if found != last {
-                // 活动态变化前 20 次落日志（含 Codex 判定原材料），便于校准阈值
+                // Log the first 20 state changes (with the Codex raw material) so thresholds can be calibrated
                 static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
                     crate::applog(&format!("activity: {:?} | {}", found.iter().map(|a| format!("{}:{}", a.provider, a.state)).collect::<Vec<_>>(), probe()));

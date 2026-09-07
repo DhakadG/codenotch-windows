@@ -1,13 +1,13 @@
-//! Claude 用量适配器（.official）——按上游 Codenotch 的接口事实独立实现。
-//! 端点：GET https://api.anthropic.com/api/oauth/usage
-//! 头：Authorization: Bearer <token>；anthropic-beta: oauth-2025-04-20；超时 15s
-//! 语义（照上游纪律）：
-//!   - 凭证来自 Claude Code 自己的存储（Windows: ~/.claude/.credentials.json），我们只读
-//!   - 401/403 → 重读一次凭证再试一次（Claude Code 可能刚刷新过 token）→ 仍败则 needsAuth
-//!   - 429 → 退避 60s×2^n 封顶 15min，Retry-After 只作下限；退避截止持久化
-//!   - 失败绝不编造百分比：保留上次读数标记 stale，UI 显示"多旧"
-//! 响应（snake_case）：{ limits:[{kind,percent,resets_at}], five_hour:{utilization,resets_at}, seven_day:{...} }
-//! limits 为前向兼容主形；five_hour/seven_day 作为兜底合并（刚滚动重置的窗口会从 limits 消失）。
+//! Claude usage adapter (official), implemented from the upstream Codenotch's documented behaviour.
+//! Endpoint: GET https://api.anthropic.com/api/oauth/usage
+//! Headers: Authorization: Bearer <token>; anthropic-beta: oauth-2025-04-20; 15 s timeout
+//! Rules (upstream's discipline):
+//!   - the credential comes from Claude Code's own store (Windows: ~/.claude/.credentials.json), read only
+//!   - 401/403 → re-read the credential once and retry (Claude Code may have just refreshed the token) → still failing means needsAuth
+//!   - 429 → back off 60 s × 2^n capped at 15 min, Retry-After only raises it; the deadline is persisted
+//!   - never invent a percentage on failure: keep the last reading marked stale, and the UI shows how old it is
+//! Reply (snake_case): { limits:[{kind,percent,resets_at}], five_hour:{utilization,resets_at}, seven_day:{...} }
+//! limits is the forward-compatible main shape; five_hour/seven_day are merged in as a fallback (a window that just rolled over disappears from limits).
 
 use crate::AppState;
 use serde::{Deserialize, Serialize};
@@ -22,12 +22,12 @@ const BACKOFF_CAP_SECS: u64 = 900;
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 托盘/命令触发的立即刷新
+/// Immediate refresh from the tray or a command
 pub fn request_refresh() {
     REFRESH.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// 可被 request_refresh 打断的分段睡眠
+/// Sleep in slices so request_refresh can interrupt it
 fn sleep_interruptible(total_secs: u64) {
     for _ in 0..total_secs {
         if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -48,14 +48,14 @@ fn now_ms() -> u64 {
 pub struct LimitWindow {
     pub id: String,
     pub label: String,
-    /// 0.0–1.0（已用比例）
+    /// 0.0–1.0 (fraction used)
     pub used: f64,
-    /// 重置时刻 ms epoch（None = 未知）
+    /// Reset time, ms epoch (None = unknown)
     pub resets_at: Option<u64>,
-    /// 纯计数窗口（没有公布的分母时，如 Antigravity 的"今日请求数"）——cell 显示 ~N，环只画轨道
+    /// Pure count window (no published denominator, e.g. Antigravity's requests today) — the cell shows ~N and the ring draws only its track
     #[serde(default)]
     pub count: Option<i64>,
-    /// 数字是我们自己算的而非厂商公布（上游 fidelity=.derived）——卡片加 ~ 前缀
+    /// The number is ours, not the vendor's (upstream fidelity=.derived) — the card adds a ~ prefix
     #[serde(default)]
     pub derived: bool,
 }
@@ -81,7 +81,7 @@ pub fn load_persisted() -> UsageSnapshot {
         .and_then(|t| serde_json::from_str::<UsageSnapshot>(&t).ok())
         .map(|mut s| {
             if !s.windows.is_empty() {
-                s.status = "stale".into(); // 重启后的旧读数如实标注
+                s.status = "stale".into(); // an old reading after a restart is labelled as such
             }
             s
         })
@@ -94,7 +94,7 @@ fn persist(s: &UsageSnapshot) {
     }
 }
 
-/// 读 Claude Code 的 OAuth 凭证。返回 (token, 过期提示)。
+/// Reads Claude Code's OAuth credential. Returns (token, expired hint).
 fn read_credentials() -> Option<(String, bool)> {
     let home = dirs::home_dir()?;
     for name in [".credentials.json", "credentials.json"] {
@@ -118,15 +118,15 @@ fn read_credentials() -> Option<(String, bool)> {
     None
 }
 
-/// 供 doctor 使用：凭证探测报告（不输出任何秘密值）
+/// For doctor: credential probe report (prints no secret values)
 pub fn probe_credentials() -> String {
     match read_credentials() {
         Some((tok, expired)) => format!(
-            "凭证: 已找到（token {} 字符，{}）",
+            "credential: found (token {} chars, {})",
             tok.len(),
-            if expired { "已过期——Claude Code 下次使用时会刷新" } else { "未过期" }
+            if expired { "expired — Claude Code refreshes it on its next use" } else { "valid" }
         ),
-        None => "凭证: 未找到 ~/.claude/.credentials.json（needsAuth；桌面版可能使用其他存储，登录一次 Claude Code CLI 可生成）".into(),
+        None => "credential: ~/.claude/.credentials.json not found (needsAuth; the desktop app may use another store — signing in once with the Claude Code CLI creates it)".into(),
     }
 }
 
@@ -143,7 +143,7 @@ fn label_for(kind: &str) -> String {
         "seven_day_opus" | "weekly_opus" => "Weekly (Opus)".into(),
         "weekly_scoped" => "Weekly (model-scoped)".into(),
         other => {
-            // 前向兼容：未知 kind 转可读标签
+            // Forward compatibility: an unknown kind gets a readable label
             let mut s = other.replace('_', " ");
             if let Some(c) = s.get_mut(0..1) {
                 c.make_ascii_uppercase();
@@ -165,7 +165,7 @@ fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
             };
             let resets = l.get("resets_at").and_then(parse_reset);
             if resets.is_none() {
-                continue; // 上游纪律：无重置时刻的窗口不展示
+                continue; // upstream rule: a window without a reset time is not shown
             }
             out.push(LimitWindow {
                 id: kind.to_string(),
@@ -175,10 +175,10 @@ fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
             });
         }
     }
-    // 兜底合并：刚滚动重置的窗口会从 limits 消失而命名字段仍在
-    // 实测：limits 里的 kind 是 weekly_all/weekly_scoped，而不是 seven_day——
-    // 只按 id 判重会把 seven_day 兜底再塞一份（卡片出现 "Weekly all" + "Weekly (all models)" 双胞胎）。
-    // 判重三条：id 别名 / 同一 resets_at 且同百分比 / 同 label。
+    // Fallback merge: a window that just rolled over disappears from limits while the named field remains.
+    // In practice the kinds in limits are weekly_all/weekly_scoped, not seven_day — deduplicating by id
+    // alone would add the seven_day fallback a second time (the card showed "Weekly all" and
+    // "Weekly (all models)" as twins). Three dedupe rules: id alias / same resets_at and percentage / same label.
     let aliases: [(&str, &str, &[&str]); 2] = [
         ("five_hour", "session", &["session", "five_hour"]),
         ("seven_day", "seven_day", &["seven_day", "weekly_all", "weekly"]),
@@ -201,14 +201,14 @@ fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
         }
         out.push(LimitWindow { id: id.into(), label, used, resets_at, ..Default::default() });
     }
-    // session 永远排最前（上游展示顺序）
+    // session always comes first (upstream display order)
     out.sort_by_key(|w| if w.id == "session" { 0 } else { 1 });
     out
 }
 
 enum FetchErr {
     NeedsAuth,
-    RateLimited(u64), // 建议等待秒数（已含下限逻辑前的 Retry-After）
+    RateLimited(u64), // suggested wait in seconds (the Retry-After before the floor is applied)
     Other(String),
 }
 
@@ -222,7 +222,7 @@ fn fetch_once(token: &str) -> Result<Vec<LimitWindow>, FetchErr> {
         Ok(r) => {
             let v: serde_json::Value = r
                 .into_json()
-                .map_err(|e| FetchErr::Other(format!("解析失败: {e}")))?;
+                .map_err(|e| FetchErr::Other(format!("parse: {e}")))?;
             Ok(parse_response(&v))
         }
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
@@ -258,7 +258,7 @@ fn set_and_broadcast(app: &AppHandle, mutate: impl FnOnce(&mut UsageSnapshot)) {
 
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
-        // 启动即广播持久化的旧读数（stale 优于空白）
+        // Broadcast the persisted old reading at startup (stale beats blank)
         {
             let st = app.state::<AppState>();
             let snap = st.usage.lock().unwrap().clone();
@@ -266,7 +266,7 @@ pub fn start(app: AppHandle) {
         }
         let mut consecutive_429: u32 = 0;
         loop {
-            // 退避窗口内不发请求
+            // No requests inside the backoff window
             let bu = {
                 let st = app.state::<AppState>();
                 let u = st.usage.lock().unwrap();
@@ -280,10 +280,10 @@ pub fn start(app: AppHandle) {
             match read_credentials() {
                 None => set_and_broadcast(&app, |u| {
                     u.status = "needsAuth".into();
-                    u.note = "未找到 Claude Code 凭证".into();
+                    u.note = "No Claude Code credential found".into();
                 }),
                 Some((token, expired)) => {
-                    // 401/403 时重读一次凭证再试（Claude Code 可能刚刷新）
+                    // On 401/403 re-read the credential and retry once (Claude Code may have just refreshed it)
                     let result = match fetch_once(&token) {
                         Err(FetchErr::NeedsAuth) => match read_credentials() {
                             Some((t2, _)) if t2 != token => fetch_once(&t2),
@@ -292,9 +292,9 @@ pub fn start(app: AppHandle) {
                         other => other,
                     };
                     let auth_note = if expired {
-                        "凭证已过期——运行一次 claude 命令（或与 Claude 对话）即可刷新"
+                        "Credential expired — run any claude command (or chat with Claude) to refresh it"
                     } else {
-                        "凭证被拒（换过账号？）"
+                        "Credential rejected (switched accounts?)"
                     };
                     match result {
                         Ok(windows) => {
@@ -318,7 +318,7 @@ pub fn start(app: AppHandle) {
                                 if !u.windows.is_empty() {
                                     u.status = "stale".into();
                                 }
-                                u.note = format!("限流，{wait}s 后重试");
+                                u.note = format!("Rate limited, retrying in {wait}s");
                                 u.backoff_until = now_ms() + wait * 1000;
                             });
                         }
@@ -333,7 +333,7 @@ pub fn start(app: AppHandle) {
                     }
                 }
             }
-            // 有活跃会话 60s，无会话 300s（上游节流纪律）
+            // 60 s while a session is active, 300 s otherwise (upstream throttling discipline)
             let active = {
                 let st = app.state::<AppState>();
                 let store = st.store.lock().unwrap();

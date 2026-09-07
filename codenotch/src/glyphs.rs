@@ -1,13 +1,13 @@
-//! 提供商图标。
+//! Provider glyphs.
 //!
-//! 纪律：**我们不自己画任何厂商 logo**，只用现成素材。取用顺序：
-//!   1. 用户覆盖：`%APPDATA%\codenotch\glyphs\<id>.svg|.png` 或 exe 同目录 `glyphs\`；
-//!   2. 内置（个人自用、非商业）：编译进 exe 的 `glyphs/*.svg`，
-//!      来自 npm `@lobehub/icons-static-svg` 1.95.0（MIT），原文件未改；商标声明见 glyphs/NOTICE.md；
-//!   3. 本机已安装应用自己的图标（PrivateExtractIconsW 取 exe 资源 64px → PNG）；
-//!   都没有 → 前端退回占位字母。
-//! SVG 以文本内联进 DOM（`fill="currentColor"` 随 CSS 变白/变暗）；PNG/应用图标走 <img>。
-//! id 与前端/上游一致：claude / codex / cursor / gemini。
+//! Rule: **no vendor logo is drawn by hand here**; only existing artwork is used, in this order:
+//!   1. User override: `%APPDATA%\codenotch\glyphs\<id>.svg|.png`, or `glyphs\` next to the exe;
+//!   2. Built in: the `glyphs/*.svg` compiled into the exe, from npm `@lobehub/icons-static-svg`
+//!      1.95.0 (MIT), files unmodified; trademark notice in glyphs/NOTICE.md;
+//!   3. The installed application's own icon (PrivateExtractIconsW on the exe resources, 64 px → PNG);
+//!   none of those → the page falls back to a letter.
+//! SVGs are inlined into the DOM as text (`fill="currentColor"` follows the CSS white/dimmed state);
+//! PNGs and app icons go through <img>. Ids match the page and upstream: claude / codex / cursor / gemini.
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -15,19 +15,19 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Serialize, Debug, Default)]
 pub struct Glyph {
-    /// svg = 内联 SVG（单色，随 currentColor）；png = 位图素材；appicon = 应用图标（彩色，圆角缩小）
+    /// svg = inline SVG (monochrome, follows currentColor); png = bitmap artwork; appicon = application icon (colour, rounded and shrunk)
     pub kind: String,
-    /// png/appicon 的 data: URL
+    /// data: URL for png/appicon
     pub url: String,
-    /// svg 的文本（已去 script / on* 事件属性）
+    /// The SVG text (script and on* event attributes removed)
     pub svg: String,
-    /// 来源说明（doctor 用）
+    /// Where it came from (for doctor)
     pub source: String,
 }
 
 pub const IDS: [&str; 4] = ["claude", "codex", "cursor", "gemini"];
 
-/// 内置素材（@lobehub/icons-static-svg，MIT）：codex 用 OpenAI 标（与上游 glyph 选择一致），gemini 用 Antigravity 标
+/// Built-in artwork (@lobehub/icons-static-svg, MIT): the OpenAI mark for codex (matching upstream's glyph choice), the Antigravity mark for gemini
 const BUILTIN: [(&str, &str); 4] = [
     ("claude", include_str!("../glyphs/claude.svg")),
     ("codex", include_str!("../glyphs/codex.svg")),
@@ -35,8 +35,9 @@ const BUILTIN: [(&str, &str); 4] = [
     ("gemini", include_str!("../glyphs/gemini.svg")),
 ];
 
-/// 最低限度的 SVG 清洗：内联进 DOM 前去掉 <script> 块与 on*="…" 事件属性（内置文件本无，用户文件防手滑）。
-/// 所有切片位置都来自 ASCII 模式匹配，落在字符边界上，对中文/emoji 内容安全。
+/// Minimal SVG sanitising before inlining into the DOM: drop <script> blocks and on*="…" event
+/// attributes (the built-in files have none; this guards user files). Every slice position comes
+/// from an ASCII pattern match and lands on a character boundary, so non-ASCII content is safe.
 fn sanitize_svg(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let lower = s.to_ascii_lowercase();
@@ -132,7 +133,7 @@ fn from_file(p: &Path) -> Option<Glyph> {
     }
 }
 
-/// 本机应用 exe 候选（Windows）；MSIX 商店版装在 WindowsApps 下普通进程读不到，取不到就算了
+/// Candidate executables of the installed apps (Windows); MSIX store versions live under WindowsApps where a normal process cannot read them, and that is fine
 fn app_candidates(id: &str) -> Vec<PathBuf> {
     let mut v = Vec::new();
     let Some(local) = dirs::data_local_dir() else { return v };
@@ -170,7 +171,7 @@ fn app_candidates(id: &str) -> Vec<PathBuf> {
     v.into_iter().filter(|p| p.is_file()).collect()
 }
 
-/// exe 资源里的图标 → 64px RGBA → PNG data URL
+/// Icon from the exe resources → 64 px RGBA → PNG data URL
 #[cfg(windows)]
 fn from_exe(p: &Path) -> Option<Glyph> {
     use windows::Win32::Graphics::Gdi::{
@@ -208,7 +209,7 @@ fn from_exe(p: &Path) -> Option<Glyph> {
                 bi.bmiHeader = BITMAPINFOHEADER {
                     biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
                     biWidth: w,
-                    biHeight: -h, // 自上而下
+                    biHeight: -h, // top-down
                     biPlanes: 1,
                     biBitCount: 32,
                     biCompression: BI_RGB.0,
@@ -218,7 +219,7 @@ fn from_exe(p: &Path) -> Option<Glyph> {
                 let lines = GetDIBits(hdc, info.hbmColor, 0, h as u32, Some(buf.as_mut_ptr() as *mut _), &mut bi, DIB_RGB_COLORS);
                 let _ = ReleaseDC(None, hdc);
                 if lines > 0 {
-                    // BGRA → RGBA；全 0 alpha 的旧式图标按不透明处理
+                    // BGRA → RGBA; old-style icons with all-zero alpha are treated as opaque
                     let any_alpha = buf.chunks_exact(4).any(|px| px[3] != 0);
                     for px in buf.chunks_exact_mut(4) {
                         px.swap(0, 2);
@@ -261,7 +262,7 @@ fn encode_png(w: u32, h: u32, rgba: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 收集全部提供商图标（启动时一次；托盘"刷新"时再来一次）
+/// Collects every provider glyph (once at startup, again on the tray's refresh)
 pub fn collect() -> HashMap<String, Glyph> {
     let mut map = HashMap::new();
     let dirs = glyph_dirs();
@@ -301,14 +302,14 @@ pub fn collect() -> HashMap<String, Glyph> {
     map
 }
 
-/// doctor 用
+/// For doctor
 pub fn probe() -> String {
     let m = collect();
-    let mut lines = vec![format!("图标目录: {}（放 claude/codex/cursor/gemini 的 .svg 或 .png）", user_dir().display())];
+    let mut lines = vec![format!("glyph directory: {} (drop claude/codex/cursor/gemini .svg or .png files here)", user_dir().display())];
     for id in IDS {
         lines.push(match m.get(id) {
             Some(g) => format!("  {id}: {} ← {}", g.kind, g.source),
-            None => format!("  {id}: 占位字母（内置素材缺失？）"),
+            None => format!("  {id}: fallback letter (built-in artwork missing?)"),
         });
     }
     lines.join("\n")

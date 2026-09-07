@@ -113,7 +113,7 @@ fn handle(app: &AppHandle, id: &str) {
                 crate::autostart::enable()
             };
             notice(app, r);
-            refresh_menu(app); // 刷新勾选状态
+            refresh_menu(app); // refresh the check marks
         }
         "quit" => app.exit(0),
         _ if id.starts_with("lang-") => crate::apply_lang(app, &id[5..]),

@@ -1,6 +1,6 @@
-//! `codenotch.exe doctor` —— 自诊断：不猜，直接看。
-//! 检查：配置/端口占用/监视根目录/最新会话文件/尾行解析结果，
-//! 输出到 stdout + %APPDATA%\codenotch\doctor.log。
+//! `codenotch.exe doctor` — self-diagnosis: look instead of guessing.
+//! Checks the config, port occupancy, watch roots, the newest session file and how its tail parses,
+//! and writes to stdout plus %APPDATA%\codenotch\doctor.log.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -37,51 +37,51 @@ pub fn run() -> String {
 
     let cfg = crate::config::load();
     o += &format!(
-        "配置: port={} lang={} ({})\n",
+        "config: port={} lang={} ({})\n",
         cfg.port,
         cfg.lang,
         crate::config::config_path().display()
     );
 
     match std::net::TcpListener::bind(("127.0.0.1", cfg.port)) {
-        Ok(_) => o += "端口: 空闲 —— 当前【没有】Codenotch 实例在运行\n",
-        Err(_) => o += "端口: 被占用 —— 已有实例在运行（确认面板头部版本号是否 v0.1.1，防止跑的是旧版）\n",
+        Ok(_) => o += "port: free — no Codenotch instance is running\n",
+        Err(_) => o += "port: in use — an instance is already running (quit it from the tray before starting a new build)\n",
     }
 
     for root in crate::watcher::roots() {
         if !root.exists() {
-            o += &format!("根目录: {} 【不存在】\n", root.display());
+            o += &format!("root: {} [missing]\n", root.display());
             continue;
         }
-        o += &format!("根目录: {} 存在，扫描最新会话…\n", root.display());
+        o += &format!("root: {} exists, scanning for the newest session…\n", root.display());
         let mut files = Vec::new();
         collect(&root, 0, &mut files);
         files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
         if files.is_empty() {
-            o += "  （没有任何会话 transcript）\n";
+            o += "  (no session transcripts)\n";
         }
         for (p, m) in files.into_iter().take(5) {
-            o += &format!("  {}s 前更新  {}\n", age_secs(m), p.display());
+            o += &format!("  updated {}s ago  {}\n", age_secs(m), p.display());
             match crate::watcher::tail_entry(&p) {
                 Some(v) => {
                     o += &format!(
-                        "    尾行解析 OK: type={} sessionId={}\n",
+                        "    tail parses OK: type={} sessionId={}\n",
                         v.get("type").and_then(|x| x.as_str()).unwrap_or("?"),
-                        v.get("sessionId").and_then(|x| x.as_str()).unwrap_or("(缺失,将用文件名)")
+                        v.get("sessionId").and_then(|x| x.as_str()).unwrap_or("(missing, the file name will be used)")
                     );
                 }
-                None => o += "    尾行解析失败（30 行内无有效 JSON——请把此文件路径发给开发者）\n",
+                None => o += "    tail failed to parse (no valid JSON in the last 30 lines — please report this file)\n",
             }
         }
     }
 
-    o += &format!("\n用量数据源:\n  {}\n  {}\n", crate::usage::probe_credentials(), crate::codex::probe());
+    o += &format!("\nusage sources:\n  {}\n  {}\n", crate::usage::probe_credentials(), crate::codex::probe());
     o += &format!("  {}\n", crate::cursor::probe());
     o += &format!("  {}\n", crate::antigravity::probe());
-    o += &format!("\n提供商图标:\n{}\n", crate::glyphs::probe());
-    o += &format!("\n活动态:\n  {}\n", crate::activity::probe());
+    o += &format!("\nprovider glyphs:\n{}\n", crate::glyphs::probe());
+    o += &format!("\nworking state:\n  {}\n", crate::activity::probe());
 
-    o += "\nwatch.log（若存在，最近运行的监视日志）:\n";
+    o += "\nwatch.log (the most recent watcher log, if any):\n";
     if let Some(dir) = dirs::config_dir() {
         let p = dir.join("codenotch").join("watch.log");
         match std::fs::read_to_string(&p) {
@@ -90,7 +90,7 @@ pub fn run() -> String {
                     o += &format!("  {}\n", line);
                 }
             }
-            _ => o += "  （空——主程序尚未启动过（首次运行正常），或跑的是不含 watcher 的旧版本）\n",
+            _ => o += "  (empty — the app has not run yet, which is normal on first use, or an older build without the watcher)\n",
         }
     }
     o

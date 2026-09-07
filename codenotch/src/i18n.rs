@@ -1,4 +1,4 @@
-//! Rust 侧（托盘菜单）文案。前端有自己的字典，两边键名保持一致。
+//! Rust-side (tray menu) strings. The page has its own dictionary; keys are kept identical on both sides.
 
 pub fn resolve_auto() -> &'static str {
     #[cfg(windows)]

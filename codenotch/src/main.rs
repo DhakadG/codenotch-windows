@@ -21,23 +21,23 @@ mod watcher;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 
-/// notch 窗口逻辑尺寸：右列 70pt 胶囊 + 左侧悬停细节卡的空间
+/// Logical size of the notch window: the 70 pt pill column on the right plus room for the hover card on the left.
 pub const NOTCH_W: f64 = 340.0;
-/// 轮次水印：每轮改动 +1，run.log 与卡片右上角都显示，杜绝"跑的是旧 exe"误判
+/// Hand-bumped build tag, written to run.log at startup so a log can always be matched to the exe that wrote it.
 pub const BUILD: &str = "r31";
-pub const NOTCH_H: f64 = 460.0; // 300 装不下 3 个窗口块+会话列表（卡片上下被裁）
+pub const NOTCH_H: f64 = 460.0; // 300 clipped the card once it held three window blocks plus the session list
 
 pub struct AppState {
     pub store: Mutex<state::Store>,
     pub cfg: Mutex<config::Config>,
     pub usage: Mutex<usage::UsageSnapshot>,
-    /// Codex 适配器快照（同一 UsageSnapshot 形状；status 另有 none/absent）
+    /// Codex snapshot (same UsageSnapshot shape; status may also be none/absent)
     pub codex: Mutex<usage::UsageSnapshot>,
     pub cursor: Mutex<usage::UsageSnapshot>,
     pub antigravity: Mutex<usage::UsageSnapshot>,
-    /// 提供商图标缓存（启动收集；托盘刷新时重收集）
+    /// Provider glyph cache, collected at launch and again on a tray refresh
     pub glyphs: Mutex<std::collections::HashMap<String, glyphs::Glyph>>,
-    /// 非 Claude 提供商的活动态（Cursor 真状态；Codex/Antigravity 按最近写入推断）
+    /// Working state of the non-Claude providers (Cursor reports it; Codex and Antigravity are inferred from recent writes)
     pub activity: Mutex<Vec<activity::Activity>>,
 }
 
@@ -59,28 +59,29 @@ pub fn broadcast(app: &AppHandle) {
     let _ = app.emit("state", &snap);
 }
 
-/// notch 贴屏幕右缘、垂直居中（W4 再做四边停靠）
+/// Pins the notch to the right edge of the primary monitor; the other edges are a later milestone.
 pub fn place_notch(app: &AppHandle) {
     let Some(w) = app.get_webview_window("notch") else {
         return;
     };
     let scale = w.scale_factor().unwrap_or(1.0);
     if let Ok(Some(mon)) = w.primary_monitor() {
-        // 双显示器不同缩放（实测 150%/200% 混用）：窗口建在哪块屏、被搬到哪块屏，
-        // 物理尺寸都可能按"另一块屏"的 scale 换算，导致 WebView 逻辑宽只剩 ~256 而非 340。
-        // 对策：一律按目标显示器 mon.scale_factor() 直接钉物理尺寸，再定位；定位后若
-        // 窗口自报 scale 仍不一致，再钉一次。
+        // Two monitors at different scales (150 % and 200 % in practice): the physical size can
+        // end up converted with the *other* monitor's scale factor depending on where the window
+        // is created and then moved, leaving the WebView ~256 logical px wide instead of 340.
+        // So the physical size is pinned straight from mon.scale_factor() before placing the
+        // window; if it still reports a different scale afterwards, it is pinned once more.
         let ms = mon.scale_factor();
         let target = tauri::PhysicalSize::new((NOTCH_W * ms).round() as u32, (NOTCH_H * ms).round() as u32);
         let _ = w.set_size(target);
-        // 用窗口实测物理尺寸定位——按 scale 猜算在 125%/150% 缩放下会把窗口
-        // 推出屏幕右缘（W1 实测：环右侧被裁）
+        // Position from the window's measured physical size — deriving it from the scale factor
+        // pushed the window past the right edge at 125 % / 150 % (the ring's right side was clipped).
         let (ww, wh) = w
             .outer_size()
             .map(|s| (s.width as i32, s.height as i32))
             .unwrap_or(((NOTCH_W * scale) as i32, (NOTCH_H * scale) as i32));
         let x = mon.position().x + mon.size().width as i32 - ww;
-        // 垂直位置来自配置比例（允许上下拖动，位置持久化），钳制在屏内
+        // Vertical position comes from the configured ratio (the pill can be dragged; it persists), clamped to the monitor
         let ratio = {
             let st = app.state::<AppState>();
             let c = st.cfg.lock().unwrap();
@@ -95,12 +96,12 @@ pub fn place_notch(app: &AppHandle) {
             let x = mon.position().x + mon.size().width as i32 - target.width as i32;
             let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
         }
-        // 启动定位日志：排查"看不见"时的第一证据
+        // Placement log line: the first thing to check when the notch is not visible
         let log = config::config_path().with_file_name("run.log");
         let _ = std::fs::write(
             log,
             format!(
-                "notch 就位 build={BUILD}: pos=({x},{y}) size=({ww}x{wh}) inner={:?} win_scale={scale} mon_scale={ms} monitor=({},{} {}x{})\n",
+                "notch placed build={BUILD}: pos=({x},{y}) size=({ww}x{wh}) inner={:?} win_scale={scale} mon_scale={ms} monitor=({},{} {}x{})\n",
                 w.inner_size().map(|s| (s.width, s.height)).unwrap_or((0, 0)),
                 mon.position().x,
                 mon.position().y,
@@ -111,7 +112,7 @@ pub fn place_notch(app: &AppHandle) {
     }
 }
 
-/// 兼容 tray.rs 的旧入口名
+/// Older entry point name still used by tray.rs
 pub fn reset_bar(app: &AppHandle) {
     {
         let st = app.state::<AppState>();
@@ -122,9 +123,10 @@ pub fn reset_bar(app: &AppHandle) {
     place_notch(app);
 }
 
-/// 沿右缘上下拖动。前端在胶囊上按下并移动 >4px 后调用一次；
-/// 之后由 Rust 线程按系统光标驱动（不依赖 WebView 的 mousemove——窗口一动光标事件就不可靠），
-/// 左键松开即结束，中心比例写回配置。
+/// Drag along the right edge. The page calls this once after a press on the pill moves more than
+/// 4 px; from then on a Rust thread follows the system cursor (WebView mousemove is unreliable
+/// once the window itself starts moving). Releasing the left button ends the drag and the centre
+/// ratio is written back to the config.
 static DRAGGING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(windows)]
@@ -180,7 +182,7 @@ fn drag_begin(app: AppHandle) {
             let mut c = st.cfg.lock().unwrap();
             c.notch_y = ratio;
             config::save(&c);
-            applog(&format!("notch 拖动: y={last_y} ratio={ratio:.3}"));
+            applog(&format!("notch drag: y={last_y} ratio={ratio:.3}"));
         }
         DRAGGING.store(false, std::sync::atomic::Ordering::SeqCst);
         let _ = app.emit("drag_end", moved);
@@ -190,7 +192,7 @@ pub fn place_bar(app: &AppHandle) {
     place_notch(app);
 }
 pub fn toggle_drag(app: &AppHandle) {
-    // notch 固定贴边，无拖动语义（保留空实现以兼容托盘菜单代码路径）
+    // The notch stays welded to the edge; kept as a no-op for the tray menu code path
     let _ = app;
 }
 
@@ -209,7 +211,7 @@ pub fn apply_lang(app: &AppHandle, lang: &str) {
     broadcast(app);
 }
 
-/// notch 永不抢焦点：WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW
+/// The notch must never take focus: WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW
 #[cfg(windows)]
 fn noactivate(app: &AppHandle) {
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -275,7 +277,7 @@ fn get_glyphs(state: tauri::State<AppState>) -> std::collections::HashMap<String
     state.glyphs.lock().unwrap().clone()
 }
 
-/// 重新收集图标并推给前端（托盘刷新 / 用户刚放好素材）
+/// Collects the glyphs again and pushes them to the page (tray refresh, or the user just dropped in an override)
 pub fn reload_glyphs(app: &AppHandle) {
     let m = glyphs::collect();
     let st = app.state::<AppState>();
@@ -307,7 +309,7 @@ fn get_codex(state: tauri::State<AppState>) -> usage::UsageSnapshot {
     state.codex.lock().unwrap().clone()
 }
 
-/// 点击 cell → 该提供商的用量页
+/// A click on a cell opens that provider's usage page
 #[tauri::command]
 fn open_provider_page(provider: String) {
     let url = match provider.as_str() {
@@ -326,9 +328,10 @@ fn open_provider_page(provider: String) {
     let _ = cmd.spawn();
 }
 
-/// 细节卡展开态：Some(热区矩形列表，**物理像素**，相对窗口左上角 x,y,w,h) = 展开中；None = 收起
-/// 前端用自己的 devicePixelRatio 把矩形换成物理像素再上报，Rust 端不再做任何
-/// scale 换算——因为 WebView2 的 DPR 与窗口 scale_factor 可能不一致（见 report_dpr）。
+/// Card expansion state: Some(hot rectangles, in **physical pixels** relative to the window's
+/// top-left as x,y,w,h) = expanded; None = collapsed. The page converts the rectangles with its
+/// own devicePixelRatio before reporting them, so no scale conversion happens on this side —
+/// WebView2's DPR and the window's scale_factor can disagree (see report_dpr).
 static HOT: Mutex<Option<Vec<[f64; 4]>>> = Mutex::new(None);
 
 #[tauri::command]
@@ -336,7 +339,7 @@ fn set_expanded(on: bool, rects: Option<Vec<[f64; 4]>>) {
     *HOT.lock().unwrap() = if on { Some(rects.unwrap_or_default()) } else { None };
 }
 
-/// 当前已施加的 WebView 缩放（1.0 = 未校正）
+/// The WebView zoom currently applied (1.0 = uncorrected)
 static ZOOM: Mutex<f64> = Mutex::new(1.0);
 
 pub fn applog(line: &str) {
@@ -347,9 +350,11 @@ pub fn applog(line: &str) {
     }
 }
 
-/// 根因：双显示器（150%/200%）下 WebView2 的 devicePixelRatio 取了 2.0，而窗口按主屏
-/// 1.5 定尺寸 → 页面只有 255 CSS px 宽（设计 340），且所有坐标换算全错（看门狗误判→卡片一闪而过）。
-/// 对策：前端上报 DPR，与主屏 scale 不一致时用 set_zoom 把有效 DPR 拉回 scale（CSS px 恢复 340 宽）。
+/// Root cause: with two monitors (150 % / 200 %) WebView2 picked a devicePixelRatio of 2.0 while
+/// the window was sized for the primary monitor's 1.5, so the page was 255 CSS px wide instead of
+/// the designed 340 and every coordinate conversion was off (the watchdog misfired and the card
+/// flashed away). Fix: the page reports its DPR, and when it differs from the primary monitor's
+/// scale, set_zoom pulls the effective DPR back to that scale, restoring the 340 px width.
 #[tauri::command]
 fn report_dpr(app: AppHandle, dpr: f64, w: f64, h: f64) {
     let Some(win) = app.get_webview_window("notch") else { return };
@@ -363,10 +368,10 @@ fn report_dpr(app: AppHandle, dpr: f64, w: f64, h: f64) {
     let base = if *z > 0.0 { dpr / *z } else { dpr };
     let target = if base > 0.0 { want / base } else { 1.0 };
     applog(&format!(
-        "dpr 上报: dpr={dpr:.3} viewport={w:.0}x{h:.0} 主屏scale={want:.3} 已用zoom={:.3} → 目标zoom={target:.3}",
+        "dpr report: dpr={dpr:.3} viewport={w:.0}x{h:.0} monitor_scale={want:.3} zoom_applied={:.3} -> target_zoom={target:.3}",
         *z
     ));
-    // 防振荡保险：整个进程最多校正 3 次（若 WebView 的 DPR 不随 zoom 变化，就不再追）
+    // Oscillation guard: at most three corrections per process (if the DPR does not follow the zoom, stop chasing it)
     static APPLIED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if (dpr - want).abs() > 0.02
         && (target - *z).abs() > 0.01
@@ -376,18 +381,20 @@ fn report_dpr(app: AppHandle, dpr: f64, w: f64, h: f64) {
         match win.set_zoom(target) {
             Ok(()) => {
                 *z = target;
-                applog(&format!("dpr 校正: set_zoom({target:.3}) 成功"));
+                applog(&format!("dpr correction: set_zoom({target:.3}) ok"));
             }
-            Err(e) => applog(&format!("dpr 校正失败: {e}")),
+            Err(e) => applog(&format!("dpr correction failed: {e}")),
         }
     }
 }
 
-/// NOACTIVATE 透明窗里 WebView2 的 mouseleave 不可靠——光标快速离开窗口时经常
-/// 收不到 WM_MOUSELEAVE，卡片就一直挂着。不赌 DOM 事件：展开期间 Rust 侧用系统光标坐标
-/// 兜底，光标已在窗口矩形之外就发 pointer_left，前端按 250ms 宽限收起。
-/// 窗口有 340×460 的透明区，光标离开胶囊但仍在透明区内时"在窗口内"不成立为离开——
-/// 改为对比前端上报的热区矩形（胶囊+卡片，及两者之间的空隙），连续 2 拍（300ms）不在热区即收。
+/// WebView2's mouseleave is unreliable inside a NOACTIVATE transparent window — a cursor that
+/// leaves quickly often produces no WM_MOUSELEAVE, and the card stays up. Rather than trust DOM
+/// events, the Rust side watches the system cursor while the card is expanded and emits
+/// pointer_left once the cursor is outside; the page collapses after its 250 ms grace period.
+/// "Outside the window" is not the test, though: the window has a 340×460 transparent area, so
+/// the cursor is compared against the hot rectangles the page reports (pill, card, and the gap
+/// between them), and two consecutive misses (300 ms) count as leaving.
 fn start_pointer_watchdog(app: AppHandle) {
     std::thread::spawn(move || {
         let mut miss = 0u8;
@@ -402,7 +409,7 @@ fn start_pointer_watchdog(app: AppHandle) {
             };
             let Some(w) = app.get_webview_window("notch") else { continue };
             let (Ok(pos), Ok(cur)) = (w.outer_position(), app.cursor_position()) else { continue };
-            // 光标 → 相对窗口左上角的物理像素；热区已是物理像素，不做任何 scale 换算
+            // Cursor position relative to the window's top-left, in physical pixels; the hot rectangles are physical too, so no scale conversion
             let lx = cur.x - pos.x as f64;
             let ly = cur.y - pos.y as f64;
             const PAD: f64 = 10.0;
@@ -413,7 +420,7 @@ fn start_pointer_watchdog(app: AppHandle) {
             let mut inside = in_window && rects.iter().any(|r| {
                 lx >= r[0] - PAD && ly >= r[1] - PAD && lx < r[0] + r[2] + PAD && ly < r[1] + r[3] + PAD
             });
-            // 热区之间的空隙（胶囊与卡片之间）也算在内：取所有热区的包围盒
+            // The gap between hot rectangles (pill and card) counts as inside: use the bounding box of all of them
             if !inside && in_window && rects.len() > 1 {
                 let x0 = rects.iter().map(|r| r[0]).fold(f64::MAX, f64::min);
                 let y0 = rects.iter().map(|r| r[1]).fold(f64::MAX, f64::min);
@@ -424,7 +431,7 @@ fn start_pointer_watchdog(app: AppHandle) {
             static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
                 applog(&format!(
-                    "看门狗: cursor_rel=({lx:.0},{ly:.0}) inside={inside} rects={rects:?} winpos=({},{})",
+                    "watchdog: cursor_rel=({lx:.0},{ly:.0}) inside={inside} rects={rects:?} winpos=({},{})",
                     pos.x, pos.y
                 ));
             }
@@ -442,15 +449,10 @@ fn start_pointer_watchdog(app: AppHandle) {
     });
 }
 
-/// 前端日志通道：JS 把关键诊断写进 run.log（invoke 若失败，前端会用 notice 在屏上直接报）
+/// Log channel for the page: JS writes key diagnostics into run.log (if invoke itself fails, the page reports on screen instead)
 #[tauri::command]
 fn log_js(msg: String) {
     applog(&format!("js: {}", msg.chars().take(600).collect::<String>()));
-}
-
-#[tauri::command]
-fn build_tag() -> String {
-    BUILD.to_string()
 }
 
 #[tauri::command]
@@ -493,7 +495,7 @@ fn set_lang(app: AppHandle, lang: String) {
     apply_lang(&app, &lang);
 }
 
-/// 看过即清（引擎能力，v0.2.0 语义原样保留）
+/// Seen-clears-it: looking at a session acknowledges it (engine behaviour, unchanged)
 #[cfg(windows)]
 fn ack_scan(app: &AppHandle) -> bool {
     let need = {
@@ -565,7 +567,7 @@ fn main() {
                 let r = match args.get(2).map(|s| s.as_str()) {
                     Some("on") => autostart::enable(),
                     Some("off") => autostart::disable(),
-                    _ => Err("用法: codenotch.exe autostart on|off".into()),
+                    _ => Err("usage: codenotch.exe autostart on|off".into()),
                 };
                 report(r);
                 return;
@@ -586,10 +588,10 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // 重编译后直接再启动，旧实例还在 → 新实例在这里被拦截退出，
-            // 看到的仍是旧进程。必须在屏上和日志里都喊出来。
-            applog(&format!("单实例: 又一个实例尝试启动并被拦截——当前运行的是 build={BUILD}，若你刚重编译，请先从托盘退出再启动"));
-            let _ = app.emit("notice", format!("已在运行（{BUILD}）：重编译后请先托盘退出旧实例再启动"));
+            // Launching a freshly built exe while the old one is still running lands here: the new
+            // instance is turned away and what stays on screen is the old process. Say so loudly.
+            applog(&format!("single instance: another launch was refused; the running instance is build={BUILD} — quit it from the tray first if you just rebuilt"));
+            let _ = app.emit("notice", format!("Codenotch is already running ({BUILD}) — quit it from the tray before starting a new build"));
         }))
         .manage(AppState {
             store: Mutex::new(Default::default()),
@@ -617,7 +619,6 @@ fn main() {
             set_expanded,
             report_dpr,
             log_js,
-            build_tag,
             focus_session,
             dismiss_session,
             set_lang
@@ -637,11 +638,11 @@ fn main() {
             cursor::start(handle.clone());
             antigravity::start(handle.clone());
             activity::start(handle.clone());
-            // 图标收集可能要读几个 exe 的资源，放后台线程，收完再推
+            // Collecting glyphs may read icon resources out of a few executables; do it off the main thread and push when done
             let gh = handle.clone();
             std::thread::spawn(move || reload_glyphs(&gh));
             start_pointer_watchdog(handle.clone());
-            // 看过即清
+            // Seen-clears-it scan
             let acker = handle.clone();
             std::thread::spawn(move || {
                 activity::lower_thread_priority();
@@ -652,7 +653,7 @@ fn main() {
                     }
                 }
             });
-            // 陈旧会话清理
+            // Stale session cleanup
             let sweeper = handle.clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(30));
@@ -665,7 +666,7 @@ fn main() {
                     broadcast(&sweeper);
                 }
             });
-            // 落盘配置（codenotch-hook 读端口用）
+            // Persist the config (codenotch-hook reads the port from it)
             {
                 let st = handle.state::<AppState>();
                 let c = st.cfg.lock().unwrap();

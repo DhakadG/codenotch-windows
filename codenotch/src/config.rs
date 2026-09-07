@@ -12,13 +12,13 @@ pub struct Config {
     pub bar_x: Option<i32>,
     #[serde(default)]
     pub bar_y: Option<i32>,
-    /// 悬浮条逻辑宽度（滚轮调节，220-520），None=默认 360
+    /// Logical width of the bar (wheel-adjustable, 220-520); None = default 360
     #[serde(default)]
     pub bar_w: Option<u32>,
-    /// 允许拖动+滚轮调宽（托盘开关，默认关防误拖）
+    /// Allow dragging + wheel resizing (tray toggle, off by default to prevent accidental drags)
     #[serde(default)]
     pub drag_enabled: bool,
-    /// notch 垂直位置：窗口中心在主屏高度上的比例（0=顶 1=底），默认 0.5；上下拖动后保存
+    /// Vertical position of the notch: the window centre as a fraction of the primary monitor's height (0 = top, 1 = bottom), default 0.5; saved after a drag
     #[serde(default = "default_notch_y")]
     pub notch_y: f64,
 }

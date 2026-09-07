@@ -3,7 +3,7 @@ target/
 check.txt
 codenotch/gen/
 
-# 内部工作文档（不入库）
+# internal working notes (not part of the repository)
 开发文档.md
 美术文档.md
 避坑文档.md

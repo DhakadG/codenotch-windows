@@ -1,6 +1,6 @@
-//! 开机自启：HKCU\...\Run 注册表项（per-user，无需管理员）。
-//! 自启命令带 --silent：后台待命，无会话时不显示悬浮条，有会话自动现身。
-//! 用 reg.exe 实现，零新依赖。
+//! Start at sign-in: an HKCU\...\Run registry value (per user, no administrator needed).
+//! The command carries --silent: wait in the background, show no bar without sessions, appear when one starts.
+//! Implemented with reg.exe, so no new dependency.
 
 use std::process::Command;
 
@@ -35,22 +35,22 @@ pub fn enable() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let val = format!("\"{}\" --silent", exe.display());
     match reg(&["add", RUN_KEY, "/v", NAME, "/t", "REG_SZ", "/d", &val, "/f"]) {
-        Some((true, _)) => Ok("开机自启已启用（静默待命，有会话自动现身）".into()),
+        Some((true, _)) => Ok("start at sign-in enabled (silent until a session appears)".into()),
         Some((false, out)) => Err(out),
-        None => Err("reg.exe 执行失败".into()),
+        None => Err("reg.exe failed to run".into()),
     }
 }
 
 pub fn disable() -> Result<String, String> {
     match reg(&["delete", RUN_KEY, "/v", NAME, "/f"]) {
-        Some((true, _)) => Ok("开机自启已关闭".into()),
+        Some((true, _)) => Ok("start at sign-in disabled".into()),
         Some((false, out)) => {
-            if out.to_lowercase().contains("unable to find") || out.contains("找不到") {
-                Ok("开机自启本就未启用".into())
+            if out.to_lowercase().contains("unable to find") || out.contains("找不到") { // reg.exe answers in the OS language; "找不到" is the Chinese "unable to find"
+                Ok("start at sign-in was not enabled".into())
             } else {
                 Err(out)
             }
         }
-        None => Err("reg.exe 执行失败".into()),
+        None => Err("reg.exe failed to run".into()),
     }
 }

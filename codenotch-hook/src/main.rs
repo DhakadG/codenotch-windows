@@ -1,6 +1,6 @@
-//! codenotch-hook：Claude Code hooks 调用的极简客户端。
-//! 职责：1) 把事件+stdin JSON 上报给主程序；2) 主程序没跑就拉起它。
-//! 铁律：绝不阻塞 Claude Code——总预算 ~2s，任何失败都静默退出 0。
+//! codenotch-hook: the minimal client Claude Code's hooks call.
+//! Duties: 1) report the event plus stdin JSON to the main app; 2) launch the main app if it is not running.
+//! Iron rule: never block Claude Code — ~2 s total budget, and every failure exits 0 silently.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -12,7 +12,7 @@ const MAX_STDIN: u64 = 256 * 1024;
 fn main() {
     let event = std::env::args().nth(1).unwrap_or_else(|| "ping".into());
 
-    // hook 的 stdin 是 Claude Code 给的 JSON（session_id / cwd / prompt / message…）
+    // The hook's stdin is the JSON Claude Code provides (session_id / cwd / prompt / message…)
     let mut body = String::new();
     let _ = std::io::stdin().take(MAX_STDIN).read_to_string(&mut body);
 
@@ -22,7 +22,7 @@ fn main() {
     if send(port, &event, ppid, &body).is_ok() {
         return;
     }
-    // 主程序未运行：分离式拉起，再重试一小会儿
+    // Main app not running: launch it detached, then retry briefly
     spawn_main();
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(100));
@@ -30,10 +30,10 @@ fn main() {
             return;
         }
     }
-    // 放弃也要安静退出——不能影响 Claude Code
+    // Give up quietly — never affect Claude Code
 }
 
-/// 从 %APPDATA%\codenotch\config.json 里扒 "port": N（无依赖手工扫描）
+/// Pulls "port": N out of %APPDATA%\codenotch\config.json (hand-rolled scan, no dependency)
 fn read_port() -> u16 {
     let path = match std::env::var("APPDATA") {
         Ok(a) => format!("{a}\\codenotch\\config.json"),
@@ -69,11 +69,11 @@ fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
     );
     s.write_all(req.as_bytes())?;
     let mut buf = [0u8; 64];
-    let _ = s.read(&mut buf); // 等一个响应片段确认送达，失败无所谓
+    let _ = s.read(&mut buf); // wait for a response fragment to confirm delivery; failure does not matter
     Ok(())
 }
 
-/// 分离式拉起主程序：不继承句柄、无窗口、绝不 wait
+/// Launches the main app detached: no inherited handles, no window, never waits
 fn spawn_main() {
     let Ok(me) = std::env::current_exe() else { return };
     let Some(dir) = me.parent() else { return };
@@ -95,7 +95,7 @@ fn spawn_main() {
     let _ = cmd.spawn();
 }
 
-/// 父进程 PID（≈ Claude Code CLI 进程），零依赖 NtQueryInformationProcess
+/// Parent process PID (≈ the Claude Code CLI process) via NtQueryInformationProcess, no dependency
 #[cfg(windows)]
 fn parent_pid() -> u32 {
     #[repr(C)]

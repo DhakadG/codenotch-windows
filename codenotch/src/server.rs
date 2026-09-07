@@ -1,5 +1,5 @@
-//! 本地事件服务：接收 codenotch-hook 的 POST /event?e=<event>&ppid=<pid>
-//! body 为 Claude Code hook 的 stdin JSON。解析宽容：任何字段缺失都不报错。
+//! Local event server: receives codenotch-hook's POST /event?e=<event>&ppid=<pid>
+//! with the Claude Code hook's stdin JSON as the body. Lenient parsing: no missing field is an error.
 
 use crate::state::HookEvent;
 use crate::AppState;
@@ -11,7 +11,7 @@ pub fn start(app: AppHandle, port: u16) {
         let server = match tiny_http::Server::http(("127.0.0.1", port)) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[codenotch] 端口 {port} 绑定失败: {e}（是否已有实例在运行？）");
+                eprintln!("[codenotch] failed to bind port {port}: {e} (is another instance running?)");
                 return;
             }
         };
@@ -52,7 +52,7 @@ fn query_param(url: &str, key: &str) -> String {
 fn parse(url: &str, body: &str) -> HookEvent {
     let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    // tool_input.command（Bash 等）用于"最后动作"摘要
+    // tool_input.command (Bash etc.) feeds the "last action" summary
     let tool_cmd = v
         .get("tool_input")
         .and_then(|t| t.get("command"))
