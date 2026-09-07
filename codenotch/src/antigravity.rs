@@ -16,9 +16,14 @@
 //!      with header `x-codeium-csrf-token: <t>` (Antigravity sits on the Codeium stack; the header
 //!      name never changed) and body `{"forceRefresh":true}` (otherwise the server answers from
 //!      QuotaSummaryCache). Self-signed certificate → verification is relaxed for 127.0.0.1 only.
-//!      Reply `{response:{groups:[{displayName, buckets:[{bucketId, displayName, remainingFraction, resetTime}]}]}}`
-//!      — it reports what **remains**, so used = 1 - remainingFraction; the label is
-//!      group.displayName (buckets only ever say "Weekly Limit Remaining").
+//!      Reply `{response:{groups:[{displayName, buckets:[{bucketId, displayName, window,
+//!      remainingFraction, resetTime}]}]}}` — it reports what **remains**, so
+//!      used = 1 - remainingFraction.
+//!      Verified against a live install on 2026-09-07: a group now carries **two** buckets,
+//!      not one — `window` is `"5h"` or `"weekly"` (`gemini-5h`/`gemini-weekly`,
+//!      `3p-5h`/`3p-weekly`), and `displayName` says "Five Hour Limit Remaining" or
+//!      "Weekly Limit Remaining". Labelling a bucket with its group name alone therefore
+//!      produces two identical labels per group, so the window is appended.
 //!   2. Bridge answered before and does not now = Antigravity is closed (the port changes on every
 //!      launch): keep the last percentage marked stale rather than switching to a count.
 //!   3. Credential path (when a Google token exists): Windows Credential Manager target
@@ -125,7 +130,17 @@ fn discover() -> Option<Endpoint> {
             "Get-CimInstance Win32_Process -Filter \"Name LIKE '%language_server%'\" | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }",
         ],
     );
-    let line = table.lines().find(|l| l.contains("--csrf_token"))?;
+    // More than one language_server can be running at once — an Antigravity install ships
+    // both a production client and one pointed at `daily-cloudcode-pa.googleapis.com`, and
+    // they answer with different numbers for different accounts. Taking whichever the
+    // process table listed first is a coin flip, so prefer the production endpoint and use
+    // a staging one only when it is the only thing running.
+    let candidates: Vec<&str> = table.lines().filter(|l| l.contains("--csrf_token")).collect();
+    let line = candidates
+        .iter()
+        .find(|l| !is_staging_endpoint(l))
+        .or_else(|| candidates.first())
+        .copied()?;
     let (pid_s, cmdline) = line.split_once('\t')?;
     let pid: u32 = pid_s.trim().parse().ok()?;
     let csrf = flag_value(cmdline, "--csrf_token")?;
@@ -151,6 +166,31 @@ fn discover() -> Option<Endpoint> {
         return None;
     }
     Some(Endpoint { ports, csrf })
+}
+
+#[cfg(test)]
+#[path = "antigravity_tests.rs"]
+mod tests;
+
+/// True when a `language_server` command line points at a pre-release Cloud Code host
+/// rather than the production one — `daily-cloudcode-pa.googleapis.com` and friends.
+fn is_staging_endpoint(cmdline: &str) -> bool {
+    match flag_value(cmdline, "--cloud_code_endpoint") {
+        Some(url) => {
+            let host = url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            // Match the host label, not the whole string: "daily-cloudcode-pa…" is staging,
+            // a hypothetical "cloudcode-pa-daily-release" is not something to guess about.
+            host.starts_with("daily-") || host.starts_with("staging-") || host.starts_with("autopush-")
+        }
+        // No endpoint flag at all: nothing marks it as staging, so treat it as production.
+        None => false,
+    }
 }
 
 fn flag_value(line: &str, flag: &str) -> Option<String> {
@@ -224,6 +264,33 @@ fn parse_iso(v: Option<&serde_json::Value>) -> Option<u64> {
         .map(|d| d.timestamp_millis().max(0) as u64)
 }
 
+/// Names one bucket's ring.
+///
+/// The group says which models ("Gemini Models", "Claude and GPT models") and the bucket
+/// says over what period. Neither alone is enough: the group repeats across its buckets,
+/// and the bucket's own name repeats across groups. Both together are unique and read the
+/// way the rest of the card does.
+fn bucket_label(group: Option<&str>, bucket: Option<&str>, window: Option<&str>) -> String {
+    // The wire values seen in practice. An unrecognised one is passed through rather than
+    // dropped, so a new window type still gets a distinguishable label.
+    let period = match window {
+        Some("5h") => Some("5h".to_string()),
+        Some("weekly") => Some("weekly".to_string()),
+        Some(other) if !other.is_empty() => Some(other.to_string()),
+        // No `window` field: fall back to the bucket's own name, trimmed of the
+        // " Remaining" suffix that every one of them carries.
+        _ => bucket
+            .map(|b| b.trim_end_matches(" Remaining").trim().to_string())
+            .filter(|b| !b.is_empty()),
+    };
+    match (group, period) {
+        (Some(g), Some(p)) => format!("{g} ({p})"),
+        (Some(g), None) => g.to_string(),
+        (None, Some(p)) => p,
+        (None, None) => "Usage".to_string(),
+    }
+}
+
 /// The server reports what remains and the notch shows what is used: flip it here so the view never learns about provider differences
 pub fn windows_from_bridge(v: &serde_json::Value) -> Vec<LimitWindow> {
     let mut out = Vec::new();
@@ -237,9 +304,10 @@ pub fn windows_from_bridge(v: &serde_json::Value) -> Vec<LimitWindow> {
                 continue;
             }
             let bname = b.get("displayName").and_then(|x| x.as_str());
+            let window = b.get("window").and_then(|x| x.as_str());
             out.push(LimitWindow {
                 id: b.get("bucketId").and_then(|x| x.as_str()).or(gname).unwrap_or("quota").to_string(),
-                label: gname.or(bname).unwrap_or("Usage").to_string(),
+                label: bucket_label(gname, bname, window),
                 used: (1.0 - rem).clamp(0.0, 1.0),
                 resets_at: parse_iso(b.get("resetTime")),
                 ..Default::default()
@@ -291,7 +359,7 @@ fn read_credential_raw() -> Option<Vec<u8>> {
 fn decode_credential(raw: &[u8]) -> Option<Creds> {
     let mut text = String::from_utf8(raw.to_vec()).unwrap_or_else(|_| {
         // Some writers store the blob as UTF-16LE
-        let u16s: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let u16s: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         String::from_utf16_lossy(&u16s)
     });
     text = text.trim_matches('\0').trim().to_string();
@@ -617,7 +685,26 @@ pub fn probe() -> String {
             None => "not found".into(),
         },
         match ep {
-            Some(e) => format!("running, ports {:?}", e.ports),
+            // Finding the process only proves discovery works. The question a reader
+            // actually has is whether the quota RPC answers, so ask it: which port
+            // replied, and how many windows came back.
+            Some(e) => {
+                let ports = format!("{:?}", e.ports);
+                match bridge_quota(&e) {
+                    Ok(ws) if ws.is_empty() => {
+                        format!("running, ports {ports}, bridge answered with no quota groups")
+                    }
+                    Ok(ws) => format!(
+                        "running, ports {ports}, bridge returned {} window(s): {}",
+                        ws.len(),
+                        ws.iter()
+                            .map(|w| format!("{}={:.0}%", w.label, w.used * 100.0))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    Err(e) => format!("running, ports {ports}, but the quota RPC failed: {e}"),
+                }
+            }
             None => "not running".into(),
         }
     )
