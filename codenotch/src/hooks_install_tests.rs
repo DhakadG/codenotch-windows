@@ -162,6 +162,66 @@ fn upgrading_removes_our_entries_from_events_we_no_longer_wire() {
 }
 
 #[test]
+fn a_user_command_sharing_an_entry_with_ours_survives() {
+    // Claude Code allows several commands in one entry, so nothing stops a user putting one of
+    // theirs beside one of ours. Judging the entry as a whole and deleting it would delete
+    // their command too - silently, in a file this application does not own.
+    let mut root = json!({
+        "hooks": {
+            "PostToolUse": [{
+                "matcher": "*",
+                "hooks": [
+                    { "type": "command", "command": "echo user-audit" },
+                    { "type": "command", "command": "\"C:\\old\\codenotch-hook.exe\" running", "timeout": 5 }
+                ]
+            }]
+        }
+    });
+    assert_eq!(merge_uninstall(&mut root), 1);
+
+    let post = entries(&root, "PostToolUse");
+    assert_eq!(post.len(), 1, "the entry itself must survive");
+    let cmds = post[0]["hooks"].as_array().unwrap();
+    assert_eq!(cmds.len(), 1, "only our command should have been removed");
+    assert_eq!(cmds[0]["command"], json!("echo user-audit"));
+    // The matcher and any other keys on the entry are the user's and stay as they were.
+    assert_eq!(post[0]["matcher"], json!("*"));
+}
+
+#[test]
+fn installing_over_a_mixed_entry_keeps_the_user_command() {
+    // The same case reached through install rather than uninstall, since install now sweeps
+    // first. This is the path an upgrade actually takes.
+    let mut root = json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [
+                    { "type": "command", "command": "\"C:\\old\\codenotch-hook.exe\" running" },
+                    { "type": "command", "command": "echo keep-me" }
+                ]
+            }]
+        }
+    });
+    merge_install(&mut root, HOOK);
+    let pre = entries(&root, "PreToolUse");
+    assert_eq!(pre.len(), 1);
+    let cmds = pre[0]["hooks"].as_array().unwrap();
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(cmds[0]["command"], json!("echo keep-me"));
+}
+
+#[test]
+fn an_entry_the_user_left_empty_is_not_tidied_away() {
+    // Odd, but theirs. Removing it would be this application editing a file it does not own
+    // for cosmetic reasons.
+    let mut root = json!({ "hooks": { "PreCompact": [{ "hooks": [] }] } });
+    let before = root.clone();
+    assert_eq!(merge_uninstall(&mut root), 0);
+    assert_eq!(root, before);
+}
+
+#[test]
 fn upgrading_from_a_legacy_name_also_clears_the_retired_events() {
     // Same path, but the stale entry was written under one of the earlier binary names. It is
     // still ours, so it still has to go.
