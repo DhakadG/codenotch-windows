@@ -6,6 +6,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege. Without this block the workflow inherits the repository default, which
+# can include write access it has no use for; nothing here needs more than to read the code.
+# The audit job's action is given its token explicitly.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # RUSTFLAGS is deliberately NOT set here. The environment variable *replaces*

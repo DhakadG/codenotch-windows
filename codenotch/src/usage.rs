@@ -269,7 +269,39 @@ pub fn start(app: AppHandle) {
             let _ = app.emit("usage", &snap);
         }
         let mut consecutive_429: u32 = 0;
+        // The credential that earned the current backoff. When the file changes, whatever
+        // the server objected to has changed too, so the wait no longer applies.
+        let mut backoff_token: Option<String> = None;
         loop {
+            // A backoff is tied to one credential. Claude Code rewriting .credentials.json
+            // means the next request is a different request, and sitting out the remainder
+            // of an hour-long Retry-After after the user has already fixed the problem is
+            // the difference between "briefly unavailable" and "apparently broken".
+            if backoff_token.is_some() && read_credentials().map(|(t, _)| t) != backoff_token {
+                set_and_broadcast(&app, |u| {
+                    u.backoff_until = 0;
+                    u.note.clear();
+                });
+                backoff_token = None;
+                consecutive_429 = 0;
+            }
+            // The expired-credential case is settled before the backoff gate, not after.
+            // A backoff only governs whether a *request* may be made, and an expired
+            // credential means no request is going to be made either way. Checking it
+            // second meant a backoff restored from disk at startup - an hour of it, after
+            // one 429 - kept showing "Rate limited" when the honest and actionable answer
+            // was that the saved credential had expired.
+            if let Some((_, true)) = read_credentials() {
+                set_and_broadcast(&app, |u| {
+                    u.status = "needsAuth".into();
+                    u.note = "Claude Code's saved credential has expired. Run `claude` in a terminal to refresh it — Codenotch reads that file and cannot sign in on its own.".into();
+                    u.backoff_until = 0;
+                });
+                backoff_token = None;
+                consecutive_429 = 0;
+                sleep_interruptible(POLL_ACTIVE_SECS);
+                continue;
+            }
             // No requests inside the backoff window
             let bu = {
                 let st = app.state::<AppState>();
@@ -286,7 +318,16 @@ pub fn start(app: AppHandle) {
                     u.status = "needsAuth".into();
                     u.note = "No Claude Code credential found".into();
                 }),
-                Some((token, expired)) => {
+                // Unreachable in practice: the expired case is handled above, before the
+                // backoff gate. Kept so the match stays total and a future edit that moves
+                // that check cannot silently start sending dead tokens again.
+                Some((_, true)) => {}
+                // An expired token is never worth a request. Sending one to
+                // api.anthropic.com/api/oauth/usage does not come back as 401: the endpoint
+                // answers 429 with a Retry-After of an hour, so a single doomed request
+                // locks the cell out far longer than refreshing the credential would have
+                // taken, and the card then reports a rate limit the account is not under.
+                Some((token, _)) => {
                     // On 401/403 re-read the credential and retry once (Claude Code may have just refreshed it)
                     let result = match fetch_once(&token) {
                         Err(FetchErr::NeedsAuth) => match read_credentials() {
@@ -295,14 +336,11 @@ pub fn start(app: AppHandle) {
                         },
                         other => other,
                     };
-                    let auth_note = if expired {
-                        "Credential expired — run any claude command (or chat with Claude) to refresh it"
-                    } else {
-                        "Credential rejected (switched accounts?)"
-                    };
+                    let auth_note = "Claude rejected the saved credential. Run `claude` in a terminal to sign in again, or check whether the account changed.";
                     match result {
                         Ok(windows) => {
                             consecutive_429 = 0;
+                            backoff_token = None;
                             set_and_broadcast(&app, |u| {
                                 u.status = "ok".into();
                                 u.windows = windows;
@@ -318,10 +356,16 @@ pub fn start(app: AppHandle) {
                         Err(FetchErr::RateLimited(ra)) => {
                             consecutive_429 += 1;
                             let wait = backoff_secs(consecutive_429 - 1, ra);
+                            backoff_token = Some(token.clone());
                             set_and_broadcast(&app, |u| {
-                                if !u.windows.is_empty() {
-                                    u.status = "stale".into();
-                                }
+                                // The status is always set, never left as whatever the
+                                // previous iteration wrote. It used to be updated only when
+                                // there were windows to keep, so a needsAuth from an earlier
+                                // pass survived alongside a fresh rate-limit note and the
+                                // card said "Sign in to Claude Code" and "Rate limited" at
+                                // the same time - two different problems, neither of them
+                                // the one the user had.
+                                u.status = if u.windows.is_empty() { "backoff".into() } else { "stale".into() };
                                 u.note = format!("Rate limited, retrying in {wait}s");
                                 u.backoff_until = now_ms() + wait * 1000;
                             });

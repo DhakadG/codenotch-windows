@@ -98,13 +98,19 @@ fn handle(app: &AppHandle, id: &str) {
         "reset" => crate::reset_bar(app),
         "open-data" => {
             let dir = crate::config::config_path().parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::create_dir_all(crate::glyphs::user_dir());
-            let mut cmd = std::process::Command::new("explorer");
-            cmd.arg(dir.as_os_str());
+            // `explorer <path>` spawned with CREATE_NO_WINDOW reported "Location is not
+            // available" for a directory that plainly existed and opened fine from a normal
+            // shell. explorer.exe is a shell process rather than a console program, and
+            // suppressing its console this way loses the argument. The shell verb is what
+            // the rest of this file already uses to open URLs, so use it here too.
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/C", "start", ""]).arg(dir.as_os_str());
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x0800_0000);
+                cmd.creation_flags(0x0800_0000); // hides cmd's own console, not explorer's
             }
             let _ = cmd.spawn();
         }
@@ -130,7 +136,13 @@ fn handle(app: &AppHandle, id: &str) {
             notice(app, r);
             refresh_menu(app); // refresh the check marks
         }
-        "quit" => app.exit(0),
+        "quit" => {
+            // Record that this was deliberate, so codenotch-hook does not relaunch the
+            // application on the user's very next Claude Code tool call. main() clears the
+            // marker on every start, so it never outlives the decision it records.
+            crate::mark_user_quit();
+            app.exit(0)
+        }
         _ if id.starts_with("lang-") => crate::apply_lang(app, &id[5..]),
         _ => {}
     }

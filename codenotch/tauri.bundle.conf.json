@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "cargo build -p codenotch-hook --release"
+  },
+  "bundle": {
+    "resources": {
+      "../target/release/codenotch-hook.exe": "codenotch-hook.exe"
+    }
+  }
+}

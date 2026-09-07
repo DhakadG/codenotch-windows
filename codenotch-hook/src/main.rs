@@ -22,15 +22,31 @@ fn main() {
     if send(port, &event, ppid, &body).is_ok() {
         return;
     }
-    // Main app not running: launch it detached, then retry briefly
-    spawn_main();
-    for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(100));
-        if send(port, &event, ppid, &body).is_ok() {
-            return;
-        }
+    // The app is not running. Two rules apply, and both exist because this code runs on
+    // Claude Code's hot path: it is invoked before and after *every* tool call.
+    //
+    // 1. If the user quit from the tray, that decision stands. Relaunching the application
+    //    they just closed, seconds later, because they happened to keep working, makes the
+    //    quit menu item look broken.
+    // 2. Launch and return. There used to be a retry loop here - twenty attempts, 100 ms
+    //    apart - so that the event which triggered the launch would not be lost. That put
+    //    up to two seconds on every hook, and with PreToolUse and PostToolUse both wired
+    //    it added around four seconds to every single tool call. Losing one event is
+    //    invisible; the next one lands milliseconds later and the transcript watcher
+    //    reports the same state anyway. A slow hook is not.
+    if user_quit() {
+        return;
     }
-    // Give up quietly — never affect Claude Code
+    spawn_main();
+}
+
+/// True when the user quit from the tray. The application removes this marker whenever it
+/// starts, so it only ever means "closed on purpose, and not reopened since".
+fn user_quit() -> bool {
+    match std::env::var("APPDATA") {
+        Ok(a) => std::path::Path::new(&format!("{a}\\codenotch\\quit")).exists(),
+        Err(_) => false,
+    }
 }
 
 /// Pulls "port": N out of %APPDATA%\codenotch\config.json (hand-rolled scan, no dependency)

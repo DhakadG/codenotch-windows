@@ -556,8 +556,27 @@ fn report(r: Result<String, String>) {
     let _ = std::fs::write(log, &msg);
 }
 
+/// Path of the marker that records a deliberate quit from the tray.
+///
+/// codenotch-hook reads it before deciding whether to launch the application, so that
+/// quitting is not undone by the user's next Claude Code tool call.
+pub fn quit_marker_path() -> std::path::PathBuf {
+    config::config_path().with_file_name("quit")
+}
+
+pub fn mark_user_quit() {
+    let p = quit_marker_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&p, b"");
+}
+
 fn main() {
     attach_console();
+    // Any start at all - tray, autostart, hook launch, or the user double-clicking - means
+    // the application is wanted again, so the quit marker never outlives one session.
+    let _ = std::fs::remove_file(quit_marker_path());
     let args: Vec<String> = std::env::args().collect();
     if let Some(cmd) = args.get(1) {
         match cmd.as_str() {

@@ -54,8 +54,17 @@ jobs:
           "version=$($conf.version)" | Out-File $env:GITHUB_OUTPUT -Append
           Write-Host "Version: $($conf.version)"
 
+      # tauri.bundle.conf.json is an overlay, applied only here. It carries the hook
+      # binary as a bundle resource and the command that builds it.
+      #
+      # It cannot live in tauri.conf.json: tauri-build reads that file from the *build
+      # script*, and a declared resource that is not yet on disk aborts the build with
+      # "resource path doesn't exist". That would break plain `cargo build`, `cargo test`
+      # and `cargo clippy` for anyone who has not built the hook first — which is everyone
+      # cloning the repository. As an overlay the resource is declared only for a bundle,
+      # and `beforeBuildCommand` produces the file before the build script ever looks.
       - name: Build installer
-        run: cargo tauri build --config codenotch/tauri.conf.json
+        run: cargo tauri build --config tauri.bundle.conf.json
         working-directory: codenotch
 
       # The same assertion CI makes, repeated here because this is the binary that actually
