@@ -102,10 +102,15 @@
      to remove it and it would otherwise sit on top of the incoming one until the fallback
      timer fired. */
   @media (prefers-reduced-motion:reduce){
-    .arc-spin,.arc-enter.arc-spin,.arc-exit.arc-spin{animation:none}
-    .arc-pulse,.arc-enter.arc-pulse,.arc-exit.arc-pulse{animation:none;opacity:.6}
+    .arc-spin,.arc-enter.arc-spin{animation:none}
+    .arc-pulse,.arc-enter.arc-pulse{animation:none;opacity:.6}
     .arc-enter{animation:none}
-    .arc-exit{animation:none;opacity:0}
+    /* The exit rules come last and match the incoming rules' specificity, because a bare
+       `.arc-exit{opacity:0}` loses to `.arc-exit.arc-pulse{opacity:.6}` above - two classes
+       beat one - and the outgoing amber would sit at 0.6 on top of the state replacing it
+       until the fallback timer removed it. With no animation there is no animationend to
+       trigger that removal promptly, so it has to be invisible from the moment it is marked. */
+    .arc-exit,.arc-exit.arc-spin,.arc-exit.arc-pulse{animation:none;opacity:0}
   }
 
   /* Right-click menu. Replaces the WebView's own Back/Reload/Save-as menu, which offers
