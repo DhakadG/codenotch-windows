@@ -50,8 +50,16 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .checked(crate::autostart::is_enabled())
         .build(app)?;
     let quit = MenuItemBuilder::with_id("quit", tr(lang, "quit")).build(app)?;
+    // Only the action that applies. Offering "install hooks" to someone who already has
+    // them, next to "uninstall hooks", makes the user work out the current state from a
+    // menu that could simply have told them.
+    let hook_item: &dyn tauri::menu::IsMenuItem<Wry> = if hooks_install::is_installed() {
+        &uninstall
+    } else {
+        &install
+    };
     MenuBuilder::new(app)
-        .items(&[&install, &uninstall])
+        .items(&[hook_item])
         .separator()
         .item(&lang_menu)
         .item(&refresh)
@@ -78,8 +86,15 @@ fn refresh_menu(app: &AppHandle) {
 
 fn handle(app: &AppHandle, id: &str) {
     match id {
-        "install" => notice(app, hooks_install::install()),
-        "uninstall" => notice(app, hooks_install::uninstall()),
+        // Rebuild afterwards so the menu swaps to the opposite action straight away.
+        "install" => {
+            notice(app, hooks_install::install());
+            refresh_menu(app);
+        }
+        "uninstall" => {
+            notice(app, hooks_install::uninstall());
+            refresh_menu(app);
+        }
         "reset" => crate::reset_bar(app),
         "open-data" => {
             let dir = crate::config::config_path().parent().map(|p| p.to_path_buf()).unwrap_or_default();
