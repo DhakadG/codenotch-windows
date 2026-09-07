@@ -14,8 +14,12 @@
 //!      so both are tried),
 //!      POST `https://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`
 //!      with header `x-codeium-csrf-token: <t>` (Antigravity sits on the Codeium stack; the header
-//!      name never changed) and body `{"forceRefresh":true}` (otherwise the server answers from
-//!      QuotaSummaryCache). Self-signed certificate → verification is relaxed for 127.0.0.1 only.
+//!      name never changed) and body `{"forceRefresh":false}` — the server answers from its
+//!      QuotaSummaryCache. `true` bypasses that cache and makes the language server call Cloud
+//!      Code upstream; sending it on every poll meant this app forced another application's
+//!      process into a network round trip every five minutes, on both ports, even while that
+//!      application was idle. Reserved for an explicit user-initiated refresh, and not wired to
+//!      one yet. Self-signed certificate → verification is relaxed for 127.0.0.1 only.
 //!      Reply `{response:{groups:[{displayName, buckets:[{bucketId, displayName, window,
 //!      remainingFraction, resetTime}]}]}}` — it reports what **remains**, so
 //!      used = 1 - remainingFraction.
@@ -230,7 +234,18 @@ fn local_agent() -> Option<ureq::Agent> {
     Some(ureq::AgentBuilder::new().tls_connector(Arc::new(tls)).timeout(Duration::from_secs(10)).build())
 }
 
-fn bridge_quota(ep: &Endpoint) -> Result<Vec<LimitWindow>, String> {
+/// Asks the local language server for its quota summary.
+///
+/// `force` controls whether the server is made to go upstream. `forceRefresh: true` exists
+/// to bypass its own `QuotaSummaryCache`, so sending it on every poll compelled Antigravity's
+/// language server into a Cloud Code round trip every five minutes, on both of its ports,
+/// forever - including while the IDE was idle and nobody was looking at the notch. That is
+/// not a reasonable thing to do to another application's process, and it is the most likely
+/// reason Antigravity became unstable and rate limited while this app was running.
+///
+/// Routine polling now reads whatever the server already has, which is the same number it
+/// would compute anyway. Only an explicit refresh from the user forces it.
+fn bridge_quota(ep: &Endpoint, force: bool) -> Result<Vec<LimitWindow>, String> {
     let agent = local_agent().ok_or("TLS setup failed")?;
     let mut last = String::from("no port answered");
     // Whether any port replied with a well-formed quota document that simply listed no
@@ -246,7 +261,11 @@ fn bridge_quota(ep: &Endpoint) -> Result<Vec<LimitWindow>, String> {
             .post(&url)
             .set("Content-Type", "application/json")
             .set(CSRF_HEADER, &ep.csrf)
-            .send_string(r#"{"forceRefresh":true}"#)
+            .send_string(if force {
+                r#"{"forceRefresh":true}"#
+            } else {
+                r#"{"forceRefresh":false}"#
+            })
         {
             Ok(r) => match r.into_json::<serde_json::Value>() {
                 Ok(v) => {
@@ -549,7 +568,7 @@ fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
     let mut tried = false;
     if let Some(ep) = rt.endpoint.clone() {
         tried = true;
-        match bridge_quota(&ep) {
+        match bridge_quota(&ep, false) {
             Ok(w) => {
                 rt.ever_bridged = true;
                 snap.status = "ok".into();
@@ -566,7 +585,7 @@ fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
     }
     if let Some(ep) = discover() {
         tried = true;
-        match bridge_quota(&ep) {
+        match bridge_quota(&ep, false) {
             Ok(w) => {
                 rt.endpoint = Some(ep);
                 rt.ever_bridged = true;
@@ -701,7 +720,7 @@ pub fn probe() -> String {
             // replied, and how many windows came back.
             Some(e) => {
                 let ports = format!("{:?}", e.ports);
-                match bridge_quota(&e) {
+                match bridge_quota(&e, false) {
                     Ok(ws) if ws.is_empty() => {
                         format!("running, ports {ports}, bridge answered with no quota groups")
                     }
