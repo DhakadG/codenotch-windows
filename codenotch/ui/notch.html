@@ -52,6 +52,9 @@
   .c-head .mark{display:inline-block;width:16px;height:16px;color:#e8e8ea;margin-right:2px}
   .c-head .mark svg{width:16px;height:16px;fill:currentColor}
   .pct{font-size:15px;font-weight:600;color:#fff;font-variant-numeric:tabular-nums}
+  /* Time until the ring's window resets. Quiet on purpose: it qualifies the percentage above
+     it rather than competing with it, and 70 pt of pill is not much room. */
+  .cd{font-size:9px;color:#8a8a8a;font-variant-numeric:tabular-nums;letter-spacing:-.2px;margin-top:-3px}
   .dim{opacity:.55}
   /* Session arc animation */
   @keyframes spin{to{transform:rotate(360deg)}}
@@ -208,7 +211,7 @@ function glyphHtml(p,small){
 // Provider table (order = top to bottom in the pill). `glyph` is the fallback letter used when no mark is available
 /* User preferences, pushed from the tray. Defaults match the previous behaviour exactly, so
    a config that has never been touched changes nothing. */
-let prefs={hidden_providers:[],ring_window:'auto'};
+let prefs={hidden_providers:[],ring_window:'auto',show_percent:true,show_countdown:true,show_pace_tick:true,show_activity_arc:true};
 
 function providers(){
   const list=[{id:'claude',name:'Claude',glyph:'C',snap:usage}];
@@ -313,7 +316,7 @@ function renderRing(){
   if(pill.dataset.cells!==want){
     pill.innerHTML=ps.map(p=>`<div class="cell" data-p="${p.id}">
       <div class="ringwrap"><svg class="ring" viewBox="0 0 56 56"><g class="base"></g></svg><div class="glyph ${(!glyphs[p.id]&&p.glyph.length>1)?'small':''}">${glyphHtml(p)}</div></div>
-      <div class="pct">—</div></div>`).join('');
+      <div class="pct">—</div><div class="cd"></div></div>`).join('');
     pill.dataset.cells=want;
   }
   for(const p of ps){
@@ -325,7 +328,7 @@ function renderRing(){
       inner+=svgArc(25,Math.min(h.used,1),tone(h.used),5);
       // Only for a metered window, and only when it is not stale: a pace mark computed from
       // a reading of unknown age would point at a moment that has already passed.
-      if(!staleOf(p.snap)) inner+=paceTick(h);
+      if(prefs.show_pace_tick && !staleOf(p.snap)) inner+=paceTick(h);
     }
     // Only the base layer is rewritten. The animated arc is a sibling that survives, because
     // replacing a node restarts its CSS animation - and this function runs on every usage,
@@ -334,7 +337,7 @@ function renderRing(){
     // what made it look broken.
     svg.querySelector('g.base').innerHTML=inner;
     { // thin inner arc: spinning = working, amber pulse = waiting on you (one animation for all four, different sources)
-      const ws=workState(p.id);
+      const ws=prefs.show_activity_arc?workState(p.id):'idle';
       if(cell.dataset.ws!==ws){
         cell.dataset.ws=ws;
         // Fade the outgoing shape out *while* the incoming one fades in, rather than
@@ -371,6 +374,14 @@ function renderRing(){
     else if(h && h.count!=null) pct.textContent='~'+h.count;
     else if(h) pct.textContent=(h.derived?'~':'')+Math.round(h.used*100)+'%';
     else pct.textContent='…';
+    pct.hidden=!prefs.show_percent;
+    const cd=cell.querySelector('.cd');
+    // Only for the window the ring is actually showing, and only while the reading is fresh:
+    // a countdown is a claim about right now, and one computed from a stale reading keeps
+    // ticking towards a moment that has already passed.
+    const left=(prefs.show_countdown && h && !staleOf(p.snap)) ? untilReset(h.resets_at) : '';
+    cd.textContent=left;
+    cd.hidden=!left;
     glyph.classList.toggle('dim', !!(h && h.used>=1));
     wrap.classList.toggle('dim', staleOf(p.snap));
   }
@@ -384,7 +395,30 @@ function resetCopy(ms){
   const d=new Date(ms);
   const t=d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
   if(diff<24*60*60*1000) return `Resets at ${t}`;
+  // A weekday only identifies a day inside the coming week, which upstream's ResetCopy learned
+  // the hard way: Codex's monthly window resets 26 days out, and "Resets Mon 3:55 PM" reads as
+  // *this* Monday - six days away rather than nearly four weeks. At a week or more out, day
+  // and month, and no time of day: nobody plans around 3:55 PM in four weeks, and exactly
+  // seven days is the worst case rather than a mild one, since the weekday is then the same
+  // word as today's.
+  if(diff>=7*24*60*60*1000) return `Resets ${d.toLocaleDateString('en-US',{month:'short',day:'numeric'})}`;
   return `Resets ${d.toLocaleDateString('en-US',{weekday:'short'})} ${t}`;
+}
+
+/* The same fact as resetCopy, in the width a pill has: "47m", "2h14m", "3d".
+   Truncated rather than rounded, unlike the card's copy. A countdown that rounds up says
+   there is more time left than there is, and this one sits directly under the percentage it
+   qualifies - the two must not disagree about whether a window is nearly over. */
+function untilReset(ms){
+  if(!ms) return '';
+  const left=ms-Date.now();
+  if(left<=0) return '0m';
+  const mins=Math.floor(left/60000);
+  if(mins<1) return '<1m';
+  if(mins<60) return `${mins}m`;
+  const hours=Math.floor(mins/60);
+  if(hours<24) return `${hours}h${String(mins%60).padStart(2,'0')}m`;
+  return `${Math.floor(hours/24)}d`;
 }
 
 function ago(ms){
