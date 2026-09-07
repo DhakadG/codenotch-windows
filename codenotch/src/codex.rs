@@ -201,7 +201,7 @@ fn fetch_usage(cred: &Credential) -> Result<serde_json::Value, LiveErr> {
             Err(LiveErr::NeedsAuth)
         }
         Err(ureq::Error::Status(429, r)) => {
-            let ra = r.header("retry-after").and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+            let ra = crate::usage::retry_after_secs(r.header("retry-after")).unwrap_or(0);
             Err(LiveErr::RateLimited(ra.max(BACKOFF_MIN_SECS)))
         }
         Err(ureq::Error::Status(code, _)) => Err(LiveErr::Other(format!("HTTP {code}"))),
@@ -374,11 +374,42 @@ pub fn present() -> bool {
         || codex_home().map(|h| h.join("sessions").is_dir()).unwrap_or(false)
 }
 
-fn read_once() -> UsageSnapshot {
-    let mut snap = UsageSnapshot::default();
+fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
+    // The request log is the one thing carried across readings: it is this provider's record
+    // of what it has already spent against the endpoint's hourly limit, and starting fresh
+    // each poll would make the ceiling unenforceable.
+    let mut snap = UsageSnapshot {
+        request_log: prev.request_log.clone(),
+        ..Default::default()
+    };
     // Note attached to the fallback reading when the live read failed; needs_auth picks the empty state when there is no fallback either
     let mut live_note: Option<String> = None;
     let mut needs_auth = false;
+
+    // Local first. Codex writes the limits it saw into its own rollout log on every turn, so
+    // when that log is recent it holds the same numbers the endpoint would return, for the
+    // cost of reading a file. Asking the network anyway spends a request against a limiter
+    // that has already refused this app once, to learn something it was just told.
+    //
+    // The endpoint is still the authority when the local record is old - after a spell of not
+    // using Codex, or a window that rolled over since the last turn - which is exactly when a
+    // request is worth making.
+    let local = newest_rollout()
+        .and_then(|p| tail_text(&p))
+        .and_then(|t| snapshot_from_rollout(&t));
+    if let Some((windows, Some(recorded), plan)) = &local {
+        if now_ms().saturating_sub(*recorded) <= CURRENT_FOR_MS && !windows.is_empty() {
+            snap.status = "ok".into();
+            snap.windows = windows.clone();
+            snap.fetched_at = *recorded;
+            snap.note = match plan {
+                Some(p) => format!("{} · from Codex's own record", cap(p)),
+                None => "from Codex's own record".into(),
+            };
+            return snap;
+        }
+    }
+
     let held_until = BACKOFF_UNTIL.load(std::sync::atomic::Ordering::Relaxed);
     let now = now_ms();
     if held_until > now {
@@ -391,7 +422,14 @@ fn read_once() -> UsageSnapshot {
                     crate::applog("codex: auth.json has no usable access_token/account_id, falling back to the rollout");
                 }
             }
-            Some(cred) => match fetch_usage(&cred) {
+            // The hard ceiling, on the one path that reaches the network. Reached only when
+            // the local record was too old to answer, so ordinary use never approaches it.
+            Some(_) if crate::usage::budget_check(&mut snap.request_log, now_ms()).is_err() => {
+                live_note = Some("Holding off: this app's own hourly limit for usage checks".into());
+            }
+            Some(cred) => {
+                snap.request_log.push(now_ms());
+                match fetch_usage(&cred) {
                 Ok(v) => {
                     let windows = windows_from_usage(&v);
                     if !windows.is_empty() {
@@ -425,11 +463,12 @@ fn read_once() -> UsageSnapshot {
                     crate::applog(&format!("codex: live read failed ({e}), falling back to the rollout"));
                     live_note = Some(format!("Live read failed ({e})"));
                 }
-            },
+                }
+            }
         }
     }
-    // Fallback: rollout
-    match newest_rollout().and_then(|p| tail_text(&p)).and_then(|t| snapshot_from_rollout(&t)) {
+    // Fallback: the local record read at the top, reused rather than read again.
+    match local {
         Some((windows, recorded, plan)) => {
             let rec = recorded.unwrap_or(0);
             let fresh = rec > 0 && now_ms().saturating_sub(rec) <= CURRENT_FOR_MS;
@@ -517,7 +556,9 @@ pub fn start(app: AppHandle) {
                     continue;
                 }
             }
-            let snap = read_once();
+            let st = app.state::<AppState>();
+            let prev = st.codex.lock().unwrap().clone();
+            let snap = read_once(&prev);
             let hold = snap.backoff_until.saturating_sub(now_ms()) / 1000;
             broadcast(&app, snap);
             for _ in 0..POLL_SECS.max(hold) {

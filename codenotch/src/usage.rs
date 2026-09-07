@@ -455,11 +455,7 @@ fn fetch_once(token: &str) -> Result<Vec<LimitWindow>, FetchErr> {
             Err(FetchErr::NeedsAuth)
         }
         Err(ureq::Error::Status(429, r)) => {
-            let ra = r
-                .header("retry-after")
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            Err(FetchErr::RateLimited(ra))
+            Err(FetchErr::RateLimited(retry_after_secs(r.header("retry-after")).unwrap_or(0)))
         }
         Err(ureq::Error::Status(code, _)) => Err(FetchErr::Other(format!("HTTP {code}"))),
         Err(e) => Err(FetchErr::Other(format!("{e}"))),
@@ -486,7 +482,32 @@ fn credential_fingerprint(token: &str) -> String {
 ///
 /// Kept separate from the check so the pruning is testable on its own, and so a caller
 /// cannot accidentally test the budget against an unpruned log.
-fn prune_request_log(log: &mut Vec<u64>, now: u64) -> usize {
+/// Seconds to wait, from a `Retry-After` header.
+///
+/// RFC 9110 allows two forms and servers use both: a number of seconds, or an HTTP-date.
+/// Only the numeric form was handled, so a date-form header parsed as nothing and the caller
+/// fell back to a guess - which, for a header whose entire purpose is to say how long to
+/// wait, means ignoring the one piece of guidance the server actually gave.
+///
+/// A date in the past yields zero rather than an error: the wait has already elapsed.
+pub(crate) fn retry_after_secs(header: Option<&str>) -> Option<u64> {
+    let raw = header?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(secs);
+    }
+    // HTTP-date. RFC 9110 mandates IMF-fixdate for new messages, and chrono parses that
+    // directly; the obsolete RFC 850 and asctime forms are not accepted, which matches what
+    // servers actually send today.
+    let when = chrono::DateTime::parse_from_rfc2822(raw)
+        .ok()
+        .map(|d| d.timestamp_millis())?;
+    Some(((when - now_ms() as i64).max(0) / 1000) as u64)
+}
+
+pub(crate) fn prune_request_log(log: &mut Vec<u64>, now: u64) -> usize {
     log.retain(|t| now.saturating_sub(*t) < HOUR_MS);
     log.len()
 }
@@ -495,7 +516,7 @@ fn prune_request_log(log: &mut Vec<u64>, now: u64) -> usize {
 ///
 /// Returns `Ok(())` to proceed, or `Err(seconds)` with how long until the oldest request
 /// ages out of the window.
-fn budget_check(log: &mut Vec<u64>, now: u64) -> Result<(), u64> {
+pub(crate) fn budget_check(log: &mut Vec<u64>, now: u64) -> Result<(), u64> {
     if prune_request_log(log, now) < MAX_REQUESTS_PER_HOUR {
         return Ok(());
     }

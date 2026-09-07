@@ -243,6 +243,32 @@ fn uncapped_extra_usage_shows_an_amount_rather_than_a_share() {
     assert_eq!(ws[0].used, 0.0);
 }
 
+#[test]
+fn retry_after_accepts_both_forms_the_spec_allows() {
+    // Seconds, the common form.
+    assert_eq!(retry_after_secs(Some("120")), Some(120));
+    assert_eq!(retry_after_secs(Some("  90  ")), Some(90));
+    assert_eq!(retry_after_secs(Some("0")), Some(0));
+
+    // An HTTP-date, which servers do send and which used to parse as nothing at all - so the
+    // caller fell back to a guess and ignored the only guidance the server gave.
+    let future = chrono::Utc::now() + chrono::Duration::seconds(300);
+    let header = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let secs = retry_after_secs(Some(&header)).expect("an HTTP-date must parse");
+    assert!((295..=300).contains(&secs), "expected about 300s, got {secs}");
+
+    // A date already in the past means the wait has elapsed, not that the header is broken.
+    let past = chrono::Utc::now() - chrono::Duration::seconds(600);
+    let header = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    assert_eq!(retry_after_secs(Some(&header)), Some(0));
+
+    // Absent or unparseable: the caller decides, rather than being handed a fabricated wait.
+    assert_eq!(retry_after_secs(None), None);
+    assert_eq!(retry_after_secs(Some("")), None);
+    assert_eq!(retry_after_secs(Some("soon")), None);
+    assert_eq!(retry_after_secs(Some("-5")), None);
+}
+
 // ---------------- The request budget ----------------
 
 #[test]
