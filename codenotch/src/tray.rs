@@ -44,6 +44,8 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .items(&[&l_auto, &l_zh, &l_en, &l_ja, &l_ko])
         .build()?;
     let refresh = MenuItemBuilder::with_id("refresh", tr(lang, "refresh")).build(app)?;
+    let refresh_creds =
+        MenuItemBuilder::with_id("refresh-creds", tr(lang, "refresh_creds")).build(app)?;
     let reset = MenuItemBuilder::with_id("reset", tr(lang, "reset_pos")).build(app)?;
     let open_data = MenuItemBuilder::with_id("open-data", tr(lang, "open_data")).build(app)?;
     let auto = CheckMenuItemBuilder::with_id("autostart", tr(lang, "autostart"))
@@ -63,6 +65,7 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .separator()
         .item(&lang_menu)
         .item(&refresh)
+        .item(&refresh_creds)
         .item(&reset)
         .item(&open_data)
         .item(&auto)
@@ -113,6 +116,34 @@ fn handle(app: &AppHandle, id: &str) {
                 cmd.creation_flags(0x0800_0000); // hides cmd's own console, not explorer's
             }
             let _ = cmd.spawn();
+        }
+        // Re-acquire credentials, then re-poll. Distinct from "refresh now", which only
+        // re-polls: this is for the case where a reading is missing because the *sign-in*
+        // is stale rather than because the number is old.
+        //
+        // Only Claude has a nudge worth making. Codex's session is refreshed by the Codex
+        // CLI and is read the same way; Cursor's is borrowed from the editor, so signing in
+        // there is the only fix; Antigravity's lives in Credential Manager and is renewed
+        // by its own IDE. For those three the honest action is to drop any cached copy and
+        // read again, which is what request_refresh does, and to say so rather than imply
+        // the app can re-authenticate them.
+        "refresh-creds" => {
+            let claude = crate::usage::nudge_claude_credential();
+            {
+                let st = app.state::<crate::AppState>();
+                let mut u = st.usage.lock().unwrap();
+                u.backoff_until = 0;
+            }
+            crate::usage::request_refresh();
+            crate::codex::request_refresh();
+            crate::cursor::request_refresh();
+            crate::antigravity::request_refresh();
+            notice(
+                app,
+                Ok(format!(
+                    "Claude: {claude}. Codex, Cursor and Antigravity re-read from their own stores."
+                )),
+            );
         }
         "refresh" => {
             {

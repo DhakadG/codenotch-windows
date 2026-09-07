@@ -181,6 +181,69 @@ fn parse_response_survives_shapes_it_has_never_seen() {
 }
 
 #[test]
+fn model_scoped_weekly_windows_are_read_when_the_plan_has_them() {
+    // Null on Pro, populated on Max and Team. Reading them costs nothing on the plans that
+    // leave them null, and a Max account was previously shown none of them.
+    let v = json!({
+        "limits": [],
+        "seven_day_opus": { "utilization": 22.0, "resets_at": RESET_ISO },
+        "seven_day_sonnet": { "utilization": 8.0, "resets_at": RESET_ISO }
+    });
+    let ws = parse_response(&v);
+    assert_eq!(ids(&ws), ["seven_day_opus", "seven_day_sonnet"]);
+    assert_eq!(ws[0].label, "Weekly (Opus)");
+    assert_eq!(ws[1].label, "Weekly (Sonnet)");
+    assert!((ws[0].used - 0.22).abs() < 1e-9);
+}
+
+#[test]
+fn extra_usage_is_shown_only_when_it_is_switched_on() {
+    let off = json!({
+        "limits": [],
+        "extra_usage": { "is_enabled": false, "monthly_limit": null, "used_credits": null }
+    });
+    assert!(parse_response(&off).is_empty());
+
+    // A Pro account with the feature never enabled: every field null, still nothing shown.
+    let never = json!({ "limits": [], "extra_usage": { "is_enabled": false, "user_disabled": true } });
+    assert!(parse_response(&never).is_empty());
+}
+
+#[test]
+fn extra_usage_is_a_ratio_of_money_not_a_utilization() {
+    // 1500 cents of a 5000 cent cap. `utilization` is deliberately ignored: it is null
+    // until the first spend of a cycle, so a bar keyed on it disappears every month start.
+    let v = json!({
+        "limits": [],
+        "extra_usage": {
+            "is_enabled": true,
+            "monthly_limit": 5000.0,
+            "used_credits": 1500.0,
+            "utilization": null
+        }
+    });
+    let ws = parse_response(&v);
+    assert_eq!(ids(&ws), ["extra_usage"]);
+    assert_eq!(ws[0].label, "Extra usage");
+    assert!((ws[0].used - 0.3).abs() < 1e-9);
+    assert_eq!(ws[0].count, None);
+}
+
+#[test]
+fn uncapped_extra_usage_shows_an_amount_rather_than_a_share() {
+    // Enabled with no ceiling: there is no denominator, so there is no honest percentage.
+    // Upstream's rule - a count, marked derived, never an invented share.
+    let v = json!({
+        "limits": [],
+        "extra_usage": { "is_enabled": true, "monthly_limit": null, "used_credits": 734.0 }
+    });
+    let ws = parse_response(&v);
+    assert_eq!(ws[0].count, Some(7)); // 734 cents rounds to 7 dollars
+    assert!(ws[0].derived);
+    assert_eq!(ws[0].used, 0.0);
+}
+
+#[test]
 fn backoff_doubles_then_stops_at_the_cap() {
     assert_eq!(backoff_secs(0, 0), 60);
     assert_eq!(backoff_secs(1, 0), 120);

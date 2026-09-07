@@ -588,6 +588,12 @@ fn main() {
                 report(hooks_install::uninstall());
                 return;
             }
+            // The tray item's command-line twin, so the behaviour can be tested and
+            // scripted rather than only clicked.
+            "refresh-creds" => {
+                report(Ok(usage::nudge_claude_credential()));
+                return;
+            }
             "autostart" => {
                 let r = match args.get(2).map(|s| s.as_str()) {
                     Some("on") => autostart::enable(),

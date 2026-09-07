@@ -23,6 +23,10 @@ const POLL_ACTIVE_SECS: u64 = 60;
 const POLL_IDLE_SECS: u64 = 300;
 const BACKOFF_BASE_SECS: u64 = 60;
 const BACKOFF_CAP_SECS: u64 = 900;
+/// How often the app may ask Claude Code to refresh its own credential. Ten minutes is
+/// frequent enough that an expiry is picked up promptly and rare enough that a machine left
+/// signed out does not spawn a process every minute forever.
+const NUDGE_EVERY_MS: u64 = 10 * 60 * 1000;
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -122,6 +126,91 @@ fn read_credentials() -> Option<(String, bool)> {
     None
 }
 
+/// Where Claude Code's CLI lives, if it is installed.
+///
+/// PATH first, then the two places the installers actually put it. Mirrors what
+/// `codex::find_executable` does for the same reason: a user who installed through npm has
+/// no `claude.exe` on PATH for a GUI process, because the shim is a `.cmd`.
+fn claude_exe() -> Option<std::path::PathBuf> {
+    if let Ok(p) = which_on_path("claude.exe") {
+        return Some(p);
+    }
+    let home = dirs::home_dir()?;
+    let candidates = [
+        home.join(".local").join("bin").join("claude.exe"),
+        dirs::data_dir()?.join("npm").join("claude.cmd"),
+    ];
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+fn which_on_path(name: &str) -> Result<std::path::PathBuf, ()> {
+    let path = std::env::var_os("PATH").ok_or(())?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+        .ok_or(())
+}
+
+/// Asks Claude Code to put its own credential in order, and reports whether that changed it.
+///
+/// Codenotch never mints or rotates a Claude token. The macOS original is explicit about
+/// why - "minting a new token would mean writing a credential this app does not own" - and
+/// the risk is concrete: refresh tokens rotate, so a second client refreshing behind Claude
+/// Code's back can invalidate the token Claude Code still holds and sign the user out of
+/// the tool they were using. So the only move available is to ask the owner to do it.
+///
+/// `claude auth status` is the cheapest way to ask: about half a second, no session, and no
+/// transcript written - which matters, because a transcript would appear in this very app
+/// as a phantom working session.
+///
+/// Whether it *also* refreshes an expired token is not documented, and could not be
+/// verified without waiting for a real expiry. So this reports what actually happened
+/// rather than assuming: the caller logs it, and the log is the evidence for whether a
+/// heavier nudge (starting and killing a real session) is ever warranted.
+pub fn nudge_claude_credential() -> String {
+    let Some(exe) = claude_exe() else {
+        return "no claude executable found on PATH or in the usual install locations".into();
+    };
+    let before = read_credentials().map(|(t, _)| t);
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("auth")
+        .arg("status")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => return format!("claude auth status failed to run: {e}"),
+    };
+
+    // `loggedIn:false` is a real sign-out and no amount of waiting will fix it, which is a
+    // different message to the user than a token that merely aged out.
+    let text = String::from_utf8_lossy(&out.stdout);
+    let logged_in = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("loggedIn").and_then(|x| x.as_bool()));
+
+    let after = read_credentials().map(|(t, _)| t);
+    let changed = before != after;
+    let still_expired = matches!(read_credentials(), Some((_, true)));
+
+    match (logged_in, changed, still_expired) {
+        (Some(false), _, _) => "claude reports signed out - run `claude` and sign in".into(),
+        (_, true, false) => "credential refreshed by Claude Code".into(),
+        (_, true, true) => "Claude Code rewrote the credential but it is still expired".into(),
+        (_, false, true) => {
+            "`claude auth status` did not refresh the expired credential - run `claude` once".into()
+        }
+        (_, false, false) => "credential was already valid".into(),
+    }
+}
+
 /// For doctor: credential probe report (prints no secret values)
 pub fn probe_credentials() -> String {
     match read_credentials() {
@@ -145,6 +234,8 @@ fn label_for(kind: &str) -> String {
         "session" => "Current session".into(),
         "seven_day" | "weekly_all" => "Weekly (all models)".into(),
         "seven_day_opus" | "weekly_opus" => "Weekly (Opus)".into(),
+        "seven_day_sonnet" | "weekly_sonnet" => "Weekly (Sonnet)".into(),
+        "extra_usage" => "Extra usage".into(),
         "weekly_scoped" => "Weekly (model-scoped)".into(),
         other => {
             // Forward compatibility: an unknown kind gets a readable label
@@ -183,9 +274,14 @@ fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
     // In practice the kinds in limits are weekly_all/weekly_scoped, not seven_day — deduplicating by id
     // alone would add the seven_day fallback a second time (the card showed "Weekly all" and
     // "Weekly (all models)" as twins). Three dedupe rules: id alias / same resets_at and percentage / same label.
-    let aliases: [(&str, &str, &[&str]); 2] = [
+    // The reply carries more named windows than `limits` ever lists. On a Pro account the
+    // model-scoped ones are null, but Max and Team accounts populate them, and reading them
+    // costs nothing on the plans that do not.
+    let aliases: [(&str, &str, &[&str]); 4] = [
         ("five_hour", "session", &["session", "five_hour"]),
         ("seven_day", "seven_day", &["seven_day", "weekly_all", "weekly"]),
+        ("seven_day_opus", "seven_day_opus", &["seven_day_opus", "weekly_opus"]),
+        ("seven_day_sonnet", "seven_day_sonnet", &["seven_day_sonnet", "weekly_sonnet"]),
     ];
     for (field, id, alias) in aliases {
         let Some(w) = v.get(field) else { continue };
@@ -204,6 +300,38 @@ fn parse_response(v: &serde_json::Value) -> Vec<LimitWindow> {
             continue;
         }
         out.push(LimitWindow { id: id.into(), label, used, resets_at, ..Default::default() });
+    }
+    // Paid extra usage, when the account has opted in. Unlike every other window this one
+    // is money rather than a share of an allowance: `monthly_limit` and `used_credits` are
+    // in cents, and `utilization` is null until the first spend of a cycle - so a bar keyed
+    // on utilization alone would vanish at the start of every month. Derive it from the two
+    // amounts instead, and show nothing at all when the feature is switched off.
+    if let Some(eu) = v.get("extra_usage").filter(|x| x.is_object()) {
+        let enabled = eu.get("is_enabled").and_then(|x| x.as_bool()).unwrap_or(false);
+        let limit_cents = eu.get("monthly_limit").and_then(|x| x.as_f64());
+        let used_cents = eu.get("used_credits").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        // A null limit with the feature enabled means uncapped: there is no denominator, so
+        // there is no honest percentage. Upstream's rule applies - show the count, not an
+        // invented share.
+        if enabled {
+            match limit_cents {
+                Some(limit) if limit > 0.0 => out.push(LimitWindow {
+                    id: "extra_usage".into(),
+                    label: label_for("extra_usage"),
+                    used: (used_cents / limit).clamp(0.0, 1.0),
+                    resets_at: None,
+                    ..Default::default()
+                }),
+                _ => out.push(LimitWindow {
+                    id: "extra_usage".into(),
+                    label: label_for("extra_usage"),
+                    used: 0.0,
+                    resets_at: None,
+                    count: Some((used_cents / 100.0).round() as i64),
+                    derived: true,
+                }),
+            }
+        }
     }
     // session always comes first (upstream display order)
     out.sort_by_key(|w| if w.id == "session" { 0 } else { 1 });
@@ -272,6 +400,8 @@ pub fn start(app: AppHandle) {
         // The credential that earned the current backoff. When the file changes, whatever
         // the server objected to has changed too, so the wait no longer applies.
         let mut backoff_token: Option<String> = None;
+        // When the expired-credential nudge last ran, so it stays occasional.
+        let mut last_nudge: Option<u64> = None;
         loop {
             // A backoff is tied to one credential. Claude Code rewriting .credentials.json
             // means the next request is a different request, and sitting out the remainder
@@ -292,9 +422,34 @@ pub fn start(app: AppHandle) {
             // one 429 - kept showing "Rate limited" when the honest and actionable answer
             // was that the saved credential had expired.
             if let Some((_, true)) = read_credentials() {
+                // Ask Claude Code to sort its own credential out, but not on every tick: a
+                // process spawn per minute is its own kind of rude.
+                let due = last_nudge.map(|t| now_ms().saturating_sub(t) >= NUDGE_EVERY_MS).unwrap_or(true);
+                let outcome = if due {
+                    last_nudge = Some(now_ms());
+                    let r = nudge_claude_credential();
+                    crate::applog(&format!("claude credential nudge: {r}"));
+                    Some(r)
+                } else {
+                    None
+                };
+                // The nudge may have fixed it, in which case fall through and fetch now
+                // rather than waiting out another poll interval.
+                if !matches!(read_credentials(), Some((_, true))) {
+                    continue;
+                }
                 set_and_broadcast(&app, |u| {
-                    u.status = "needsAuth".into();
-                    u.note = "Claude Code's saved credential has expired. Run `claude` in a terminal to refresh it — Codenotch reads that file and cannot sign in on its own.".into();
+                    // An expired credential is not a sign-out, and the difference matters:
+                    // the last reading is still the truth about the account, just old.
+                    // Blanking it to needsAuth is what left the ring spinning with no bar
+                    // when the only thing wrong was a token that had aged out overnight.
+                    u.status = if u.windows.is_empty() { "needsAuth".into() } else { "stale".into() };
+                    u.note = match outcome.as_deref() {
+                        Some(o) if o.contains("signed out") => {
+                            "Claude Code is signed out. Run `claude` in a terminal and sign in.".into()
+                        }
+                        _ => "Claude Code's saved credential has expired. Run `claude` in a terminal to refresh it — Codenotch reads that file and never rotates it, so that a background refresh cannot sign you out of Claude Code.".to_string()
+                    };
                     u.backoff_until = 0;
                 });
                 backoff_token = None;
