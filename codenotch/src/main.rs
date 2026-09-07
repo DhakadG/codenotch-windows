@@ -346,15 +346,30 @@ fn get_codex(state: tauri::State<AppState>) -> usage::UsageSnapshot {
 pub struct Prefs {
     pub hidden_providers: Vec<String>,
     pub ring_window: String,
+    pub show_percent: bool,
+    pub show_countdown: bool,
+    pub show_pace_tick: bool,
+    pub show_activity_arc: bool,
+}
+
+impl Prefs {
+    /// Built in one place so a field added here cannot reach the page through the initial
+    /// read and then go missing from the update, or the other way round.
+    fn from_config(c: &config::Config) -> Self {
+        Prefs {
+            hidden_providers: c.hidden_providers.clone(),
+            ring_window: c.ring_window.clone(),
+            show_percent: c.show_percent,
+            show_countdown: c.show_countdown,
+            show_pace_tick: c.show_pace_tick,
+            show_activity_arc: c.show_activity_arc,
+        }
+    }
 }
 
 #[tauri::command]
 fn get_prefs(state: tauri::State<AppState>) -> Prefs {
-    let c = state.cfg.lock().unwrap();
-    Prefs {
-        hidden_providers: c.hidden_providers.clone(),
-        ring_window: c.ring_window.clone(),
-    }
+    Prefs::from_config(&state.cfg.lock().unwrap())
 }
 
 /// Pushes the current preferences to the pill. Called after any tray toggle.
@@ -362,10 +377,7 @@ pub fn broadcast_prefs(app: &AppHandle) {
     let prefs = {
         let st = app.state::<AppState>();
         let c = st.cfg.lock().unwrap();
-        Prefs {
-            hidden_providers: c.hidden_providers.clone(),
-            ring_window: c.ring_window.clone(),
-        }
+        Prefs::from_config(&c)
     };
     let _ = app.emit("prefs", &prefs);
 }

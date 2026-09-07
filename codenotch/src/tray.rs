@@ -81,6 +81,30 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .items(&[&r_auto, &r_session, &r_weekly])
         .build()?;
 
+    // Parts of a cell, each switchable on its own. The id after "show-" is the config field,
+    // so adding one here and in `Config` is the whole change.
+    let show = {
+        let st = app.state::<crate::AppState>();
+        let c = st.cfg.lock().unwrap();
+        [
+            ("percent", c.show_percent),
+            ("countdown", c.show_countdown),
+            ("pace_tick", c.show_pace_tick),
+            ("activity_arc", c.show_activity_arc),
+        ]
+    };
+    let mut show_items = Vec::new();
+    for (name, on) in show {
+        show_items.push(
+            CheckMenuItemBuilder::with_id(format!("show-{name}"), tr(lang, &format!("show_{name}")))
+                .checked(on)
+                .build(app)?,
+        );
+    }
+    let show_menu = SubmenuBuilder::new(app, tr(lang, "show"))
+        .items(&show_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<Wry>).collect::<Vec<_>>())
+        .build()?;
+
     let refresh = MenuItemBuilder::with_id("refresh", tr(lang, "refresh")).build(app)?;
     let refresh_creds =
         MenuItemBuilder::with_id("refresh-creds", tr(lang, "refresh_creds")).build(app)?;
@@ -103,6 +127,7 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .separator()
         .item(&provider_menu)
         .item(&ring_menu)
+        .item(&show_menu)
         .item(&lang_menu)
         .item(&refresh)
         .item(&refresh_creds)
@@ -156,6 +181,24 @@ fn handle(app: &AppHandle, id: &str) {
                     c.hidden_providers.remove(pos);
                 } else {
                     c.hidden_providers.push(provider);
+                }
+                crate::config::save(&c);
+            }
+            crate::broadcast_prefs(app);
+            refresh_menu(app);
+        }
+        id if id.starts_with("show-") => {
+            {
+                let st = app.state::<crate::AppState>();
+                let mut c = st.cfg.lock().unwrap();
+                match id.trim_start_matches("show-") {
+                    "percent" => c.show_percent = !c.show_percent,
+                    "countdown" => c.show_countdown = !c.show_countdown,
+                    "pace_tick" => c.show_pace_tick = !c.show_pace_tick,
+                    "activity_arc" => c.show_activity_arc = !c.show_activity_arc,
+                    // An id built here that nothing matches would silently do nothing, which is
+                    // the failure mode worth naming rather than the one worth ignoring.
+                    other => crate::applog(&format!("tray: unknown show toggle {other:?}")),
                 }
                 crate::config::save(&c);
             }

@@ -34,6 +34,32 @@ pub struct Config {
     /// people who only care about one of them, and the hover card still lists them all.
     #[serde(default = "default_ring_window")]
     pub ring_window: String,
+    /// Individually switchable parts of a cell.
+    ///
+    /// Upstream has no equivalent: its settings are about what the notch *is* (which edge,
+    /// how visible, which providers), not about which decorations a cell carries. This comes
+    /// from the taskbar mod, where every element of a bar is switchable, and it earns its keep
+    /// for the same reason there — 70 pt is not much room, and what counts as the useful part
+    /// differs per person. Someone who only wants a ring and a colour should be able to have
+    /// that without four lines of text under it.
+    ///
+    /// All default to on, so the app looks exactly as it did before any of these existed and
+    /// a new one cannot silently switch itself off for someone upgrading.
+    #[serde(default = "yes")]
+    pub show_percent: bool,
+    /// Time until the ring's window resets, under the percentage.
+    #[serde(default = "yes")]
+    pub show_countdown: bool,
+    /// The mark on the ring showing how far through the reset window you are.
+    #[serde(default = "yes")]
+    pub show_pace_tick: bool,
+    /// The inner arc: turning while a session works, amber while one waits on you.
+    #[serde(default = "yes")]
+    pub show_activity_arc: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_ring_window() -> String {
@@ -63,6 +89,10 @@ impl Default for Config {
             notch_y: default_notch_y(),
             hidden_providers: Vec::new(),
             ring_window: default_ring_window(),
+            show_percent: true,
+            show_countdown: true,
+            show_pace_tick: true,
+            show_activity_arc: true,
         }
     }
 }
