@@ -25,8 +25,7 @@ Providers that are not installed simply do not get a cell.
 Prerequisites: Rust (MSVC toolchain), WebView2 runtime (ships with Windows 11).
 
 ```powershell
-git clone <this repo>
-cd codenotch-win
+# from this directory (the repo root here; `windows/` inside the upstream repo)
 cargo build --release
 .\target\release\codenotch.exe          # pill appears on the right edge of the primary monitor
 .\target\release\codenotch.exe doctor   # self-diagnosis: credentials, data sources, icons, hooks
@@ -45,7 +44,7 @@ The marks remain the trademarks of their owners.
 ## Layout
 
 ```
-codenotch-win/
+.
 ├── codenotch/          Tauri 2 app: window, tray, providers (usage.rs, codex.rs, cursor.rs, antigravity.rs),
 │   ├── src/            session engine (watcher.rs, state.rs, focus.rs), glyphs.rs, doctor.rs
 │   ├── ui/notch.html   the pill + hover card (single file, no framework)
@@ -56,9 +55,10 @@ codenotch-win/
 ## Relationship to upstream
 
 This port follows the upstream design spec (`docs/specs/2026-08-28-usage-notch-design.md`)
-and provider semantics, and is offered to the upstream project as a `windows/` tree.
-Until that lands it lives here. The session-detection engine originated in
-[Im-Midi/Pac-Man](https://github.com/Im-Midi/Pac-Man) (MIT).
+and provider semantics. It is developed at
+[Im-Midi/codenotch-windows](https://github.com/Im-Midi/codenotch-windows) and offered to the
+upstream project as its `windows/` tree; the two are kept in sync. The session-detection engine
+originated in [Im-Midi/Pac-Man](https://github.com/Im-Midi/Pac-Man) (MIT).
 
 ## License
 
