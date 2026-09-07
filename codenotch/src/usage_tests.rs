@@ -243,6 +243,61 @@ fn uncapped_extra_usage_shows_an_amount_rather_than_a_share() {
     assert_eq!(ws[0].used, 0.0);
 }
 
+#[test]
+fn retry_after_accepts_both_forms_the_spec_allows() {
+    // Seconds, the common form.
+    assert_eq!(retry_after_secs(Some("120")), Some(120));
+    assert_eq!(retry_after_secs(Some("  90  ")), Some(90));
+    assert_eq!(retry_after_secs(Some("0")), Some(0));
+
+    // An HTTP-date, which servers do send and which used to parse as nothing at all - so the
+    // caller fell back to a guess and ignored the only guidance the server gave.
+    let future = chrono::Utc::now() + chrono::Duration::seconds(300);
+    let header = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let secs = retry_after_secs(Some(&header)).expect("an HTTP-date must parse");
+    assert!((295..=300).contains(&secs), "expected about 300s, got {secs}");
+
+    // A date already in the past means the wait has elapsed, not that the header is broken.
+    let past = chrono::Utc::now() - chrono::Duration::seconds(600);
+    let header = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    assert_eq!(retry_after_secs(Some(&header)), Some(0));
+
+    // Absent or unparseable: the caller decides, rather than being handed a fabricated wait.
+    assert_eq!(retry_after_secs(None), None);
+    assert_eq!(retry_after_secs(Some("")), None);
+    assert_eq!(retry_after_secs(Some("soon")), None);
+    assert_eq!(retry_after_secs(Some("-5")), None);
+}
+
+#[test]
+fn a_sub_second_wait_rounds_up_to_one() {
+    // Against a fixed clock, so the assertion is exact. The first version of this test used
+    // the wall clock and accepted `secs <= 1`, which the truncating implementation it was
+    // written to guard also satisfies - it would have passed on the bug. A test that cannot
+    // fail on the defect it names is worse than no test, because it reports a safety it never
+    // checked.
+    //
+    // The header carries whole seconds, so the fractional remainder comes from `now` sitting
+    // part-way through a second - exactly how it arises in practice.
+    let at = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:01Z").unwrap();
+    let header = at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let target = at.timestamp_millis() as u64;
+
+    for remaining_ms in [1u64, 400, 999] {
+        assert_eq!(
+            retry_after_secs_at(Some(&header), target - remaining_ms),
+            Some(1),
+            "{remaining_ms} ms remaining must round up to 1s, not down to 0"
+        );
+    }
+    // A whole second stays a whole second rather than being rounded to two.
+    assert_eq!(retry_after_secs_at(Some(&header), target - 1000), Some(1));
+    assert_eq!(retry_after_secs_at(Some(&header), target - 1001), Some(2));
+    // Exactly at the deadline, and past it, the wait is over.
+    assert_eq!(retry_after_secs_at(Some(&header), target), Some(0));
+    assert_eq!(retry_after_secs_at(Some(&header), target + 5_000), Some(0));
+}
+
 // ---------------- The request budget ----------------
 
 #[test]

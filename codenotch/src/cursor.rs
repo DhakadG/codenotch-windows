@@ -277,9 +277,9 @@ fn fetch_once(cookie: &str) -> Result<serde_json::Value, FetchErr> {
         // 429 was previously indistinguishable from any other failure, so a rate-limited
         // Cursor kept being asked every five minutes with no acknowledgement that it had
         // said no. Named so the caller can hold off and say why.
-        Err(ureq::Error::Status(429, r)) => Err(FetchErr::RateLimited(
-            r.header("retry-after").and_then(|s| s.parse::<u64>().ok()).unwrap_or(300),
-        )),
+        Err(ureq::Error::Status(429, r)) => {
+            Err(FetchErr::RateLimited(crate::usage::retry_after_secs(r.header("retry-after")).unwrap_or(300)))
+        }
         Err(ureq::Error::Status(code, _)) => Err(FetchErr::Other(format!("HTTP {code}"))),
         Err(e) => Err(FetchErr::Other(format!("{e}"))),
     }
@@ -307,6 +307,15 @@ fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
         snap.note = "Cursor's stored session has expired. Open the Cursor editor to refresh it — Codenotch borrows its session and cannot sign in.".into();
         return snap;
     }
+    // The hourly ceiling, on the only path here that reaches the network. Cursor has no local
+    // record of its own usage - `state.vscdb` holds the credential, not the numbers - so
+    // unlike Codex there is nothing to read instead, and the ceiling is the whole protection.
+    if crate::usage::budget_check(&mut snap.request_log, now_ms()).is_err() {
+        snap.status = if snap.windows.is_empty() { "backoff".into() } else { "stale".into() };
+        snap.note = "Holding off: this app's own hourly limit for usage checks".into();
+        return snap;
+    }
+    snap.request_log.push(now_ms());
     match fetch_once(&creds.cookie) {
         Ok(v) => {
             let (windows, note) = parse_summary(&v);

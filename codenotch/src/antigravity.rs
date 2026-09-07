@@ -562,7 +562,14 @@ struct Runtime {
 }
 
 fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
-    let mut snap = UsageSnapshot::default();
+    // The request log is this provider's record of what it has spent against Google's
+    // endpoint, and it has to survive a reading or the ceiling below means nothing. The local
+    // bridge is not counted: it is a loopback call to a process already running on this
+    // machine, costs nobody anything, and is exactly what should be preferred.
+    let mut snap = UsageSnapshot {
+        request_log: prev.request_log.clone(),
+        ..Default::default()
+    };
     // 1. Local bridge (the cached endpoint first; the port changes on every launch, so a miss is normal)
     let mut bridge_err = String::new();
     let mut tried = false;
@@ -608,18 +615,33 @@ fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
         snap.note = "Antigravity is closed — last reading kept".into();
         return snap;
     }
-    // 3. Credential path
+    // 3. Credential path — the only step here that leaves the machine, so the only one the
+    // hourly ceiling applies to. Reached only when the local bridge could not answer, which
+    // is the case worth spending a request on.
     let mut tier: Option<String> = None;
-    match read_credentials() {
-        Some(c) if !c.expired => match load_tier(&c.access_token) {
+    if crate::usage::budget_check(&mut snap.request_log, now_ms()).is_err() {
+        // Fall through to the transcript count below rather than returning: a local number,
+        // honestly labelled, beats no number at all while the budget recovers.
+        crate::applog("antigravity: hourly request ceiling reached, using the local count");
+    } else {
+        match read_credentials() {
+        Some(c) if !c.expired => {
+            snap.request_log.push(now_ms());
+            match load_tier(&c.access_token) {
             Ok(t) => {
                 tier = Some(t);
-                if let Some(w) = direct_quota(&c.access_token) {
-                    snap.status = "ok".into();
-                    snap.windows = w;
-                    snap.fetched_at = now_ms();
-                    snap.note = format!("{} · via Google", tier.clone().unwrap_or_default());
-                    return snap;
+                // The tier lookup and the quota call are two separate requests to Cloud
+                // Code, so the second is checked and recorded in its own right. Counting the
+                // pair as one entry let this path spend twice what the ceiling allowed.
+                if crate::usage::budget_check(&mut snap.request_log, now_ms()).is_ok() {
+                    snap.request_log.push(now_ms());
+                    if let Some(w) = direct_quota(&c.access_token) {
+                        snap.status = "ok".into();
+                        snap.windows = w;
+                        snap.fetched_at = now_ms();
+                        snap.note = format!("{} · via Google", tier.clone().unwrap_or_default());
+                        return snap;
+                    }
                 }
             }
             Err(e) if e == "needsAuth" => {
@@ -628,12 +650,14 @@ fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
                 return snap;
             }
             Err(e) => crate::applog(&format!("antigravity: loadCodeAssist {e}")),
-        },
+            }
+        }
         Some(c) => {
             // Expired ≠ signed out: Antigravity refreshes it on its next run; auth_method stands in for the tier
             tier = Some(if c.auth_method == "consumer" { "Personal".into() } else { c.auth_method.clone() });
         }
         None => {}
+        }
     }
     // 4. Count fallback (derived: the card gets a ~ prefix and the ring draws only its track)
     let (n, latest) = requests_today();
