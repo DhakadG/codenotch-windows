@@ -151,6 +151,35 @@ fn merge_install(root: &mut Value, hook_exe: &str) {
 /// entries went. The inverse of [`merge_install`]: an event array that we emptied is
 /// removed entirely, so a settings file we had added `Stop` to does not keep a `"Stop": []`
 /// afterwards. Events the user configured themselves keep their remaining entries.
+/// Removes our commands from one entry, leaving anyone else's, and reports how many went.
+///
+/// An entry's `hooks` array can hold several commands, and nothing stops a user putting one
+/// of theirs beside one of ours - Claude Code's own documentation shows multiple commands per
+/// entry. Judging the entry as a whole and deleting it therefore deletes their command too,
+/// silently, in a file they own. Removal has to happen one command at a time.
+fn strip_ours(entry: &mut Value) -> usize {
+    let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+        return 0;
+    };
+    let before = hooks.len();
+    hooks.retain(|h| {
+        !h["command"]
+            .as_str()
+            .map(|c| HOOK_COMMAND_MARKERS.iter().any(|m| c.contains(m)))
+            .unwrap_or(false)
+    });
+    before - hooks.len()
+}
+
+/// True when an entry has no commands left and is therefore only an empty shell.
+fn is_empty_entry(entry: &Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(false)
+}
+
 fn merge_uninstall(root: &mut Value) -> usize {
     // get_mut, not `root["hooks"]`: indexing a Value mutably *inserts* a null for a missing
     // key, so uninstalling from a settings file that has no hooks section would write a
@@ -162,14 +191,32 @@ fn merge_uninstall(root: &mut Value) -> usize {
     let mut removed = 0;
     let mut emptied: Vec<String> = Vec::new();
     for (event, v) in hooks.iter_mut() {
-        if let Some(arr) = v.as_array() {
-            let filtered: Vec<Value> = arr.iter().filter(|e| !is_ours(e)).cloned().collect();
-            let dropped = arr.len() - filtered.len();
-            removed += dropped;
-            if filtered.is_empty() && dropped > 0 {
+        if let Some(arr) = v.as_array_mut() {
+            let mut dropped_commands = 0;
+            // Strip our commands from inside each entry rather than judging the entry as a
+            // whole. An entry may legitimately hold one of ours beside one of the user's, and
+            // deleting the entry would take theirs with it - silent data loss in a file this
+            // application does not own.
+            //
+            // `touched` records which entries we actually took something from, because only
+            // those may be removed when they end up empty. An entry that arrived empty was
+            // the user's to keep, odd as it is, and tidying it away would be this code editing
+            // a file it does not own for cosmetic reasons.
+            let mut touched = Vec::with_capacity(arr.len());
+            for entry in arr.iter_mut() {
+                let n = strip_ours(entry);
+                dropped_commands += n;
+                touched.push(n > 0);
+            }
+            let mut i = 0;
+            arr.retain(|e| {
+                let keep = !(touched[i] && is_empty_entry(e));
+                i += 1;
+                keep
+            });
+            removed += dropped_commands;
+            if arr.is_empty() && dropped_commands > 0 {
                 emptied.push(event.clone());
-            } else {
-                *v = json!(filtered);
             }
         }
     }
