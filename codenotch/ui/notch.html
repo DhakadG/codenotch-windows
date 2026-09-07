@@ -91,13 +91,21 @@
   .arc-exit.arc-pulse{animation:arc-out 220ms ease-in both, pulse 1.1s ease-in-out infinite}
   .arc-enter.arc-spin{animation:arc-in 220ms ease-out both, spin 1.2s linear infinite}
   .arc-enter.arc-pulse{animation:arc-in 220ms ease-out both, pulse 1.1s ease-in-out infinite}
+  /* Someone who has asked the system to stop animating things means it.
+     One block, and `animation:none` rather than a short duration. Shortening the duration
+     looks like the careful choice and is the opposite: these elements carry two animations,
+     the cross-fade and the state's own infinite spin or pulse, and animation-duration applies
+     to both - so setting it to 1ms left the spinner turning a thousand times a second at
+     exactly the person who asked for less movement. The state is still legible without
+     motion: green is present, amber is present and dimmed.
+     The exiting overlay is hidden outright, since with no animation there is no animationend
+     to remove it and it would otherwise sit on top of the incoming one until the fallback
+     timer fired. */
   @media (prefers-reduced-motion:reduce){
-    .arc-enter,.arc-exit{animation-duration:1ms}
-  }
-  /* Someone who has asked the system to stop animating things means it. */
-  @media (prefers-reduced-motion:reduce){
-    .arc-spin{animation-duration:3s}
-    .arc-pulse{animation:none;opacity:.6}
+    .arc-spin,.arc-enter.arc-spin,.arc-exit.arc-spin{animation:none}
+    .arc-pulse,.arc-enter.arc-pulse,.arc-exit.arc-pulse{animation:none;opacity:.6}
+    .arc-enter{animation:none}
+    .arc-exit{animation:none;opacity:0}
   }
 
   /* Right-click menu. Replaces the WebView's own Back/Reload/Save-as menu, which offers
