@@ -56,6 +56,17 @@ pub struct Config {
     /// The inner arc: turning while a session works, amber while one waits on you.
     #[serde(default = "yes")]
     pub show_activity_arc: bool,
+    /// Lift the pill off the screen edge instead of welding it there.
+    ///
+    /// Upstream is welded on purpose - the fillets that join the pill to the bezel are the
+    /// whole shape, and `NotchEdge` exists to choose *which* edge rather than whether there is
+    /// one. So this is not parity work; it is an option, off by default, for people who want an
+    /// overlay that reads as floating over the desktop rather than growing out of it.
+    ///
+    /// The window does not move. Only the pill inside it does, which leaves placement, dragging
+    /// and the interactive rectangles working exactly as before.
+    #[serde(default)]
+    pub float_pill: bool,
 }
 
 fn yes() -> bool {
@@ -93,6 +104,7 @@ impl Default for Config {
             show_countdown: true,
             show_pace_tick: true,
             show_activity_arc: true,
+            float_pill: false,
         }
     }
 }

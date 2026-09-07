@@ -105,6 +105,14 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .items(&show_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<Wry>).collect::<Vec<_>>())
         .build()?;
 
+    let float_pill = CheckMenuItemBuilder::with_id("float-pill", tr(lang, "float_pill"))
+        .checked({
+            let st = app.state::<crate::AppState>();
+            let c = st.cfg.lock().unwrap();
+            c.float_pill
+        })
+        .build(app)?;
+
     let refresh = MenuItemBuilder::with_id("refresh", tr(lang, "refresh")).build(app)?;
     let refresh_creds =
         MenuItemBuilder::with_id("refresh-creds", tr(lang, "refresh_creds")).build(app)?;
@@ -128,6 +136,7 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .item(&provider_menu)
         .item(&ring_menu)
         .item(&show_menu)
+        .item(&float_pill)
         .item(&lang_menu)
         .item(&refresh)
         .item(&refresh_creds)
@@ -182,6 +191,16 @@ fn handle(app: &AppHandle, id: &str) {
                 } else {
                     c.hidden_providers.push(provider);
                 }
+                crate::config::save(&c);
+            }
+            crate::broadcast_prefs(app);
+            refresh_menu(app);
+        }
+        "float-pill" => {
+            {
+                let st = app.state::<crate::AppState>();
+                let mut c = st.cfg.lock().unwrap();
+                c.float_pill = !c.float_pill;
                 crate::config::save(&c);
             }
             crate::broadcast_prefs(app);
