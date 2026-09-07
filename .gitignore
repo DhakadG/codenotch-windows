@@ -11,3 +11,6 @@ codenotch/gen/
 upstream-proposal.md
 发布指引.md
 _to_delete/
+
+# Built installers, filed by build identity (scripts/build.ps1)
+dist/
