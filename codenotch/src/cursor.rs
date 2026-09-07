@@ -114,33 +114,68 @@ struct Creds {
     plan: Option<String>,
 }
 
+/// The `sub` claim of the stored access token, which is the account id the session cookie
+/// needs — `google-oauth2|…`, `auth0|…`, and so on.
+///
+/// Nothing is verified here; the token is the editor's and the server checks it. This only
+/// reads a field the editor already put on disk.
+fn jwt_sub(token: &str) -> Option<String> {
+    let part = token.split('.').nth(1)?;
+    let raw = crate::antigravity::b64_decode(part)?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let sub = v.get("sub")?.as_str()?;
+    if sub.is_empty() {
+        return None;
+    }
+    Some(sub.to_string())
+}
+
 /// Re-read every time: the editor rotates the token, and holding on to an old value signs us out
 fn read_credentials() -> Option<Creds> {
     let path = store_url()?;
     let conn = open_ro(&path)?;
     let token = item(&conn, "cursorAuth/accessToken")?;
-    let auth_id = item(&conn, "cursorAuth/stripeMembershipAuthId")?;
+    // `stripeMembershipAuthId` is not written for every account — a free account has no
+    // Stripe membership and so never gets the key. Requiring it took the whole Cursor cell
+    // dark for those users. The id it holds is the token's own `sub` claim, so read that
+    // when the key is absent rather than giving up.
+    let auth_id = item(&conn, "cursorAuth/stripeMembershipAuthId").or_else(|| jwt_sub(&token))?;
     let plan = item(&conn, "cursorAuth/stripeMembershipType");
     Some(Creds { cookie: format!("WorkosCursorSessionToken={auth_id}::{token}"), plan })
 }
 
-/// For doctor: contains no secret values
+/// For doctor: contains no secret values.
+///
+/// Each failure gets its own message. "not signed in, or SQLite failed to open" told the
+/// reader two different fixes and left them to guess which applied.
 pub fn probe() -> String {
     let Some(p) = store_url() else { return "Cursor: cannot locate %APPDATA%".into() };
     if !p.is_file() {
-        return format!("Cursor: {} not found (not installed, or not signed in)", p.display());
+        return format!("Cursor: {} not found (not installed, or never signed in)", p.display());
     }
-    match read_credentials() {
-        Some(c) => format!(
-            "Cursor: session borrowed (cookie {} chars, plan={})",
-            c.cookie.len(),
-            c.plan.unwrap_or_else(|| "?".into())
-        ),
-        None => format!("Cursor: {} exists but cursorAuth/* could not be read (editor not signed in, or SQLite failed to open)", p.display()),
+    let Some(conn) = open_ro(&p) else {
+        return format!("Cursor: {} exists but SQLite could not open it (is the editor mid-write?)", p.display());
+    };
+    let Some(token) = item(&conn, "cursorAuth/accessToken") else {
+        return format!("Cursor: {} opened, but cursorAuth/accessToken is absent — sign in to the editor", p.display());
+    };
+    let stripe_id = item(&conn, "cursorAuth/stripeMembershipAuthId");
+    let source = if stripe_id.is_some() { "stripeMembershipAuthId" } else { "the token's sub claim" };
+    if stripe_id.is_none() && jwt_sub(&token).is_none() {
+        return format!(
+            "Cursor: signed in (token {} chars) but no account id — stripeMembershipAuthId is absent and the token carries no readable sub claim",
+            token.len()
+        );
     }
+    let plan = item(&conn, "cursorAuth/stripeMembershipType").unwrap_or_else(|| "?".into());
+    format!("Cursor: session borrowed (token {} chars, account id from {source}, plan={plan})", token.len())
 }
 
 // ---------------- Parsing ----------------
+
+#[cfg(test)]
+#[path = "cursor_tests.rs"]
+mod tests;
 
 fn pct(v: Option<&serde_json::Value>) -> Option<f64> {
     v.and_then(|x| x.as_f64()).map(|p| (p / 100.0).clamp(0.0, 1.0))
