@@ -461,7 +461,7 @@ function esc(s){const d=document.createElement('div');d.textContent=s||'';return
 /* Hover: stays expanded while either the pill or the card is under the cursor; collapses after a 250 ms grace period (upstream motion rule) */
 const card=document.getElementById('card'), pill=document.getElementById('pill');
 let hideTimer=null;
-function showCard(){clearTimeout(hideTimer);card.classList.add("show");renderCard();armWatchdog();syncInteractive();} // show first, then render: placeCard needs offsetHeight
+function showCard(){clearTimeout(hideTimer);card.classList.add("show");renderCard();syncInteractive();} // show first, then render: placeCard needs offsetHeight
 function hideCard(){card.classList.remove("show");invoke("set_expanded",{on:false,rects:null}).catch(()=>{});syncInteractive();}
 function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(hideCard,250);}
 // ===== Diagnostics + geometry =====
@@ -471,14 +471,6 @@ function callq(cmd,args){ // invoke with visible failure: any command error is r
 }
 // Hot rectangles are reported in physical pixels (multiplied by this page's real DPR), so the Rust side does no conversion — WebView2's DPR and the window scale can disagree
 function rectOf(el){const r=el.getBoundingClientRect(),k=window.devicePixelRatio||1;return [r.left*k,r.top*k,r.width*k,r.height*k];}
-function armWatchdog(){
-  requestAnimationFrame(()=>{ // wait one frame so renderCard's new content is laid out before measuring
-    if(!card.classList.contains('show'))return;
-    // The menu joins the hot set while it is open: without it, moving the cursor from the card
-    // onto the menu counts as leaving, and pointer_left closes the very menu being aimed at.
-    callq('set_expanded',{on:true,rects:hotRects()}).catch(()=>{});
-  });
-}
 /* Everything currently on screen, for both the collapse watchdog and click-through.
    The pill is always there; the rest join while they are shown. */
 function hotRects(){
@@ -489,17 +481,27 @@ function hotRects(){
   }
   return out;
 }
-/* Click-through: the window is 340 px wide but the pill uses 70 of them, so without this the
-   transparent remainder swallows every click meant for what is underneath. Reported after a
-   frame so freshly shown elements are laid out, and again on a slow timer as a backstop — a
-   missed call here means a dead pill, which is worse than one redundant invoke per second. */
+/* One measurement, both consumers.
+   Click-through needs it because the window is 340 px wide while the pill uses 70 of them, so
+   the transparent remainder would otherwise swallow every click meant for what is underneath.
+   The collapse watchdog needs the same rectangles, and giving each its own update path is what
+   let them disagree: the menu could open, join the click-through set, and still be absent from
+   the watchdog's — which then read the cursor moving onto the menu as leaving and closed the
+   very menu being aimed at.
+   Measured after a frame so freshly shown elements are laid out, and repeated on a slow timer
+   as a backstop: a missed call here means a dead pill, which is worse than one spare invoke a
+   second. */
 let interactiveSyncQueued=false;
 function syncInteractive(){
   if(interactiveSyncQueued)return;
   interactiveSyncQueued=true;
   requestAnimationFrame(()=>{
     interactiveSyncQueued=false;
-    invoke('set_interactive_rects',{rects:hotRects()}).catch(()=>{});
+    const rects=hotRects();
+    invoke('set_interactive_rects',{rects}).catch(()=>{});
+    // Only while the card is up: `set_expanded(false)` is hideCard's to send, and arming the
+    // watchdog against a collapsed pill would have it emit pointer_left at nothing.
+    if(card.classList.contains('show')) callq('set_expanded',{on:true,rects}).catch(()=>{});
   });
 }
 setInterval(syncInteractive,1000);
@@ -516,7 +518,7 @@ function reportDpr(){
   callq('report_dpr',{dpr:window.devicePixelRatio||1,w:innerWidth,h:innerHeight}).catch(()=>{});
 }
 reportDpr();
-window.addEventListener('resize',()=>{clearTimeout(window._dprT);window._dprT=setTimeout(()=>{reportDpr();if(card.classList.contains('show'))armWatchdog();},120);});
+window.addEventListener('resize',()=>{clearTimeout(window._dprT);window._dprT=setTimeout(()=>{reportDpr();syncInteractive();},120);});
 matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`).addEventListener('change',reportDpr);
 
 /* Collapse test: no trust in element-level mouseenter/mouseleave/e.target at all —
@@ -543,7 +545,7 @@ document.addEventListener('mousemove',e=>{
   if(hot){
     clearTimeout(hideTimer);
     const id=cellAt(e.clientX,e.clientY);
-    if(id&&id!==hoverId){ hoverId=id; if(card.classList.contains('show')){ renderCard(); armWatchdog(); } }
+    if(id&&id!==hoverId){ hoverId=id; if(card.classList.contains('show')){ renderCard(); syncInteractive(); } }
     if(!card.classList.contains('show')) showCard();
   }
   else if(card.classList.contains('show')){ if(hideLogged++<5) jslog(`mousemove left the hot area -> collapse at ${e.clientX},${e.clientY}`); scheduleHide(); }
@@ -553,8 +555,8 @@ document.addEventListener('mouseout',e=>{ // relatedTarget null = the cursor lef
 });
 listen('pointer_left',()=>{clearTimeout(hideTimer);hideCard();}).catch(()=>{});
 // Card content changes change its height -> report the hot rectangles again
-listen('usage',()=>{if(card.classList.contains('show'))armWatchdog();}).catch(()=>{});
-listen('state',()=>{if(card.classList.contains('show'))armWatchdog();}).catch(()=>{});
+listen('usage',()=>{syncInteractive();}).catch(()=>{});
+listen('state',()=>{syncInteractive();}).catch(()=>{});
 /* The pill can be dragged up and down the right edge. Press and move more than 4 px = drag (handed to Rust,
    which follows the system cursor; the card is collapsed first); release without moving = click (opens the provider's usage page). */
 let press=null, dragging=false;

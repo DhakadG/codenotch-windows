@@ -539,13 +539,15 @@ fn update_click_through(app: &AppHandle) {
     if DRAGGING.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }
-    let rects = INTERACTIVE_RECTS.lock().unwrap().clone();
-    if rects.is_empty() {
-        return; // Page has not reported yet; leave the window fully clickable.
-    }
     let Some(w) = app.get_webview_window("notch") else { return };
     let (Ok(pos), Ok(cur)) = (w.outer_position(), app.cursor_position()) else { return };
-    let want_ignore = !point_in_rects(cur.x - pos.x as f64, cur.y - pos.y as f64, &rects, 6.0);
+    let rects = INTERACTIVE_RECTS.lock().unwrap().clone();
+    // No rectangles means the whole window stays clickable, and it has to be handled here
+    // rather than by returning early: an empty list arriving *after* click-through was turned
+    // on would otherwise leave the window transparent to the mouse with nothing able to turn
+    // it back, which is the one outcome this guard exists to prevent.
+    let want_ignore =
+        !rects.is_empty() && !point_in_rects(cur.x - pos.x as f64, cur.y - pos.y as f64, &rects, 6.0);
     static IGNORING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if IGNORING.swap(want_ignore, std::sync::atomic::Ordering::SeqCst) != want_ignore {
         let _ = w.set_ignore_cursor_events(want_ignore);
