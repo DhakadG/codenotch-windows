@@ -111,6 +111,9 @@ fn item(conn: &rusqlite::Connection, key: &str) -> Option<String> {
 
 struct Creds {
     cookie: String,
+    /// The raw access token, kept so its own `exp` claim can be checked before a request is
+    /// spent on it. Never logged or persisted.
+    token: String,
     plan: Option<String>,
 }
 
@@ -120,14 +123,33 @@ struct Creds {
 /// Nothing is verified here; the token is the editor's and the server checks it. This only
 /// reads a field the editor already put on disk.
 fn jwt_sub(token: &str) -> Option<String> {
-    let part = token.split('.').nth(1)?;
-    let raw = crate::antigravity::b64_decode(part)?;
-    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-    let sub = v.get("sub")?.as_str()?;
+    let sub = jwt_claims(token)?.get("sub")?.as_str()?.to_string();
     if sub.is_empty() {
         return None;
     }
-    Some(sub.to_string())
+    Some(sub)
+}
+
+/// The second JWT segment, decoded. Nothing is verified; the token is the editor's and the
+/// server checks it. This only reads fields the editor already wrote to disk.
+fn jwt_claims(token: &str) -> Option<serde_json::Value> {
+    let part = token.split('.').nth(1)?;
+    let raw = crate::antigravity::b64_decode(part)?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// True when the stored token's own `exp` claim is in the past.
+///
+/// Cursor's access token is short-lived and the editor refreshes it. With the editor closed
+/// the stored copy simply ages out, and sending it earns a rejection that is indistinguishable
+/// from a real sign-out - which is what "Cursor session was rejected, sign in again" used to
+/// tell people who were perfectly well signed in. Reading `exp` first costs nothing, spends no
+/// request, and lets the note name the actual remedy: open the editor.
+fn token_expired(token: &str) -> bool {
+    jwt_claims(token)
+        .and_then(|v| v.get("exp").and_then(|x| x.as_f64()))
+        .map(|exp| (exp * 1000.0) as u64 <= now_ms())
+        .unwrap_or(false)
 }
 
 /// Re-read every time: the editor rotates the token, and holding on to an old value signs us out
@@ -141,7 +163,11 @@ fn read_credentials() -> Option<Creds> {
     // when the key is absent rather than giving up.
     let auth_id = item(&conn, "cursorAuth/stripeMembershipAuthId").or_else(|| jwt_sub(&token))?;
     let plan = item(&conn, "cursorAuth/stripeMembershipType");
-    Some(Creds { cookie: format!("WorkosCursorSessionToken={auth_id}::{token}"), plan })
+    Some(Creds {
+        cookie: format!("WorkosCursorSessionToken={auth_id}::{token}"),
+        token,
+        plan,
+    })
 }
 
 /// For doctor: contains no secret values.
@@ -266,6 +292,13 @@ fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
         snap.note = "Sign in to Cursor (the editor) to see usage.".into();
         return snap;
     };
+    // Do not spend a request on a token that has already expired on its own clock. Keep the
+    // last reading rather than blanking it: an aged-out token says nothing about the account.
+    if token_expired(&creds.token) {
+        snap.status = if snap.windows.is_empty() { "needsAuth".into() } else { "stale".into() };
+        snap.note = "Cursor's stored session has expired. Open the Cursor editor to refresh it — Codenotch borrows its session and cannot sign in.".into();
+        return snap;
+    }
     match fetch_once(&creds.cookie) {
         Ok(v) => {
             let (windows, note) = parse_summary(&v);

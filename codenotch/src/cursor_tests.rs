@@ -56,6 +56,22 @@ fn a_token_with_no_usable_sub_claim_yields_no_id() {
 }
 
 #[test]
+fn an_expired_token_is_recognised_from_its_own_exp_claim() {
+    // Cursor's token is short-lived and refreshed by the editor. With the editor closed the
+    // stored copy ages out, and sending it earns a rejection indistinguishable from a real
+    // sign-out - which is how a signed-in user was told to sign in again.
+    let past = jwt_with(&json!({ "sub": "google-oauth2|1", "exp": 1_000_000_000 }));
+    let future = jwt_with(&json!({ "sub": "google-oauth2|1", "exp": 4_102_444_800i64 }));
+    assert!(token_expired(&past));
+    assert!(!token_expired(&future));
+    // No exp claim, or nothing parseable: assume usable and let the server decide, rather
+    // than refusing to read usage because of a field that may simply not be there.
+    assert!(!token_expired(&jwt_with(&json!({ "sub": "x" }))));
+    assert!(!token_expired("not-a-jwt"));
+    assert!(!token_expired(""));
+}
+
+#[test]
 fn pct_scales_and_clamps() {
     assert_eq!(pct(Some(&json!(0.0))), Some(0.0));
     assert_eq!(pct(Some(&json!(50))), Some(0.5));
