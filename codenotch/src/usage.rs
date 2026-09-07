@@ -27,6 +27,14 @@ const BACKOFF_CAP_SECS: u64 = 900;
 /// frequent enough that an expiry is picked up promptly and rare enough that a machine left
 /// signed out does not spawn a process every minute forever.
 const NUDGE_EVERY_MS: u64 = 10 * 60 * 1000;
+/// Minimum age of the last good reading before the endpoint is asked again.
+///
+/// `/api/oauth/usage` is rate-limited per token, and a persisted reading is the same answer
+/// it would give. Without this floor every launch fetched immediately, so restarting the app
+/// - which the hook does whenever it is not running - became a tight loop against a limiter
+/// that answers with an hour of 429. Five minutes is what other readers of this endpoint
+/// settled on independently, and a usage percentage does not move meaningfully faster.
+const MIN_REFETCH_SECS: u64 = 300;
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -35,14 +43,21 @@ pub fn request_refresh() {
     REFRESH.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Sleep in slices so request_refresh can interrupt it
-fn sleep_interruptible(total_secs: u64) {
+/// Sleep in slices so request_refresh can interrupt it.
+///
+/// Returns true when it was cut short by a refresh request. The caller needs to know,
+/// because the request is consumed here: without the return value an explicit "refresh now"
+/// that arrived during a wait would be swallowed, and the minimum-refetch floor would then
+/// decline to fetch on the very tick the user asked for one.
+#[must_use]
+fn sleep_interruptible(total_secs: u64) -> bool {
     for _ in 0..total_secs {
         if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            return;
+            return true;
         }
         std::thread::sleep(Duration::from_secs(1));
     }
+    false
 }
 
 fn now_ms() -> u64 {
@@ -402,6 +417,9 @@ pub fn start(app: AppHandle) {
         let mut backoff_token: Option<String> = None;
         // When the expired-credential nudge last ran, so it stays occasional.
         let mut last_nudge: Option<u64> = None;
+        // Set when an explicit refresh request was consumed by a wait, so the next pass
+        // fetches even though the cached reading is still young.
+        let mut forced = false;
         loop {
             // A backoff is tied to one credential. Claude Code rewriting .credentials.json
             // means the next request is a different request, and sitting out the remainder
@@ -454,20 +472,30 @@ pub fn start(app: AppHandle) {
                 });
                 backoff_token = None;
                 consecutive_429 = 0;
-                sleep_interruptible(POLL_ACTIVE_SECS);
+                forced = sleep_interruptible(POLL_ACTIVE_SECS);
                 continue;
             }
             // No requests inside the backoff window
-            let bu = {
+            let (bu, fetched_at) = {
                 let st = app.state::<AppState>();
                 let u = st.usage.lock().unwrap();
-                u.backoff_until
+                (u.backoff_until, u.fetched_at)
             };
             let now = now_ms();
             if bu > now {
-                sleep_interruptible(((bu - now) / 1000).clamp(1, 30));
+                forced = sleep_interruptible(((bu - now) / 1000).clamp(1, 30));
                 continue;
             }
+            // A reading restored from disk is still a reading. Honour its age rather than
+            // re-fetching the moment the process starts, or every relaunch spends a request
+            // on a number that has not changed.
+            let age_secs = now.saturating_sub(fetched_at) / 1000;
+            if fetched_at > 0 && age_secs < MIN_REFETCH_SECS && !forced {
+                forced = sleep_interruptible((MIN_REFETCH_SECS - age_secs).clamp(1, 30));
+                continue;
+            }
+            // No reset needed here: every path out of this iteration ends in a wait, and
+            // each of those reassigns `forced` from whether it was interrupted.
             match read_credentials() {
                 None => set_and_broadcast(&app, |u| {
                     u.status = "needsAuth".into();
@@ -543,7 +571,7 @@ pub fn start(app: AppHandle) {
                 let s = store.snapshot("en", "en", false);
                 !s.sessions.is_empty()
             };
-            sleep_interruptible(if active {
+            forced = sleep_interruptible(if active {
                 POLL_ACTIVE_SECS
             } else {
                 POLL_IDLE_SECS

@@ -1,5 +1,33 @@
 # Roadmap
 
+## Open question: does `claude auth status` refresh an expired token?
+
+The credential nudge assumes it might, and records what actually happened either way. The
+answer is in `run.log` the first time a token expires with the app running - look for
+`claude credential nudge:`. If it reports "did not refresh the expired credential", the
+heavier option is to start a real Claude Code session and kill it after a few seconds, which
+does refresh but writes a transcript. That transcript would appear in this app as a phantom
+working session, so taking that route means teaching `watcher.rs` to ignore the directory the
+refresh session runs in. Not worth building until the log says it is needed.
+
+## Upstream has moved on
+
+The macOS app has gained providers this port does not have: GLM, Grok, OpenCode and
+Perplexity, plus a `WebSessionProvider` for session-backed reads and a profile system
+(`ClaudeProfile`) for people signed into more than one Claude account. Worth tracking before
+claiming feature parity.
+
+Two smaller things it does that this port does not:
+
+- **`CredentialCache`** holds the token until it expires, so the credential is read about
+  once an hour rather than twice a minute. This port re-reads `.credentials.json` on every
+  poll. Harmless on Windows, where the read is a file rather than a keychain prompt, but it
+  is free to fix.
+- **Keychain item selection.** macOS has to pick the newest of several items because Claude
+  Code files a new one per rotation. Windows has no equivalent problem - one file - so there
+  is nothing to port, only a trap not to reinvent.
+
+
 Work that is deliberately **not** in the first shipped release, with the reason it can wait.
 Each entry is a shape of a change rather than a plan; none of it blocks a signed installer.
 

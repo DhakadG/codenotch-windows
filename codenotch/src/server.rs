@@ -22,6 +22,17 @@ pub fn start(app: AppHandle, port: u16) {
                 .as_reader()
                 .take(256 * 1024)
                 .read_to_string(&mut body);
+            // Answer first, work afterwards.
+            //
+            // tiny_http serves this loop on one thread, and the sender is codenotch-hook,
+            // which Claude Code runs before and after every tool call. Applying the event
+            // and repainting the notch before replying put all of that on Claude Code's
+            // critical path: a slow broadcast, a locked mutex or a busy WebView became
+            // seconds of latency in someone else's editor, and further hook connections
+            // queued behind it. The reply carries no information - it is the literal string
+            // "ok" - so there is nothing to be gained by making the caller wait for it.
+            let _ = req.respond(tiny_http::Response::from_string("ok"));
+
             if url.starts_with("/event") {
                 let ev = parse(&url, &body);
                 let state = app.state::<AppState>();
@@ -33,7 +44,6 @@ pub fn start(app: AppHandle, port: u16) {
                     crate::broadcast(&app);
                 }
             }
-            let _ = req.respond(tiny_http::Response::from_string("ok"));
         }
     });
 }

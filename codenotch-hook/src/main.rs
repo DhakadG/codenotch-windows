@@ -73,9 +73,12 @@ fn read_port() -> u16 {
 
 fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(300))?;
-    s.set_write_timeout(Some(Duration::from_millis(700)))?;
-    s.set_read_timeout(Some(Duration::from_millis(700)))?;
+    // Every timeout here is a bound on how long Claude Code can be delayed by this
+    // program, which runs before and after each of its tool calls. They are deliberately
+    // tight: a notch that misses one event is invisible, a tool call that waits a second is
+    // not. Worst case for a hook is now roughly 300 ms rather than 1.7 s.
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(150))?;
+    s.set_write_timeout(Some(Duration::from_millis(150)))?;
     let req = format!(
         "POST /event?e={}&ppid={} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         event,
@@ -84,8 +87,14 @@ fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
         body
     );
     s.write_all(req.as_bytes())?;
-    let mut buf = [0u8; 64];
-    let _ = s.read(&mut buf); // wait for a response fragment to confirm delivery; failure does not matter
+    // No read. The reply was only ever a delivery confirmation that nothing acted on - the
+    // old comment said as much, "failure does not matter" - and waiting for it coupled
+    // Claude Code's latency to whatever the application happened to be doing. A successful
+    // connect and write already prove the app is listening and has the bytes.
+    //
+    // The write half is shut down explicitly so the server sees a clean end of request
+    // rather than a reset when this process exits a moment later.
+    let _ = s.shutdown(std::net::Shutdown::Write);
     Ok(())
 }
 
