@@ -114,6 +114,13 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .build()
 }
 
+/// Rebuild the tray menu from the current config. Public so a change made elsewhere - the
+/// pill's own right-click menu, for instance - leaves the tray showing what is actually set.
+pub fn rebuild(app: &AppHandle) -> tauri::Result<()> {
+    refresh_menu(app);
+    Ok(())
+}
+
 fn refresh_menu(app: &AppHandle) {
     let lang = {
         let st = app.state::<crate::AppState>();

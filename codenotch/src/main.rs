@@ -370,6 +370,51 @@ pub fn broadcast_prefs(app: &AppHandle) {
     let _ = app.emit("prefs", &prefs);
 }
 
+/// Re-poll one provider, or every provider when given "all".
+///
+/// This is what a single click on a cell now does. It only asks the existing poll loop to
+/// wake early; the refetch floor and the request ceiling still apply, so leaning on the
+/// mouse cannot turn into a burst of requests.
+#[tauri::command]
+fn refresh_provider(app: AppHandle, provider: String) {
+    let all = provider == "all";
+    if all || provider == "claude" {
+        {
+            let st = app.state::<AppState>();
+            let mut u = st.usage.lock().unwrap();
+            u.backoff_until = 0;
+        }
+        usage::request_refresh();
+    }
+    if all || provider == "codex" {
+        codex::request_refresh();
+    }
+    if all || provider == "cursor" {
+        cursor::request_refresh();
+    }
+    if all || provider == "gemini" {
+        antigravity::request_refresh();
+    }
+}
+
+/// Hide a provider from the pill, from its own right-click menu.
+///
+/// The same setting the tray offers; having it here too means the cell can be dismissed
+/// where it is, rather than by hunting for the tray icon.
+#[tauri::command]
+fn hide_provider(app: AppHandle, provider: String) {
+    {
+        let st = app.state::<AppState>();
+        let mut c = st.cfg.lock().unwrap();
+        if !c.hidden_providers.contains(&provider) {
+            c.hidden_providers.push(provider);
+            config::save(&c);
+        }
+    }
+    broadcast_prefs(&app);
+    let _ = tray::rebuild(&app);
+}
+
 /// A click on a cell opens that provider's usage page
 #[tauri::command]
 fn open_provider_page(provider: String) {
@@ -704,6 +749,8 @@ fn main() {
             get_cursor,
             get_antigravity,
             get_prefs,
+            refresh_provider,
+            hide_provider,
             get_glyphs,
             get_activity,
             open_data_dir,
