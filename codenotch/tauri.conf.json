@@ -4,7 +4,8 @@
   "version": "0.3.0",
   "identifier": "com.immidi.codenotch",
   "build": {
-    "frontendDist": "ui"
+    "frontendDist": "ui",
+    "beforeBundleCommand": "cargo build -p codenotch-hook --release"
   },
   "app": {
     "withGlobalTauri": true,
@@ -31,6 +32,9 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico"],
+    "resources": {
+      "../target/release/codenotch-hook.exe": "codenotch-hook.exe"
+    }
   }
 }

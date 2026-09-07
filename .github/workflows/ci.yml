@@ -8,8 +8,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # A warning that only appears in CI is a warning nobody reads.
-  RUSTFLAGS: -D warnings
+  # RUSTFLAGS is deliberately NOT set here. The environment variable *replaces*
+  # `.cargo/config.toml`'s `rustflags` rather than adding to it, so setting `-D warnings`
+  # this way silently dropped `-C target-feature=+crt-static` and produced a binary that
+  # needed the Visual C++ redistributable after all — while local builds, which read the
+  # config file, were fine. The "assert no VC++ dependency" step below caught it.
+  # Warnings are errors via `cargo clippy -- -D warnings`, which covers rustc's lints too.
 
 jobs:
   check:

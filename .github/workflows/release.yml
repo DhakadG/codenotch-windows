@@ -58,6 +58,41 @@ jobs:
         run: cargo tauri build --config codenotch/tauri.conf.json
         working-directory: codenotch
 
+      # The same assertion CI makes, repeated here because this is the binary that actually
+      # reaches users. It is not redundant: CI once passed a build that imported
+      # VCRUNTIME140 because a RUSTFLAGS environment variable had replaced the static-CRT
+      # setting in .cargo/config.toml. Anything that can happen to a CI build can happen to
+      # a release build, and only one of them gets downloaded.
+      - name: Assert no VC++ redistributable dependency
+        shell: pwsh
+        run: |
+          $dumpbin = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio" `
+            -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue |
+            Where-Object FullName -like '*Hostx64\x64*' | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe not found on the runner' }
+          foreach ($exe in 'target\release\codenotch.exe', 'target\release\codenotch-hook.exe') {
+            $bad = & $dumpbin.FullName /dependents $exe | Select-String -Pattern 'vcruntime140|msvcp140'
+            if ($bad) { throw "Dynamic CRT import in ${exe}: $bad" }
+          }
+          Write-Host 'OK: no vcruntime140/msvcp140 imports'
+
+      # The hook messenger is a second binary, and an installer without it silently loses
+      # the whole working-state feature: the tray's hook install fails with "missing
+      # codenotch-hook.exe". The first installer this project ever produced shipped without
+      # it, so its presence is asserted rather than assumed.
+      - name: Assert the hook messenger is in the installer
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem target\release\bundle\nsis\*-setup.exe | Select-Object -First 1
+          if (-not $setup) { throw 'no NSIS installer was produced' }
+          $listing = & 7z l $setup.FullName
+          foreach ($needed in 'codenotch.exe', 'codenotch-hook.exe') {
+            if (-not ($listing | Select-String -SimpleMatch $needed)) {
+              throw "$needed is missing from $($setup.Name)"
+            }
+          }
+          Write-Host "OK: $($setup.Name) contains both binaries"
+
       # Signing is wired but inert until the certificate secrets exist, so turning it on
       # later is a secrets change rather than a workflow rewrite. scripts/sign.ps1 is a
       # documented no-op when CODESIGN_PROVIDER is unset.
