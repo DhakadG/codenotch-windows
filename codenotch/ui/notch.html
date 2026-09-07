@@ -397,8 +397,10 @@ function resetCopy(ms){
   if(diff<24*60*60*1000) return `Resets at ${t}`;
   // A weekday only identifies a day inside the coming week, which upstream's ResetCopy learned
   // the hard way: Codex's monthly window resets 26 days out, and "Resets Mon 3:55 PM" reads as
-  // *this* Monday - six days away rather than nearly four weeks. Past a week, day and month,
-  // and no time of day, because nobody plans around 3:55 PM in four weeks.
+  // *this* Monday - six days away rather than nearly four weeks. At a week or more out, day
+  // and month, and no time of day: nobody plans around 3:55 PM in four weeks, and exactly
+  // seven days is the worst case rather than a mild one, since the weekday is then the same
+  // word as today's.
   if(diff>=7*24*60*60*1000) return `Resets ${d.toLocaleDateString('en-US',{month:'short',day:'numeric'})}`;
   return `Resets ${d.toLocaleDateString('en-US',{weekday:'short'})} ${t}`;
 }
