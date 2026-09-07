@@ -387,6 +387,12 @@ pub fn start(app: AppHandle) {
             }
         }
         loop {
+            // Switched off in the tray: keep the last reading, spend nothing. Checked here
+            // rather than at start-up so switching it back on resumes without a restart.
+            if crate::config::is_disconnected("cursor") {
+                sleep_interruptible(60);
+                continue;
+            }
             let prev = {
                 let st = app.state::<AppState>();
                 let s = st.cursor.lock().unwrap().clone();
