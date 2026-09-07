@@ -14,6 +14,7 @@ mod codex;
 mod cursor;
 mod antigravity;
 mod glyphs;
+mod activity;
 mod watcher;
 
 use std::sync::Mutex;
@@ -22,7 +23,7 @@ use tauri::{AppHandle, Emitter, Manager};
 /// notch 窗口逻辑尺寸：右列 70pt 胶囊 + 左侧悬停细节卡的空间
 pub const NOTCH_W: f64 = 340.0;
 /// 轮次水印：每轮改动 +1，run.log 与卡片右上角都显示，杜绝"跑的是旧 exe"误判
-pub const BUILD: &str = "r20";
+pub const BUILD: &str = "r22";
 pub const NOTCH_H: f64 = 460.0; // 300 装不下 3 个窗口块+会话列表（卡片上下被裁）
 
 pub struct AppState {
@@ -35,6 +36,8 @@ pub struct AppState {
     pub antigravity: Mutex<usage::UsageSnapshot>,
     /// 提供商图标缓存（启动收集；托盘刷新时重收集）
     pub glyphs: Mutex<std::collections::HashMap<String, glyphs::Glyph>>,
+    /// 非 Claude 提供商的活动态（Cursor 真状态；Codex/Antigravity 按最近写入推断）
+    pub activity: Mutex<Vec<activity::Activity>>,
 }
 
 fn resolved_lang(raw: &str) -> String {
@@ -259,6 +262,11 @@ fn refresh_usage(app: AppHandle) {
 #[tauri::command]
 fn get_antigravity(state: tauri::State<AppState>) -> usage::UsageSnapshot {
     state.antigravity.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_activity(state: tauri::State<AppState>) -> Vec<activity::Activity> {
+    state.activity.lock().unwrap().clone()
 }
 
 #[tauri::command]
@@ -590,6 +598,7 @@ fn main() {
             cursor: Mutex::new(cursor::load_persisted()),
             antigravity: Mutex::new(antigravity::load_persisted()),
             glyphs: Mutex::new(Default::default()),
+            activity: Mutex::new(Vec::new()),
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
@@ -598,6 +607,7 @@ fn main() {
             get_cursor,
             get_antigravity,
             get_glyphs,
+            get_activity,
             open_data_dir,
             drag_begin,
             open_provider_page,
@@ -625,6 +635,7 @@ fn main() {
             codex::start(handle.clone());
             cursor::start(handle.clone());
             antigravity::start(handle.clone());
+            activity::start(handle.clone());
             // 图标收集可能要读几个 exe 的资源，放后台线程，收完再推
             let gh = handle.clone();
             std::thread::spawn(move || reload_glyphs(&gh));

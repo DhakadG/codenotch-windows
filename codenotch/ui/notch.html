@@ -116,6 +116,15 @@ let codexSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let cursorSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let agSnap={status:'absent',windows:[],fetched_at:0,note:''};
 let glyphs={}; // id → {kind:'mark'|'appicon', url}
+let activity=[]; // 非 Claude 提供商的活动态：{provider,state:'busy'|'waiting',name,detail,since}
+// 各提供商的"在干活吗"：Claude 来自四态引擎；其余来自 activity 探测。返回 running | attention | idle
+function workState(id){
+  if(id==='claude') return stateSnap.agg==='running'?'running':stateSnap.agg==='attention'?'attention':'idle';
+  const acts=activity.filter(a=>a.provider===id);
+  if(acts.some(a=>a.state==='waiting')) return 'attention';
+  if(acts.some(a=>a.state==='busy')) return 'running';
+  return 'idle';
+}
 function glyphHtml(p,small){
   const g=glyphs[p.id];
   if(g&&g.kind==='svg'&&g.svg) return `<span class="mark">${g.svg}</span>`;
@@ -172,9 +181,10 @@ function renderRing(){
     const h=headlineOf(p.snap);
     let inner=`<circle cx="28" cy="28" r="22" fill="#2a2a2a"/><circle cx="28" cy="28" r="25" fill="none" stroke="${TRACK}" stroke-width="5"/>`;
     if(h && h.count==null) inner+=svgArc(25,Math.min(h.used,1),tone(h.used),5);
-    if(p.id==='claude'){ // 会话态内圈细弧（仅 Claude：引擎只检测 Claude 会话）
-      if(stateSnap.agg==='running') inner+=`<g class="arc-spin">${svgArc(19,0.28,RUNGREEN,2.5)}</g>`;
-      else if(stateSnap.agg==='attention') inner+=`<g class="arc-pulse"><circle cx="28" cy="28" r="19" fill="none" stroke="${AMBER}" stroke-width="2.5"/></g>`;
+    { // 会话态内圈细弧：转=在干活，琥珀脉冲=在等你（四家同一套动效，来源各异）
+      const ws=workState(p.id);
+      if(ws==='running') inner+=`<g class="arc-spin">${svgArc(19,0.28,RUNGREEN,2.5)}</g>`;
+      else if(ws==='attention') inner+=`<g class="arc-pulse"><circle cx="28" cy="28" r="19" fill="none" stroke="${AMBER}" stroke-width="2.5"/></g>`;
     }
     svg.innerHTML=inner;
     if(p.snap.status==='needsAuth'||p.snap.status==='none') pct.textContent='—';
@@ -241,6 +251,16 @@ function renderCard(){
       }
       html+=`</div>`;
     }
+  }else{ // 其余提供商：探测到的活动行（Cursor 为真状态；Codex/Antigravity 为最近写入推断）
+    const acts=activity.filter(a=>a.provider===p.id);
+    if(acts.length){
+      html+=`<div class="c-sessions">`;
+      for(const a of acts.slice(0,5)){
+        const col=a.state==='waiting'?AMBER:RUNGREEN;
+        html+=`<div class="s-row"><span class="s-dot" style="background:${col}"></span>${esc(a.name)}<span style="color:#808080;margin-left:auto">${esc(a.detail)}</span></div>`;
+      }
+      html+=`</div>`;
+    }
   }
   c.innerHTML=html;
   placeCard();
@@ -265,7 +285,7 @@ function showCard(){clearTimeout(hideTimer);card.classList.add('show');renderCar
 function hideCard(){card.classList.remove('show');invoke('set_expanded',{on:false,rects:null}).catch(()=>{});}
 function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(hideCard,250);}
 // ===== 诊断可视化 + 几何判定 =====
-const BUILD='r20';
+const BUILD='r22';
 function jslog(m){invoke('log_js',{msg:String(m)}).catch(()=>{});}
 function callq(cmd,args){ // 带可视化失败的 invoke：任何命令失败都在屏上报出来（之前 .catch 静默吞掉了）
   return invoke(cmd,args).catch(e=>{notice(cmd+' 失败: '+(e&&e.message||e));throw e;});
@@ -366,6 +386,8 @@ invoke('get_cursor').then(u=>{cursorSnap=u||cursorSnap;renderRing();}).catch(()=
 listen('antigravity',e=>{agSnap=e.payload||agSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_antigravity').then(u=>{agSnap=u||agSnap;renderRing();}).catch(()=>{});
 listen('glyphs',e=>{glyphs=e.payload||glyphs;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+listen('activity',e=>{activity=e.payload||activity;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+invoke('get_activity').then(a=>{activity=a||activity;renderRing();}).catch(()=>{});
 invoke('get_glyphs').then(g=>{glyphs=g||glyphs;renderRing();}).catch(()=>{});
 invoke('get_codex').then(u=>{codexSnap=u||codexSnap;renderRing();}).catch(()=>{});
 invoke('get_usage').then(u=>{usage=u||usage;renderRing();}).catch(e=>notice('get_usage failed: '+e));
