@@ -122,6 +122,7 @@ pub fn is_session_jsonl(p: &Path) -> bool {
 
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
+        crate::activity::lower_thread_priority();
         let (tx, rx) = channel();
         let Ok(mut w) = notify::recommended_watcher(move |res| {
             let _ = tx.send(res);

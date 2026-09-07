@@ -297,7 +297,7 @@ fn decode_credential(raw: &[u8]) -> Option<Creds> {
 }
 
 /// 零依赖 base64（标准表，容忍 URL-safe 与缺省 padding）
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn b64_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let mut buf = 0u32;
     let mut bits = 0u8;

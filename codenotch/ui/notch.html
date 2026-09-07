@@ -291,7 +291,7 @@ function showCard(){clearTimeout(hideTimer);card.classList.add('show');renderCar
 function hideCard(){card.classList.remove('show');invoke('set_expanded',{on:false,rects:null}).catch(()=>{});}
 function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(hideCard,250);}
 // ===== 诊断可视化 + 几何判定 =====
-const BUILD='r28';
+const BUILD='r31';
 function jslog(m){invoke('log_js',{msg:String(m)}).catch(()=>{});}
 function callq(cmd,args){ // 带可视化失败的 invoke：任何命令失败都在屏上报出来（之前 .catch 静默吞掉了）
   return invoke(cmd,args).catch(e=>{notice(cmd+' 失败: '+(e&&e.message||e));throw e;});

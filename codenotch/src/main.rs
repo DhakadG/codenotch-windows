@@ -24,7 +24,7 @@ use tauri::{AppHandle, Emitter, Manager};
 /// notch 窗口逻辑尺寸：右列 70pt 胶囊 + 左侧悬停细节卡的空间
 pub const NOTCH_W: f64 = 340.0;
 /// 轮次水印：每轮改动 +1，run.log 与卡片右上角都显示，杜绝"跑的是旧 exe"误判
-pub const BUILD: &str = "r28";
+pub const BUILD: &str = "r31";
 pub const NOTCH_H: f64 = 460.0; // 300 装不下 3 个窗口块+会话列表（卡片上下被裁）
 
 pub struct AppState {
@@ -643,10 +643,13 @@ fn main() {
             start_pointer_watchdog(handle.clone());
             // 看过即清
             let acker = handle.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                if ack_scan(&acker) {
-                    broadcast(&acker);
+            std::thread::spawn(move || {
+                activity::lower_thread_priority();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    if ack_scan(&acker) {
+                        broadcast(&acker);
+                    }
                 }
             });
             // 陈旧会话清理

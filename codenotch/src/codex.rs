@@ -1,10 +1,13 @@
 //! Codex 用量适配器——按上游 Codenotch 的接口事实独立实现。
 //!
-//! 两条数据路径（上游同款取舍）：
-//!   1. 活读：起一个 `codex app-server`（stdio JSON-RPC），发 initialize / initialized /
-//!      `account/rateLimits/read`，回复 `result.rateLimits.{primary,secondary}` 带
-//!      `usedPercent / windowDurationMins / resetsAt(秒)`，另有 `planType`、`rateLimitReachedType`。
-//!      这是"现在"的数字。答完即结束进程（Windows 上必须连子进程树一起收，否则 node 孤儿常驻）。
+//! 两条数据路径（上游 1.5.0 同款取舍）：
+//!   1. 活读：借 Codex 自己的登录态（`~/.codex/auth.json` → `tokens.access_token` +
+//!      `tokens.account_id`）直接 GET `https://chatgpt.com/backend-api/wham/usage`，回复
+//!      `rate_limit.{primary_window,secondary_window}` 带 `used_percent / limit_window_seconds /
+//!      reset_at(秒) | reset_after_seconds`，顶层另有 `plan_type`。这是"现在"的数字，不起任何
+//!      进程；token 只读、不刷新、不写回，401/403 就报 needsAuth，让 Codex 自己去续。
+//!      （早先走 `codex app-server` JSON-RPC：每 5 分钟拉一棵 node 进程树、还得 taskkill 收尾，
+//!      而且它的回复只带 weekly 一个窗口——换端点后 5h 窗口才回来。）
 //!   2. 兜底：Codex 会把每回合看到的限额快照写进线程 rollout 日志
 //!      `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`，行形如
 //!      `{"timestamp":"…","type":"event_msg","payload":{"type":"token_count","rate_limits":{
@@ -15,21 +18,24 @@
 //!   上游用 state_5.sqlite 的线程索引找最新 rollout；我们直接按目录日期倒序 + mtime 找，
 //!   零 SQLite 依赖（immutable/WAL 的坑整个绕开）。
 //!
-//! 无凭证、无网络：数字来自 Codex 自己的工具，Codex 没装就是 absent（cell 不显示）。
+//! 凭证只借不管：数字来自 Codex 自己的登录态和它自己的端点；既没登录也没会话记录就是 absent（cell 不显示）。
 
 use crate::usage::{LimitWindow, UsageSnapshot};
 use crate::AppState;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
-const POLL_SECS: u64 = 300; // Codex 没有会话态可依据，固定 5min（活读要起进程，不宜更勤）
+const POLL_SECS: u64 = 300; // Codex 没有会话态可依据，固定 5min（上游节奏；托盘刷新可打断）
 const TAIL_BYTES: u64 = 256 * 1024;
 const CURRENT_FOR_MS: u64 = 5 * 60 * 1000;
-const APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
+const ENDPOINT: &str = "https://chatgpt.com/backend-api/wham/usage";
+const BACKOFF_MIN_SECS: u64 = 60; // 429 时至少等这么久，Retry-After 只作下限
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 服务端给的重试截止（ms epoch）：手动刷新、重启都不能绕过它
+static BACKOFF_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn request_refresh() {
     REFRESH.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -58,6 +64,7 @@ pub fn load_persisted() -> UsageSnapshot {
             if !s.windows.is_empty() {
                 s.status = "stale".into();
             }
+            BACKOFF_UNTIL.store(s.backoff_until, std::sync::atomic::Ordering::Relaxed);
             s
         })
         .unwrap_or_default()
@@ -109,96 +116,91 @@ pub fn find_executable() -> Option<PathBuf> {
     cands.into_iter().find(|p| p.is_file())
 }
 
-// ---------------- 活读：app-server ----------------
+// ---------------- 活读：usage 端点 ----------------
 
-fn spawn_app_server(exe: &Path) -> std::io::Result<std::process::Child> {
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("app-server")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW（否则闪黑框）
-    }
-    cmd.spawn()
+fn auth_path() -> Option<PathBuf> {
+    codex_home().map(|h| h.join("auth.json"))
 }
 
-/// Windows 上 .cmd → node → 原生 exe 是三层进程；kill 父进程不会带走子进程，必须 /T 收树。
-fn kill_tree(child: &mut std::process::Child) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .creation_flags(0x0800_0000)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+struct Credential {
+    access_token: String,
+    account_id: String,
+    /// id_token 里的 chatgpt_plan_type（pro / plus / free…），只作标签
+    plan: Option<String>,
+    /// access_token 的 exp 已过：请求照发（服务端说了算），只影响 401 时的提示语
+    expired: bool,
 }
 
-const REQUEST_ID: u64 = 2;
-
-fn handshake() -> String {
-    format!(
-        concat!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"clientInfo\":{{\"name\":\"codenotch\",\"title\":\"Codenotch\",\"version\":\"{}\"}}}}}}\n",
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{{}}}}\n",
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"account/rateLimits/read\",\"params\":null}}\n"
-        ),
-        env!("CARGO_PKG_VERSION"),
-        REQUEST_ID
-    )
+/// JWT 第二段（base64url）→ claims。只取标签和本地过期提示，不做任何校验——那是服务端的事
+fn jwt_claims(token: &str) -> Option<serde_json::Value> {
+    let part = token.split('.').nth(1)?;
+    let raw = crate::antigravity::b64_decode(part)?;
+    serde_json::from_slice(&raw).ok()
 }
 
-/// 一次问答：三条消息一次写出（服务端按序读），按 id 从交错的通知里挑出回复。
-fn live_reply(exe: &Path) -> Result<serde_json::Value, String> {
-    let mut child = spawn_app_server(exe).map_err(|e| format!("启动 app-server 失败: {e}"))?;
-    let mut stdin = child.stdin.take().ok_or("无 stdin")?;
-    let stdout = child.stdout.take().ok_or("无 stdout")?;
-    if let Err(e) = stdin.write_all(handshake().as_bytes()) {
-        kill_tree(&mut child);
-        return Err(format!("写入失败: {e}"));
+/// 只读 Codex 的登录态；缺文件、缺字段都视为"没登录"
+fn load_credential() -> Option<Credential> {
+    let text = std::fs::read_to_string(auth_path()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let tokens = v.get("tokens")?;
+    let access_token = tokens.get("access_token")?.as_str()?.trim().to_string();
+    let account_id = tokens.get("account_id")?.as_str()?.trim().to_string();
+    if access_token.is_empty() || account_id.is_empty() {
+        return None;
     }
-    let _ = stdin.flush();
-    // 读线程 + 超时：服务端不答就收树
-    let (tx, rx) = std::sync::mpsc::channel::<Option<serde_json::Value>>();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        let mut head = String::new();
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            if head.len() < 400 {
-                head.push_str(&line);
-                head.push('\n');
-            }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if v.get("id").and_then(|x| x.as_u64()) == Some(REQUEST_ID) && v.get("result").is_some() {
-                    let _ = tx.send(Some(v));
-                    return;
-                }
-            }
+    let expired = jwt_claims(&access_token)
+        .and_then(|c| c.get("exp").and_then(|x| x.as_f64()))
+        .map(|exp| exp * 1000.0 <= now_ms() as f64)
+        .unwrap_or(false);
+    let plan = tokens
+        .get("id_token")
+        .and_then(|x| x.as_str())
+        .and_then(jwt_claims)
+        .and_then(|c| {
+            c.get("https://api.openai.com/auth")?
+                .get("chatgpt_plan_type")?
+                .as_str()
+                .map(String::from)
+        });
+    Some(Credential { access_token, account_id, plan, expired })
+}
+
+enum LiveErr {
+    NeedsAuth,
+    /// 建议等待秒数（已含 BACKOFF_MIN_SECS 下限）
+    RateLimited(u64),
+    Other(String),
+}
+
+fn fetch_usage(cred: &Credential) -> Result<serde_json::Value, LiveErr> {
+    let resp = ureq::get(ENDPOINT)
+        .set("Authorization", &format!("Bearer {}", cred.access_token))
+        .set("ChatGPT-Account-Id", &cred.account_id)
+        .set("Accept", "application/json")
+        .set("Cache-Control", "no-cache, no-store")
+        .set("User-Agent", concat!("codenotch/", env!("CARGO_PKG_VERSION"), " (Windows)"))
+        .timeout(Duration::from_secs(15))
+        .call();
+    match resp {
+        Ok(r) => r.into_json().map_err(|e| LiveErr::Other(format!("parse: {e}"))),
+        Err(ureq::Error::Status(code @ (401 | 403), r)) => {
+            // 401 是 token 的事；403 也可能是边缘节点拦了 UA——把状态码和响应体开头记下来，别把两者混成一句"请登录"
+            let head: String = r
+                .into_string()
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(160)
+                .collect();
+            crate::applog(&format!("codex: usage 端点 HTTP {code}: {head}"));
+            Err(LiveErr::NeedsAuth)
         }
-        let _ = tx.send(None);
-    });
-    let got = rx.recv_timeout(APP_SERVER_TIMEOUT);
-    drop(stdin); // 关 stdin：规矩的 stdio 服务端见 EOF 自退
-    let deadline = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < deadline {
-        if let Ok(Some(_)) = child.try_wait() {
-            break;
+        Err(ureq::Error::Status(429, r)) => {
+            let ra = r.header("retry-after").and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+            Err(LiveErr::RateLimited(ra.max(BACKOFF_MIN_SECS)))
         }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    kill_tree(&mut child);
-    match got {
-        Ok(Some(v)) => Ok(v),
-        Ok(None) => Err("app-server 未回答 rateLimits".into()),
-        Err(_) => Err("app-server 超时".into()),
+        Err(ureq::Error::Status(code, _)) => Err(LiveErr::Other(format!("HTTP {code}"))),
+        Err(e) => Err(LiveErr::Other(format!("{e}"))),
     }
 }
 
@@ -233,37 +235,27 @@ fn num(v: Option<&serde_json::Value>) -> Option<f64> {
     v.and_then(|x| x.as_f64())
 }
 
-/// 活读回复 → 窗口（camelCase：usedPercent / windowDurationMins / resetsAt 秒）
-fn windows_from_live(v: &serde_json::Value) -> (Vec<LimitWindow>, Option<String>, Option<String>) {
-    let rl = v.pointer("/result/rateLimits");
+/// usage 回复 → 窗口。`additional_rate_limits`、`code_review_rate_limit` 计的是别的东西，不进环。
+/// 窗口 id 记"来自哪个字段"（primary/secondary），标签按时长推——账号不同，primary 未必是 5h
+/// （免费档见过 30 天），按固定时长认窗口会把真实在用的窗口整个丢掉。
+fn windows_from_usage(v: &serde_json::Value) -> Vec<LimitWindow> {
+    let now = now_ms();
     let mut out = Vec::new();
-    if let Some(rl) = rl {
-        for id in ["primary", "secondary"] {
-            let Some(w) = rl.get(id) else { continue };
-            let Some(pct) = num(w.get("usedPercent")) else { continue };
-            out.push(LimitWindow {
-                id: id.into(),
-                label: label_for(num(w.get("windowDurationMins")), id),
-                used: (pct / 100.0).clamp(0.0, 1.0),
-                resets_at: num(w.get("resetsAt")).map(|s| (s * 1000.0) as u64), ..Default::default()
-            });
-        }
-    }
-    let plan = rl.and_then(|r| r.get("planType")).and_then(|x| x.as_str()).map(String::from);
-    let blocked = rl
-        .and_then(|r| r.get("rateLimitReachedType"))
-        .and_then(|x| x.as_str())
-        .map(|t| match t {
-            "rate_limit_reached" => "Paused".to_string(),
-            "workspace_owner_credits_depleted" | "workspace_member_credits_depleted" => {
-                "Workspace credits used up".to_string()
-            }
-            "workspace_owner_usage_limit_reached" | "workspace_member_usage_limit_reached" => {
-                "Workspace limit reached".to_string()
-            }
-            _ => "Paused".to_string(),
+    for (id, key) in [("primary", "primary_window"), ("secondary", "secondary_window")] {
+        let Some(w) = v.pointer(&format!("/rate_limit/{key}")).filter(|x| x.is_object()) else { continue };
+        let Some(pct) = num(w.get("used_percent")) else { continue };
+        let resets_at = num(w.get("reset_at"))
+            .map(|s| (s * 1000.0) as u64)
+            .or_else(|| num(w.get("reset_after_seconds")).map(|s| now + (s * 1000.0) as u64));
+        out.push(LimitWindow {
+            id: id.into(),
+            label: label_for(num(w.get("limit_window_seconds")).map(|s| s / 60.0), id),
+            used: (pct / 100.0).clamp(0.0, 1.0),
+            resets_at,
+            ..Default::default()
         });
-    (out, plan, blocked)
+    }
+    out
 }
 
 // ---------------- 兜底：rollout 快照 ----------------
@@ -366,39 +358,63 @@ pub fn snapshot_from_rollout(text: &str) -> Option<(Vec<LimitWindow>, Option<u64
 
 /// Codex 在这台机上存在吗（装了 CLI 或有过会话）——都没有则 cell 不显示
 pub fn present() -> bool {
-    find_executable().is_some() || codex_home().map(|h| h.join("sessions").is_dir()).unwrap_or(false)
+    find_executable().is_some()
+        || auth_path().map(|p| p.is_file()).unwrap_or(false)
+        || codex_home().map(|h| h.join("sessions").is_dir()).unwrap_or(false)
 }
 
 fn read_once() -> UsageSnapshot {
     let mut snap = UsageSnapshot::default();
-    if let Some(exe) = find_executable() {
-        match live_reply(&exe) {
-            Ok(v) => {
-                let (windows, plan, blocked) = windows_from_live(&v);
-                if windows.len() < 2 {
-                    // 诊断：实机只出了 Weekly limit，5h 窗口缺席——记下 rateLimits 的键与 primary 形状
-                    let rl = v.pointer("/result/rateLimits");
-                    let keys: Vec<String> = rl
-                        .and_then(|r| r.as_object())
-                        .map(|o| o.keys().cloned().collect())
-                        .unwrap_or_default();
-                    let primary = rl.and_then(|r| r.get("primary")).map(|p| p.to_string()).unwrap_or_else(|| "缺".into());
-                    crate::applog(&format!("codex: rateLimits 键={keys:?} primary={}", primary.chars().take(200).collect::<String>()));
+    // 活读失败时附在兜底读数上的说明；needs_auth 决定"连兜底都没有"时显示哪种空态
+    let mut live_note: Option<String> = None;
+    let mut needs_auth = false;
+    let held_until = BACKOFF_UNTIL.load(std::sync::atomic::Ordering::Relaxed);
+    let now = now_ms();
+    if held_until > now {
+        snap.backoff_until = held_until;
+        live_note = Some(format!("Rate limited — retrying in {}s", (held_until - now) / 1000));
+    } else {
+        match load_credential() {
+            None => {
+                if auth_path().map(|p| p.is_file()).unwrap_or(false) {
+                    crate::applog("codex: auth.json 里没有可用的 access_token/account_id，退回 rollout");
                 }
-                if !windows.is_empty() {
-                    snap.status = "ok".into();
-                    snap.windows = windows;
-                    snap.fetched_at = now_ms();
-                    snap.note = match (blocked, plan) {
-                        (Some(b), _) => b,
-                        (None, Some(p)) => format!("{} · via Codex", cap(&p)),
-                        _ => String::new(),
-                    };
-                    return snap;
-                }
-                crate::applog("codex: app-server 回复里没有可识别的窗口，退回 rollout");
             }
-            Err(e) => crate::applog(&format!("codex: 活读失败（{e}），退回 rollout")),
+            Some(cred) => match fetch_usage(&cred) {
+                Ok(v) => {
+                    let windows = windows_from_usage(&v);
+                    if !windows.is_empty() {
+                        let plan = v.get("plan_type").and_then(|x| x.as_str()).map(String::from).or(cred.plan);
+                        snap.status = "ok".into();
+                        snap.windows = windows;
+                        snap.fetched_at = now_ms();
+                        snap.note = plan.map(|p| format!("{} · via Codex", cap(&p))).unwrap_or_default();
+                        return snap;
+                    }
+                    let keys: Vec<String> = v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+                    crate::applog(&format!("codex: usage 回复里没有窗口（顶层键 {keys:?}），退回 rollout"));
+                    live_note = Some("Codex reported no usage windows".into());
+                }
+                Err(LiveErr::NeedsAuth) => {
+                    needs_auth = true;
+                    live_note = Some(if cred.expired {
+                        "Codex sign-in expired — open Codex once to refresh it".into()
+                    } else {
+                        "Codex rejected its sign-in — sign in to Codex again".into()
+                    });
+                }
+                Err(LiveErr::RateLimited(secs)) => {
+                    let until = now_ms() + secs * 1000;
+                    BACKOFF_UNTIL.store(until, std::sync::atomic::Ordering::Relaxed);
+                    snap.backoff_until = until;
+                    live_note = Some(format!("Rate limited — retrying in {secs}s"));
+                    crate::applog(&format!("codex: usage 端点 429，{secs}s 后重试"));
+                }
+                Err(LiveErr::Other(e)) => {
+                    crate::applog(&format!("codex: 活读失败（{e}），退回 rollout"));
+                    live_note = Some(format!("Live read failed ({e})"));
+                }
+            },
         }
     }
     // 兜底：rollout
@@ -413,13 +429,23 @@ fn read_once() -> UsageSnapshot {
                 Some(p) => format!("{} · from last Codex run", cap(&p)),
                 None => "from last Codex run".into(),
             };
+            if let Some(n) = live_note {
+                snap.note = format!("{n} · {}", snap.note);
+            }
         }
         None => {
-            snap.status = if present() { "none" } else { "absent" }.into();
-            snap.note = if present() {
-                "Codex has not recorded a usage snapshot yet".into()
+            snap.status = if needs_auth {
+                "needsAuth"
+            } else if present() {
+                "none"
             } else {
-                String::new()
+                "absent"
+            }
+            .into();
+            snap.note = match live_note {
+                Some(n) => n,
+                None if present() => "Codex has not recorded a usage snapshot yet".into(),
+                None => String::new(),
             };
         }
     }
@@ -465,8 +491,9 @@ pub fn start(app: AppHandle) {
         }
         loop {
             let snap = read_once();
+            let hold = snap.backoff_until.saturating_sub(now_ms()) / 1000;
             broadcast(&app, snap);
-            for _ in 0..POLL_SECS {
+            for _ in 0..POLL_SECS.max(hold) {
                 if REFRESH.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
@@ -478,6 +505,15 @@ pub fn start(app: AppHandle) {
 
 /// doctor 用：不含任何秘密
 pub fn probe() -> String {
+    let auth = match load_credential() {
+        Some(c) => format!(
+            "auth.json 可用{}{}",
+            if c.expired { "（access_token 已过期）" } else { "" },
+            c.plan.map(|p| format!("，plan={p}")).unwrap_or_default()
+        ),
+        None if auth_path().map(|p| p.is_file()).unwrap_or(false) => "auth.json 存在但缺 token".to_string(),
+        None => "auth.json 不存在".to_string(),
+    };
     let exe = find_executable();
     let roll = newest_rollout();
     let age = roll
@@ -488,7 +524,7 @@ pub fn probe() -> String {
         .map(|d| format!("{} 分钟前", d.as_secs() / 60))
         .unwrap_or_else(|| "?".into());
     format!(
-        "Codex: 可执行 {} | 最新 rollout {}（改动于 {}）",
+        "Codex: {auth} | 可执行 {} | 最新 rollout {}（改动于 {}）",
         exe.map(|p| p.display().to_string()).unwrap_or_else(|| "未找到".into()),
         roll.map(|p| p.display().to_string()).unwrap_or_else(|| "无".into()),
         age
