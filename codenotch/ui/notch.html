@@ -35,6 +35,15 @@
     bottom:calc(-1 * var(--fillet));
     background:radial-gradient(circle at 0 100%, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px));
   }
+  /* Floating: the pill lifts off the bezel instead of growing out of it. The window does not
+     move - only the pill inside it - so placement, dragging and the interactive rectangles are
+     untouched. The fillets go with it: they are the join to the bezel, and a shape that is not
+     touching the bezel has nothing to join. */
+  #root.float #pill{
+    right:8px;border-radius:20px;border-right:1px solid #2e2e2e;
+    box-shadow:0 6px 20px rgba(0,0,0,.45);
+  }
+  #root.float #pill::before,#root.float #pill::after{display:none}
   .cell{display:flex;flex-direction:column;align-items:center;gap:6px}
   .ringwrap{position:relative;width:56px;height:56px}
   .ringwrap > svg.ring{position:absolute;inset:0;overflow:visible} /* pins only the ring itself; an inline logo svg must not match this or it ends up in the top-left corner */
@@ -211,7 +220,7 @@ function glyphHtml(p,small){
 // Provider table (order = top to bottom in the pill). `glyph` is the fallback letter used when no mark is available
 /* User preferences, pushed from the tray. Defaults match the previous behaviour exactly, so
    a config that has never been touched changes nothing. */
-let prefs={hidden_providers:[],ring_window:'auto',show_percent:true,show_countdown:true,show_pace_tick:true,show_activity_arc:true};
+let prefs={hidden_providers:[],ring_window:'auto',show_percent:true,show_countdown:true,show_pace_tick:true,show_activity_arc:true,float_pill:false};
 
 function providers(){
   const list=[{id:'claude',name:'Claude',glyph:'C',snap:usage}];
@@ -311,6 +320,7 @@ function paceTick(w){
 
 function renderRing(){
   const ps=providers();
+  document.getElementById('root').classList.toggle('float',!!prefs.float_pill);
   // Rebuild the DOM only when the structure changes (never swap the element under the cursor)
   const want=ps.map(p=>p.id+':'+(glyphs[p.id]?glyphs[p.id].kind:'-')).join(',');
   if(pill.dataset.cells!==want){
