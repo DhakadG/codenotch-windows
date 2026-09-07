@@ -314,7 +314,7 @@ fn list_dirs(p: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn tail_text(path: &Path) -> Option<String> {
+pub fn tail_text(path: &Path) -> Option<String> {
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let _ = f.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)));

@@ -119,7 +119,13 @@ let glyphs={}; // id → {kind:'mark'|'appicon', url}
 let activity=[]; // 非 Claude 提供商的活动态：{provider,state:'busy'|'waiting',name,detail,since}
 // 各提供商的"在干活吗"：Claude 来自四态引擎；其余来自 activity 探测。返回 running | attention | idle
 function workState(id){
-  if(id==='claude') return stateSnap.agg==='running'?'running':stateSnap.agg==='attention'?'attention':'idle';
+  if(id==='claude'){
+    if(stateSnap.agg==='running') return 'running';
+    if(stateSnap.agg==='attention') return 'attention';
+    // 引擎看不见云端会话：退回桌面应用的网络活动推断
+    if(activity.some(a=>a.provider==='claude'&&a.state==='busy')) return 'running';
+    return 'idle';
+  }
   const acts=activity.filter(a=>a.provider===id);
   if(acts.some(a=>a.state==='waiting')) return 'attention';
   if(acts.some(a=>a.state==='busy')) return 'running';
@@ -285,7 +291,7 @@ function showCard(){clearTimeout(hideTimer);card.classList.add('show');renderCar
 function hideCard(){card.classList.remove('show');invoke('set_expanded',{on:false,rects:null}).catch(()=>{});}
 function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(hideCard,250);}
 // ===== 诊断可视化 + 几何判定 =====
-const BUILD='r22';
+const BUILD='r28';
 function jslog(m){invoke('log_js',{msg:String(m)}).catch(()=>{});}
 function callq(cmd,args){ // 带可视化失败的 invoke：任何命令失败都在屏上报出来（之前 .catch 静默吞掉了）
   return invoke(cmd,args).catch(e=>{notice(cmd+' 失败: '+(e&&e.message||e));throw e;});

@@ -15,6 +15,7 @@ mod cursor;
 mod antigravity;
 mod glyphs;
 mod activity;
+mod diag;
 mod watcher;
 
 use std::sync::Mutex;
@@ -23,7 +24,7 @@ use tauri::{AppHandle, Emitter, Manager};
 /// notch 窗口逻辑尺寸：右列 70pt 胶囊 + 左侧悬停细节卡的空间
 pub const NOTCH_W: f64 = 340.0;
 /// 轮次水印：每轮改动 +1，run.log 与卡片右上角都显示，杜绝"跑的是旧 exe"误判
-pub const BUILD: &str = "r22";
+pub const BUILD: &str = "r28";
 pub const NOTCH_H: f64 = 460.0; // 300 装不下 3 个窗口块+会话列表（卡片上下被裁）
 
 pub struct AppState {
@@ -570,7 +571,7 @@ fn main() {
                 return;
             }
             "doctor" => {
-                let out = doctor::run();
+                let out = if args.get(2).map(|s| s.as_str()) == Some("deep") { diag::run() } else { doctor::run() };
                 println!("{out}");
                 let log = config::config_path().with_file_name("doctor.log");
                 let _ = std::fs::write(log, &out);

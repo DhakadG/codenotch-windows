@@ -79,6 +79,7 @@ pub fn run() -> String {
     o += &format!("  {}\n", crate::cursor::probe());
     o += &format!("  {}\n", crate::antigravity::probe());
     o += &format!("\n提供商图标:\n{}\n", crate::glyphs::probe());
+    o += &format!("\n活动态:\n  {}\n", crate::activity::probe());
 
     o += "\nwatch.log（若存在，最近运行的监视日志）:\n";
     if let Some(dir) = dirs::config_dir() {
