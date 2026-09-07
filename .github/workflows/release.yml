@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and upload artifacts, but do not create a GitHub Release
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
+
+      # The version is read from tauri.conf.json, which is the file the bundler itself
+      # uses to name the installer. Typing it here by hand is how a tag and an installer
+      # end up disagreeing about what version they are.
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $conf = Get-Content codenotch\tauri.conf.json -Raw | ConvertFrom-Json
+          $cargo = Select-String -Path codenotch\Cargo.toml -Pattern '^version\s*=\s*"(.+)"' |
+            Select-Object -First 1
+          $cargoVersion = $cargo.Matches[0].Groups[1].Value
+          if ($conf.version -ne $cargoVersion) {
+            throw "Version mismatch: tauri.conf.json=$($conf.version) Cargo.toml=$cargoVersion"
+          }
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tag = $env:GITHUB_REF_NAME -replace '^v', ''
+            if ($tag -ne $conf.version) {
+              throw "Tag v$tag does not match tauri.conf.json version $($conf.version)"
+            }
+          }
+          "version=$($conf.version)" | Out-File $env:GITHUB_OUTPUT -Append
+          Write-Host "Version: $($conf.version)"
+
+      - name: Build installer
+        run: cargo tauri build --config codenotch/tauri.conf.json
+        working-directory: codenotch
+
+      # Signing is wired but inert until the certificate secrets exist, so turning it on
+      # later is a secrets change rather than a workflow rewrite. scripts/sign.ps1 is a
+      # documented no-op when CODESIGN_PROVIDER is unset.
+      - name: Sign binaries
+        shell: pwsh
+        env:
+          CODESIGN_PROVIDER: ${{ secrets.CODESIGN_PROVIDER }}
+          CODESIGN_USERNAME: ${{ secrets.CODESIGN_USERNAME }}
+          CODESIGN_PASSWORD: ${{ secrets.CODESIGN_PASSWORD }}
+          CODESIGN_CREDENTIAL_ID: ${{ secrets.CODESIGN_CREDENTIAL_ID }}
+          CODESIGN_TOTP_SECRET: ${{ secrets.CODESIGN_TOTP_SECRET }}
+        run: |
+          ./scripts/sign.ps1 -Path target/release/codenotch.exe
+          Get-ChildItem target/release/bundle/nsis/*.exe |
+            ForEach-Object { ./scripts/sign.ps1 -Path $_.FullName }
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $out = 'dist'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item target/release/bundle/nsis/*.exe $out
+          Get-ChildItem $out -Filter *.exe | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)"
+          } | Out-File "$out/SHA256SUMS.txt" -Encoding ascii
+          Get-Content "$out/SHA256SUMS.txt"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: codenotch-${{ steps.version.outputs.version }}
+          path: dist/*
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

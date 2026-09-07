@@ -1,0 +1,14 @@
+# Static CRT: without this the binary imports vcruntime140.dll / msvcp140.dll, which are
+# supplied by the Visual C++ redistributable and are NOT present on a clean Windows install.
+# The C dependency compiled into the tree (rusqlite's bundled SQLite) is what pulls them in;
+# pure-Rust code alone would not. Linking the CRT statically removes the redistributable from
+# the install story entirely, which is the point of shipping a single NSIS installer.
+#
+# Verify after a release build with:
+#   dumpbin /dependents target\release\codenotch.exe
+# vcruntime140.dll and msvcp140.dll must not appear in the list.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

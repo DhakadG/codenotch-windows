@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A warning that only appears in CI is a warning nobody reads.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, test, build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Caches the registry, the git checkouts and target/. The first build compiles
+      # SQLite from C, which is the slow part; without a cache every run pays for it.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # `cargo fmt --check` is deliberately not a gate. The tree predates this workflow and
+      # differs from rustfmt in 169 places, almost all of it in the original author's code.
+      # Enforcing it would mean opening the contribution with a whitespace commit that
+      # touches twelve files and buries the actual change in review. Revisit once upstream
+      # has an opinion on formatting; until then clippy carries the quality bar, and it is
+      # a hard gate.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Release build
+        run: cargo build --workspace --release
+
+      # The release binary must not depend on the Visual C++ redistributable; see
+      # .cargo/config.toml. This asserts it, so a dependency that quietly reintroduces
+      # a dynamic CRT import fails CI instead of failing on a user's clean machine.
+      - name: Assert no VC++ redistributable dependency
+        shell: pwsh
+        run: |
+          $dumpbin = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio" `
+            -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue |
+            Where-Object FullName -like '*Hostx64\x64*' | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe not found on the runner' }
+          $deps = & $dumpbin.FullName /dependents target\release\codenotch.exe
+          $bad = $deps | Select-String -Pattern 'vcruntime140|msvcp140'
+          if ($bad) { throw "Dynamic CRT import found: $bad" }
+          Write-Host 'OK: no vcruntime140/msvcp140 imports'
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
