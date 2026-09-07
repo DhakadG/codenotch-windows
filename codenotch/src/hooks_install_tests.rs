@@ -124,6 +124,59 @@ fn no_hook_is_wired_to_a_per_tool_call_event() {
 }
 
 #[test]
+fn upgrading_removes_our_entries_from_events_we_no_longer_wire() {
+    // The case that would have shipped the fix while the bug kept running. A settings.json
+    // written by an older build carries our PreToolUse and PostToolUse entries; dropping those
+    // events from WIRING only changes what a *fresh* install writes, so without the sweep the
+    // old entries would sit there untouched and Claude Code would still start a shell twice
+    // per tool call after upgrading.
+    let mut root = json!({
+        "hooks": {
+            "PreToolUse": [
+                { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo mine" }] },
+                { "matcher": "*", "hooks": [{ "type": "command", "command": "\"C:\\old\\codenotch-hook.exe\" running", "timeout": 5 }] }
+            ],
+            "PostToolUse": [
+                { "matcher": "*", "hooks": [{ "type": "command", "command": "\"C:\\old\\codenotch-hook.exe\" running", "timeout": 5 }] }
+            ]
+        }
+    });
+    merge_install(&mut root, HOOK);
+
+    // Ours are gone from both retired events...
+    assert!(ours(&root, "PreToolUse").is_empty(), "a stale PreToolUse entry survived the upgrade");
+    assert!(ours(&root, "PostToolUse").is_empty(), "a stale PostToolUse entry survived the upgrade");
+    // ...the user's own hook on a shared event is untouched...
+    let pre = entries(&root, "PreToolUse");
+    assert_eq!(pre.len(), 1);
+    assert_eq!(pre[0]["hooks"][0]["command"], json!("echo mine"));
+    // ...an event we emptied entirely is removed rather than left as a bare array...
+    assert!(
+        root["hooks"].get("PostToolUse").is_none(),
+        "PostToolUse held only our entry and should have been removed, not left empty"
+    );
+    // ...and the current wiring is installed.
+    for (event, _, _) in WIRING {
+        assert_eq!(ours(&root, event).len(), 1, "{event} should have been wired");
+    }
+}
+
+#[test]
+fn upgrading_from_a_legacy_name_also_clears_the_retired_events() {
+    // Same path, but the stale entry was written under one of the earlier binary names. It is
+    // still ours, so it still has to go.
+    let mut root = json!({
+        "hooks": {
+            "PostToolUse": [
+                { "matcher": "*", "hooks": [{ "type": "command", "command": "\"C:\\old\\pacman-hook.exe\" running" }] }
+            ]
+        }
+    });
+    merge_install(&mut root, HOOK);
+    assert!(root["hooks"].get("PostToolUse").is_none());
+}
+
+#[test]
 fn installing_twice_is_the_same_as_installing_once() {
     let once = install_fresh();
     let mut twice = install_fresh();

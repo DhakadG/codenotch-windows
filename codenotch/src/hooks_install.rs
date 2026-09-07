@@ -114,6 +114,23 @@ fn merge_install(root: &mut Value, hook_exe: &str) {
         root["hooks"] = json!({});
     }
 
+    // Sweep our entries out of *every* event first, not just the ones being written back.
+    //
+    // Without this, dropping an event from WIRING only changes what new installations get.
+    // An existing settings.json keeps whatever it was given by an older build, because the
+    // loop below never visits an event the current WIRING does not mention. That is not a
+    // theoretical leak: PreToolUse and PostToolUse were removed precisely because they made
+    // Claude Code start a shell on every tool call, and an upgrade that left them in place
+    // would have shipped the fix while the bug carried on running.
+    //
+    // Reusing the uninstall path means the two can never disagree about what counts as ours,
+    // and it inherits its rule about user entries: only our own are removed, and an event we
+    // emptied is dropped rather than left behind as a bare `[]`.
+    merge_uninstall(root);
+    if !root["hooks"].is_object() {
+        root["hooks"] = json!({});
+    }
+
     for (event, need_matcher, internal) in WIRING {
         let arr = root["hooks"][*event].as_array().cloned().unwrap_or_default();
         // Remove our own older entries first
