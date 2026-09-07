@@ -37,7 +37,41 @@ fn main() {
     if user_quit() {
         return;
     }
+    // Spawn cooldown. If the application fails to start - a bad build, a missing WebView2,
+    // a crash on launch - then without this every tool call would launch another doomed
+    // process, and the user's machine would be busy failing several times a second while
+    // Claude Code waited on each attempt. One attempt per cooldown at most; a working app
+    // answers on the socket and never reaches this line anyway.
+    if !spawn_allowed() {
+        return;
+    }
     spawn_main();
+}
+
+/// How long to wait between launch attempts when the app is not answering.
+const SPAWN_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Whether enough time has passed since the last launch attempt, recording this one.
+///
+/// The timestamp is the mtime of a marker file, because this process exists for a few
+/// milliseconds and cannot remember anything between invocations.
+fn spawn_allowed() -> bool {
+    let Ok(appdata) = std::env::var("APPDATA") else {
+        return true;
+    };
+    let dir = std::path::PathBuf::from(appdata).join("codenotch");
+    let marker = dir.join("last-spawn");
+    if let Ok(meta) = std::fs::metadata(&marker) {
+        if let Ok(age) = meta.modified().and_then(|t| t.elapsed().map_err(std::io::Error::other)) {
+            if age < SPAWN_COOLDOWN {
+                return false;
+            }
+        }
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    // Truncating rewrite is what moves the mtime forward.
+    let _ = std::fs::write(&marker, b"");
+    true
 }
 
 /// True when the user quit from the tray. The application removes this marker whenever it

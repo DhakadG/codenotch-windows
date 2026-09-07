@@ -243,6 +243,72 @@ fn uncapped_extra_usage_shows_an_amount_rather_than_a_share() {
     assert_eq!(ws[0].used, 0.0);
 }
 
+// ---------------- The request budget ----------------
+
+#[test]
+fn the_request_log_forgets_anything_older_than_an_hour() {
+    let now = 10 * HOUR_MS;
+    let mut log = vec![
+        now - HOUR_MS - 1, // just outside
+        now - HOUR_MS,     // exactly an hour old, also outside
+        now - HOUR_MS + 1, // just inside
+        now,
+    ];
+    assert_eq!(prune_request_log(&mut log, now), 2);
+    assert_eq!(log, vec![now - HOUR_MS + 1, now]);
+}
+
+#[test]
+fn the_budget_allows_normal_polling() {
+    // The five minute floor produces twelve requests an hour, comfortably under the cap,
+    // so ordinary operation must never be held back by this guardrail.
+    let now = 10 * HOUR_MS;
+    let mut log: Vec<u64> = (0..12).map(|i| now - i * 5 * 60 * 1000).collect();
+    assert_eq!(budget_check(&mut log, now), Ok(()));
+}
+
+#[test]
+fn the_budget_stops_a_burst_and_says_when_it_lifts() {
+    // The failure this exists for: many short-lived app starts in quick succession, each
+    // spending a request, which is how this endpoint was tripped in practice.
+    let now = 10 * HOUR_MS;
+    let mut log: Vec<u64> = (0..MAX_REQUESTS_PER_HOUR as u64).map(|i| now - i * 1000).collect();
+    let Err(wait) = budget_check(&mut log, now) else {
+        panic!("a full hour's budget spent in 20 seconds should have been refused");
+    };
+    // The oldest entry is 19 s old, so the window frees up just under an hour from now.
+    assert!(
+        (3570..=3600).contains(&wait),
+        "expected roughly an hour, got {wait}s"
+    );
+}
+
+#[test]
+fn the_budget_frees_up_as_old_requests_age_out() {
+    let now = 10 * HOUR_MS;
+    // Full, but every entry is nearly an hour old.
+    let mut log: Vec<u64> =
+        (0..MAX_REQUESTS_PER_HOUR as u64).map(|i| now - HOUR_MS + 10_000 + i * 100).collect();
+    let Err(wait) = budget_check(&mut log, now) else {
+        panic!("still full at this instant");
+    };
+    assert!(wait <= 10, "the oldest entry expires within 10s, got {wait}s");
+
+    // Ten seconds later the oldest has aged out and a request is allowed again.
+    assert_eq!(budget_check(&mut log, now + 10_001), Ok(()));
+}
+
+#[test]
+fn an_empty_budget_never_reports_a_zero_wait() {
+    // A zero would busy-loop the caller, which is the opposite of what a guardrail is for.
+    let now = 10 * HOUR_MS;
+    let mut log: Vec<u64> = vec![now; MAX_REQUESTS_PER_HOUR];
+    match budget_check(&mut log, now + HOUR_MS - 1) {
+        Err(wait) => assert!(wait >= 1),
+        Ok(()) => panic!("still inside the window"),
+    }
+}
+
 #[test]
 fn backoff_doubles_then_stops_at_the_cap() {
     assert_eq!(backoff_secs(0, 0), 60);

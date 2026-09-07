@@ -35,6 +35,15 @@ const NUDGE_EVERY_MS: u64 = 10 * 60 * 1000;
 /// that answers with an hour of 429. Five minutes is what other readers of this endpoint
 /// settled on independently, and a usage percentage does not move meaningfully faster.
 const MIN_REFETCH_SECS: u64 = 300;
+/// Hard ceiling on requests to the usage endpoint in any rolling hour.
+///
+/// The refetch floor already spaces normal polling to twelve an hour. This is the backstop
+/// for everything that bypasses it - manual refreshes, repeated restarts, a future code
+/// path that forgets the floor exists - so that no sequence of events can turn this app
+/// into the thing that rate-limits the user's account. Deliberately above normal usage and
+/// well below the point where the endpoint objects.
+const MAX_REQUESTS_PER_HOUR: usize = 20;
+const HOUR_MS: u64 = 60 * 60 * 1000;
 
 static REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -92,6 +101,14 @@ pub struct UsageSnapshot {
     pub note: String,
     #[serde(default)]
     pub backoff_until: u64,
+    /// Epoch-ms of each request made to the usage endpoint in the last hour.
+    ///
+    /// Persisted deliberately. The endpoint rate-limits per token, and the failure mode
+    /// that actually happened here was a burst spread across many short-lived processes:
+    /// the hook restarts this app whenever it is not running, and every start used to
+    /// fetch. An in-memory counter resets with the process and so cannot see that at all.
+    #[serde(default)]
+    pub request_log: Vec<u64>,
 }
 
 fn store_path() -> std::path::PathBuf {
@@ -387,6 +404,30 @@ fn fetch_once(token: &str) -> Result<Vec<LimitWindow>, FetchErr> {
     }
 }
 
+/// Drops request timestamps older than an hour and reports how many remain.
+///
+/// Kept separate from the check so the pruning is testable on its own, and so a caller
+/// cannot accidentally test the budget against an unpruned log.
+fn prune_request_log(log: &mut Vec<u64>, now: u64) -> usize {
+    log.retain(|t| now.saturating_sub(*t) < HOUR_MS);
+    log.len()
+}
+
+/// Whether another request is allowed right now, and when the budget next frees up.
+///
+/// Returns `Ok(())` to proceed, or `Err(seconds)` with how long until the oldest request
+/// ages out of the window.
+fn budget_check(log: &mut Vec<u64>, now: u64) -> Result<(), u64> {
+    if prune_request_log(log, now) < MAX_REQUESTS_PER_HOUR {
+        return Ok(());
+    }
+    // The log is full, so the oldest entry is what has to expire first. It exists: the
+    // capacity is non-zero, so a full log is a non-empty one.
+    let oldest = log.iter().copied().min().unwrap_or(now);
+    let wait_ms = HOUR_MS.saturating_sub(now.saturating_sub(oldest));
+    Err(wait_ms.div_ceil(1000).max(1))
+}
+
 fn backoff_secs(consecutive: u32, retry_after_floor: u64) -> u64 {
     let exp = BACKOFF_BASE_SECS.saturating_mul(1u64 << consecutive.min(4));
     exp.clamp(BACKOFF_BASE_SECS, BACKOFF_CAP_SECS).max(retry_after_floor)
@@ -496,6 +537,32 @@ pub fn start(app: AppHandle) {
             }
             // No reset needed here: every path out of this iteration ends in a wait, and
             // each of those reassigns `forced` from whether it was interrupted.
+
+            // The hard ceiling, checked on the one path every request passes through. A
+            // manual refresh may bypass the five minute floor; nothing bypasses this.
+            {
+                let st = app.state::<AppState>();
+                let mut u = st.usage.lock().unwrap();
+                if let Err(wait) = budget_check(&mut u.request_log, now_ms()) {
+                    let note = format!(
+                        "Holding off: {MAX_REQUESTS_PER_HOUR} usage checks in the last hour is this app's own limit. Next one in {}m.",
+                        wait.div_ceil(60)
+                    );
+                    if u.note != note {
+                        crate::applog(&format!("usage budget reached, next request in {wait}s"));
+                        u.note = note;
+                        if u.windows.is_empty() && u.status != "needsAuth" {
+                            u.status = "error".into();
+                        } else if !u.windows.is_empty() {
+                            u.status = "stale".into();
+                        }
+                    }
+                    drop(u);
+                    forced = sleep_interruptible(wait.clamp(1, 30));
+                    continue;
+                }
+                u.request_log.push(now_ms());
+            }
             match read_credentials() {
                 None => set_and_broadcast(&app, |u| {
                     u.status = "needsAuth".into();
