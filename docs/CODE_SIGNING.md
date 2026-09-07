@@ -17,11 +17,20 @@ reputation for that identity across every download.
 
 Two consequences follow, and both need to be said plainly rather than discovered later:
 
-- **An OV or IV certificate does not clear SmartScreen immediately.** Reputation builds
-  over downloads and time. Early users will still see the warning.
-- **An EV certificate does clear it immediately**, because the identity vetting is
-  stricter. That is the only real difference in day-one user experience, and it is why EV
-  costs several times more.
+- **No certificate clears SmartScreen on day one.** Reputation builds over downloads and
+  time — Microsoft says several weeks and hundreds of clean installs from a wide audience,
+  with no threshold published and no way to request a review for consumer machines. What
+  signing buys immediately is that the warning names a verified publisher instead of an
+  unknown one, and that reputation accrues to the certificate so later releases inherit it.
+- **EV does not change that, and buying it for that reason is wasted money.** Microsoft's
+  own guidance is explicit: "EV certificates no longer bypass SmartScreen. Years ago,
+  signing files with an Extended Validation (EV) code signing certificate would result in
+  positive SmartScreen reputation by default, but this behavior no longer exists." EV still
+  matters for some enterprise procurement rules. It does not affect SmartScreen.
+
+An earlier version of this document said the opposite — that EV clears the warning
+immediately and OV does not. That was wrong, and it pointed at the most expensive option
+for a benefit that no longer exists.
 
 ## What the pipeline already does
 
@@ -32,7 +41,10 @@ from the environment:
 - unset - the script logs that it is skipping and exits 0, so unsigned builds still work
   on forks and on pull requests from contributors who have no access to the secrets;
 - set to a provider it knows - it asserts that the provider's other secrets are present and
-  signs;
+  then **throws**, because no signer is implemented yet. Every provider branch is a
+  placeholder carrying the exact command to fill in once a certificate exists. Turning this
+  on before then fails the release rather than producing an unsigned installer described as
+  signed;
 - set to something unknown, or set with missing secrets - it fails the build.
 
 That last case is deliberate. A signing step that silently skips on misconfiguration
@@ -132,8 +144,18 @@ satisfies its one real constraint by being open source and non-commercial. The
 `Open Source Developer` publisher prefix is cosmetic here.
 
 Move to **SSL.com IV** when you first ship something commercial, or if the publisher line
-matters to you. Consider **EV** only when SmartScreen warnings on day one become a real
-support burden - it is the only thing that removes them immediately.
+matters to you.
+
+Do **not** buy EV to deal with SmartScreen. It costs several times more and, per Microsoft's
+current guidance, does nothing for it. Buy EV only if a customer's procurement rules demand
+it. The way to fewer warnings is a consistent signing identity used on every release, so
+reputation accumulates against one certificate instead of restarting each time - which is
+also why changing certificates later has a cost.
+
+Worth knowing for later: Microsoft's own **Azure Artifact Signing** starts at about
+$9.99/month and is their recommended service for non-Store distribution. It is ruled out
+here only by the geography described above, not by price or quality. Re-check its
+eligibility before renewing anything else.
 
 ## What only you can do
 

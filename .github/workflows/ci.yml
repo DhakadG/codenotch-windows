@@ -12,6 +12,13 @@ on:
 permissions:
   contents: read
 
+# One run per branch or pull request. Pushing three commits in a minute otherwise starts
+# three Windows jobs that each compile SQLite from C, and the two obsolete ones keep
+# reporting checks for code nobody is looking at any more.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # RUSTFLAGS is deliberately NOT set here. The environment variable *replaces*

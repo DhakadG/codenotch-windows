@@ -149,8 +149,12 @@ jobs:
           name: codenotch-${{ steps.version.outputs.version }}
           path: dist/*
 
+      # `dry_run` defaults to true, and a manual run started from a tag would otherwise have
+      # published anyway - the input would have been accepted and silently ignored, which is
+      # the worst behaviour available for a switch whose whole purpose is "do not publish".
+      # A tag push has no inputs, so the second clause leaves normal releases untouched.
       - name: Publish release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' && inputs.dry_run != true
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*

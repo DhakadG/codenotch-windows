@@ -105,14 +105,28 @@ fn read_port() -> u16 {
     DEFAULT_PORT
 }
 
+/// The whole budget for one hook invocation, connect and write together.
+///
+/// Per-operation timeouts bound each step but not their sum, and this program sits on
+/// Claude Code's critical path twice per tool call. One number is easier to reason about
+/// than two that add up.
+const SEND_BUDGET: Duration = Duration::from_millis(250);
+
 fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
+    let started = std::time::Instant::now();
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     // Every timeout here is a bound on how long Claude Code can be delayed by this
     // program, which runs before and after each of its tool calls. They are deliberately
     // tight: a notch that misses one event is invisible, a tool call that waits a second is
     // not. Worst case for a hook is now roughly 300 ms rather than 1.7 s.
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(150))?;
-    s.set_write_timeout(Some(Duration::from_millis(150)))?;
+    let mut s = TcpStream::connect_timeout(&addr, SEND_BUDGET)?;
+    // Whatever the connect used comes out of the same budget, so the two cannot add up to
+    // more than SEND_BUDGET no matter how slow the loopback was.
+    let left = SEND_BUDGET
+        .checked_sub(started.elapsed())
+        .filter(|d| !d.is_zero())
+        .unwrap_or(Duration::from_millis(1));
+    s.set_write_timeout(Some(left))?;
     let req = format!(
         "POST /event?e={}&ppid={} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         event,
