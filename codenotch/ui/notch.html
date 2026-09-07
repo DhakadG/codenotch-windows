@@ -81,9 +81,19 @@
      `attr` is animated rather than opacity alone so a state that arrives mid-fade replaces
      the old one cleanly instead of compounding with it. */
   @keyframes arc-in{from{opacity:0}to{opacity:1}}
-  .arc-spin,.arc-pulse{animation-fill-mode:both}
-  .arc-enter{animation:arc-in 220ms ease-out both}
-  @media (prefers-reduced-motion:reduce){.arc-enter{animation-duration:1ms}}
+  @keyframes arc-out{from{opacity:1}to{opacity:0}}
+  /* Two animations on one element: the state's own motion, and the cross-fade. Listing both
+     keeps the spin or pulse running while the shape fades, so a state does not freeze on its
+     way out. The outgoing element also stops responding to the pointer, since it is on its
+     way to being removed. */
+  .arc-exit{animation:arc-out 220ms ease-in both;pointer-events:none}
+  .arc-exit.arc-spin{animation:arc-out 220ms ease-in both, spin 1.2s linear infinite}
+  .arc-exit.arc-pulse{animation:arc-out 220ms ease-in both, pulse 1.1s ease-in-out infinite}
+  .arc-enter.arc-spin{animation:arc-in 220ms ease-out both, spin 1.2s linear infinite}
+  .arc-enter.arc-pulse{animation:arc-in 220ms ease-out both, pulse 1.1s ease-in-out infinite}
+  @media (prefers-reduced-motion:reduce){
+    .arc-enter,.arc-exit{animation-duration:1ms}
+  }
   /* Someone who has asked the system to stop animating things means it. */
   @media (prefers-reduced-motion:reduce){
     .arc-spin{animation-duration:3s}
@@ -302,7 +312,22 @@ function renderRing(){
       const ws=workState(p.id);
       if(cell.dataset.ws!==ws){
         cell.dataset.ws=ws;
-        svg.querySelector('g.work')?.remove();
+        // Fade the outgoing shape out *while* the incoming one fades in, rather than
+        // removing it first. Deleting it immediately meant amber vanished and green then
+        // appeared into the gap, which is a cut with a delay in front of it, not a
+        // transition. Both are absolutely positioned in the same SVG, so they overlap for
+        // the length of the fade and the eye reads one becoming the other.
+        const old=svg.querySelector('g.work:not(.arc-exit)');
+        if(old){
+          old.classList.add('arc-exit');
+          old.classList.remove('arc-enter');
+          // Remove on the animation's own end event rather than a matching timer, so the
+          // two can never drift apart, and unconditionally after a moment in case the
+          // element never animates - a hidden window fires no animation events.
+          const drop=()=>old.remove();
+          old.addEventListener('animationend',drop,{once:true});
+          setTimeout(drop,400);
+        }
         if(ws==='running'||ws==='attention'){
           const g=document.createElementNS('http://www.w3.org/2000/svg','g');
           // arc-enter cross-fades the incoming shape. Amber and green are different shapes -
@@ -497,22 +522,27 @@ document.addEventListener('mousemove',e=>{
    number actually wants, it is cheap, and it is undoable by ignoring it. The page is still
    one double click or one right-click menu item away.
    A pending single click waits out the double-click interval so the two do not both fire. */
-let clickTimer=null;
+/* Pending clicks are tracked per provider, not globally. With one shared timer, clicking
+   Claude and then Cursor inside the double-click interval cancelled Claude's refresh and
+   opened Cursor's usage page - two single clicks on two different cells being read as one
+   double click on the second. Two clicks only pair when they land on the same provider. */
+const pendingClick=new Map();
 const DOUBLE_CLICK_MS=280;
 document.addEventListener('mouseup',e=>{
   if(e.button!==0)return;
   const hit=press;
   press=null;
   if(!hit||dragging)return;
-  if(clickTimer){ // second click of a pair: cancel the queued refresh and open the page
-    clearTimeout(clickTimer);clickTimer=null;
+  const queued=pendingClick.get(hit.id);
+  if(queued){ // second click on the same cell: cancel its refresh and open the page instead
+    clearTimeout(queued);pendingClick.delete(hit.id);
     invoke('open_provider_page',{provider:hit.id}).catch(()=>{});
     return;
   }
-  clickTimer=setTimeout(()=>{
-    clickTimer=null;
+  pendingClick.set(hit.id,setTimeout(()=>{
+    pendingClick.delete(hit.id);
     invoke('refresh_provider',{provider:hit.id}).catch(()=>{});
-  },DOUBLE_CLICK_MS);
+  },DOUBLE_CLICK_MS));
 });
 
 /* The window is a WebView, so without this the right button opens Chromium's own menu -
