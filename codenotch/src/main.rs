@@ -11,6 +11,7 @@ mod config;
 mod doctor;
 mod focus;
 mod hooks_install;
+mod oauth;
 mod i18n;
 mod server;
 mod state;
@@ -429,6 +430,22 @@ fn hide_provider(app: AppHandle, provider: String) {
     let _ = tray::rebuild(&app);
 }
 
+/// Open a URL in the user's browser.
+///
+/// `cmd /C start` rather than ShellExecute: it is what this file already used for provider
+/// pages, and the empty second argument is the window title `start` insists on before it will
+/// treat a quoted string as the target.
+pub fn open_in_browser(url: &str) {
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(["/C", "start", "", url]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let _ = cmd.spawn();
+}
+
 /// A click on a cell opens that provider's usage page
 #[tauri::command]
 fn open_provider_page(provider: String) {
@@ -438,14 +455,32 @@ fn open_provider_page(provider: String) {
         "gemini" => "https://antigravity.google",
         _ => "https://claude.ai/settings/usage",
     };
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.args(["/C", "start", "", url]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
+    open_in_browser(url);
+}
+
+/// Start a sign-in: open Anthropic's authorization page and the local page that collects the
+/// code it hands back.
+///
+/// Two tabs rather than one, because Anthropic's callback shows the code on its own page for
+/// copying instead of redirecting to a loopback port - so something has to be waiting to take
+/// the paste. That something is the event server this app already runs, which means no dialog
+/// code, no second window, and a page that can say what went wrong in a sentence.
+pub fn begin_sign_in(app: &AppHandle) {
+    match oauth::begin() {
+        Ok(url) => {
+            let port = {
+                let st = app.state::<AppState>();
+                let c = st.cfg.lock().unwrap();
+                c.port
+            };
+            open_in_browser(&url);
+            open_in_browser(&format!("http://127.0.0.1:{port}/signin"));
+        }
+        Err(e) => {
+            applog(&format!("sign-in could not start: {e}"));
+            let _ = app.emit("notice", format!("Sign-in could not start: {e}"));
+        }
     }
-    let _ = cmd.spawn();
 }
 
 /// Card expansion state: Some(hot rectangles, in **physical pixels** relative to the window's

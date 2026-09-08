@@ -113,6 +113,16 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         })
         .build(app)?;
 
+    // Sign in, or sign out - never both. Which one applies is knowable, so offering the pair
+    // and letting the user work out which is live would be the menu asking a question it can
+    // answer itself, the same reasoning as the hook item below.
+    let signed_in = crate::oauth::is_signed_in();
+    let sign_item = MenuItemBuilder::with_id(
+        if signed_in { "sign-out" } else { "sign-in" },
+        tr(lang, if signed_in { "sign_out" } else { "sign_in" }),
+    )
+    .build(app)?;
+
     let refresh = MenuItemBuilder::with_id("refresh", tr(lang, "refresh")).build(app)?;
     let refresh_creds =
         MenuItemBuilder::with_id("refresh-creds", tr(lang, "refresh_creds")).build(app)?;
@@ -132,6 +142,7 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     };
     MenuBuilder::new(app)
         .items(&[hook_item])
+        .item(&sign_item)
         .separator()
         .item(&provider_menu)
         .item(&ring_menu)
@@ -233,6 +244,16 @@ fn handle(app: &AppHandle, id: &str) {
                 crate::config::save(&c);
             }
             crate::broadcast_prefs(app);
+            refresh_menu(app);
+        }
+        "sign-in" => crate::begin_sign_in(app),
+        "sign-out" => {
+            // Only this application's own session. Claude Code's credential is not touched,
+            // which is the point of having a separate one - and after this the app falls back
+            // to borrowing that credential exactly as it did before anyone signed in here.
+            let gone = crate::oauth::sign_out();
+            crate::applog(&format!("oauth: sign out {}", if gone { "ok" } else { "found nothing" }));
+            crate::usage::request_refresh();
             refresh_menu(app);
         }
         "reset" => crate::reset_bar(app),

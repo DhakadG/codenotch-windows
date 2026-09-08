@@ -165,8 +165,26 @@ fn persist(s: &UsageSnapshot) {
     }
 }
 
-/// Reads Claude Code's OAuth credential. Returns (token, expired hint).
+/// The Claude credential to use, and whether it has expired.
+///
+/// One choke point on purpose. The poll loop asks this question at six different decision
+/// points - before the backoff gate, after it, before the request, on a 401 retry - and a
+/// preference expressed in only some of them would be a preference the app applies at random.
+///
+/// **Our own session first.** `oauth::access_token` returns a token this application owns and
+/// has already refreshed if it was close to expiry, so it is never handed back expired; that is
+/// why the second element is false rather than a check. When nobody has signed in here, or the
+/// refresh was rejected, it returns None and the borrowed credential below is used exactly as
+/// before - so a user who never opens the sign-in sees no change at all.
 fn read_credentials() -> Option<(String, bool)> {
+    if let Some(token) = crate::oauth::access_token() {
+        return Some((token, false));
+    }
+    read_borrowed_credentials()
+}
+
+/// Claude Code's own credential, read and never written. Returns (token, expired hint).
+fn read_borrowed_credentials() -> Option<(String, bool)> {
     let home = dirs::home_dir()?;
     for name in [".credentials.json", "credentials.json"] {
         let p = home.join(".claude").join(name);
@@ -666,7 +684,7 @@ pub fn start(app: AppHandle) {
             if read_credentials().is_none() {
                 set_and_broadcast(&app, |u| {
                     u.status = if u.windows.is_empty() { "needsAuth".into() } else { "stale".into() };
-                    u.note = "No Claude Code credential found. Run `claude` in a terminal and sign in.".into();
+                    u.note = "Not signed in. Right-click the tray icon and choose Sign in to Claude - or run `claude` in a terminal, and Codenotch will borrow that credential instead.".into();
                 });
                 forced = sleep_interruptible(POLL_ACTIVE_SECS);
                 continue;
@@ -708,7 +726,7 @@ pub fn start(app: AppHandle) {
             match read_credentials() {
                 None => set_and_broadcast(&app, |u| {
                     u.status = "needsAuth".into();
-                    u.note = "No Claude Code credential found".into();
+                    u.note = "Not signed in - right-click the tray icon and choose Sign in to Claude".into();
                 }),
                 // Reachable despite the check above: the credential is read again here, and
                 // in between it can have expired on the clock, or Claude Code can have
