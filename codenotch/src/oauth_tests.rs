@@ -129,3 +129,33 @@ fn an_absurd_expires_in_is_clamped_at_both_ends() {
     let normal = parse_token_response(r#"{"access_token":"a","expires_in":3600}"#, 1_000).unwrap();
     assert_eq!(normal.expires_at, 4_600);
 }
+
+/// The authorize URL, pinned against the reference implementation.
+///
+/// This exists because of a real failure: Anthropic answered "Authorization failed - Invalid
+/// request format" for a URL whose only difference from the working one was a shorter `state`.
+/// The shape is not a matter of taste here, so it is written out in full rather than assembled
+/// a second way - a test that builds the string the same way the code does would agree with any
+/// bug the code has.
+#[test]
+fn the_authorize_url_matches_the_reference_flow_exactly() {
+    assert_eq!(
+        authorize_url("CHALLENGE", "STATE"),
+        "https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference&code_challenge=CHALLENGE&code_challenge_method=S256&state=STATE"
+    );
+    // A line continuation that left its indentation in would send raw spaces to the endpoint.
+    let url = authorize_url("C", "S");
+    assert!(!url.contains(' ') && !url.contains('\n'), "{url}");
+}
+
+/// 32 bytes is 43 base64url characters. The verifier's length is fixed by RFC 7636; the
+/// state's is not by the specification, but it is by this endpoint - 22 characters came back
+/// as an invalid request format.
+#[cfg(windows)]
+#[test]
+fn the_verifier_and_state_are_both_the_reference_length() {
+    assert_eq!(PKCE_BYTES, 32);
+    assert_eq!(b64url(&random_bytes(PKCE_BYTES)).len(), 43);
+    // A SHA-256 challenge is the same width, which is what this endpoint has always accepted.
+    assert_eq!(b64url(&sha256(b"whatever")).len(), 43);
+}

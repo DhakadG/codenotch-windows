@@ -55,6 +55,19 @@ const CRED_TARGET: &str = "codenotch:anthropic-oauth";
 /// sign-out.
 const REFRESH_SKEW_SECS: u64 = 300;
 
+/// Bytes of randomness behind the PKCE verifier and the `state`, before base64url.
+///
+/// Thirty-two for both, matching the reference implementation this flow was ported from - the
+/// companion taskbar mod, which signs in against this same client successfully.
+///
+/// The verifier's size is fixed by RFC 7636. The `state`'s is not, and sixteen bytes is ample
+/// entropy for what `state` is *for*, so this started at sixteen on that reasoning. Anthropic's
+/// authorize page answered "Authorization failed - Invalid request format" and nothing else in
+/// the two URLs differed, so the length is evidently load-bearing to that endpoint whatever the
+/// specification says. One constant for both now, so the two cannot drift apart again and so
+/// the next person does not repeat the same reasonable-sounding deviation.
+const PKCE_BYTES: usize = 32;
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 pub struct Token {
     pub access_token: String,
@@ -269,8 +282,8 @@ pub fn is_signed_in() -> bool {
 /// The verifier and state stay in memory until the user pastes the code back. Starting a second
 /// sign-in replaces the first, which is what someone who clicked twice means.
 pub fn begin() -> Result<String, String> {
-    let verifier_bytes = random_bytes(32);
-    let state_bytes = random_bytes(16);
+    let verifier_bytes = random_bytes(PKCE_BYTES);
+    let state_bytes = random_bytes(PKCE_BYTES);
     if verifier_bytes.is_empty() || state_bytes.is_empty() {
         return Err("the system random number generator is unavailable".into());
     }
@@ -281,14 +294,29 @@ pub fn begin() -> Result<String, String> {
         return Err("SHA-256 is unavailable".into());
     }
     let challenge = b64url(&digest);
-    let url = format!(
-        "{AUTHORIZE_URL}?code=true&client_id={CLIENT_ID}&response_type=code\
-         &redirect_uri={}&scope={}&code_challenge={challenge}&code_challenge_method=S256&state={state}",
-        urlencode(REDIRECT_URI),
-        urlencode(SCOPE),
-    );
+    let url = authorize_url(&challenge, &state);
+    // Logged, because the last failure here was invisible from this side: the browser said
+    // "Invalid request format" and this application had no record of what it had asked for.
+    // The challenge and the state are public by design; the verifier, which is the secret, is
+    // not in the URL.
+    crate::applog(&format!("oauth: authorize {url}"));
     *PENDING.lock().unwrap() = Some(Pending { verifier, state });
     Ok(url)
+}
+
+/// The authorization URL, given an already-computed challenge and state.
+///
+/// Separated from `begin` so the exact string can be tested. Parameter names, order and
+/// encoding are matched to the reference implementation deliberately: this endpoint rejected a
+/// URL that differed from it in the length of one value alone, so "equivalent" is not a useful
+/// standard here. Identical is.
+fn authorize_url(challenge: &str, state: &str) -> String {
+    format!(
+        "{AUTHORIZE_URL}?code=true&client_id={CLIENT_ID}&response_type=code\
+&redirect_uri={}&scope={}&code_challenge={challenge}&code_challenge_method=S256&state={state}",
+        urlencode(REDIRECT_URI),
+        urlencode(SCOPE),
+    )
 }
 
 /// Percent-encode everything outside the unreserved set.
