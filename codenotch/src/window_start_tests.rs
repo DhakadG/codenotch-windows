@@ -56,3 +56,44 @@ fn the_request_is_the_smallest_thing_that_counts_as_a_message() {
     // in - that is the correction this module is built around, so it is worth a test.
     assert!(b["system"].as_str().unwrap().contains("Noted"));
 }
+
+// ---------------------------------------------------------------- the schedule
+
+const HOUR: u64 = 3600;
+
+#[test]
+fn nothing_happens_while_the_toggle_is_off_or_nobody_is_signed_in() {
+    assert_eq!(next_action(false, true, Some(5), None, NOW), Next::Wait(30));
+    assert_eq!(next_action(true, false, Some(5), None, NOW), Next::Wait(30));
+}
+
+#[test]
+fn a_fresh_reading_with_no_window_is_the_case_this_exists_for() {
+    assert_eq!(next_action(true, true, Some(5), None, NOW), Next::Send);
+}
+
+/// An old reading is not wrong about *when* a reset happens - the time is absolute - but it can
+/// be wrong about whether a window exists at all, and acting on that spends a message.
+#[test]
+fn a_stale_reading_is_never_acted_on() {
+    assert_eq!(next_action(true, true, Some(601), None, NOW), Next::Wait(30));
+    assert_eq!(next_action(true, true, None, None, NOW), Next::Wait(30));
+    // Exactly at the limit is still fresh; the boundary belongs to the usable side.
+    assert_eq!(next_action(true, true, Some(600), None, NOW), Next::Send);
+}
+
+#[test]
+fn it_waits_out_a_running_window_and_fires_just_after_the_reset() {
+    // Four hours to go: idle ticking, nothing clever.
+    assert_eq!(next_action(true, true, Some(5), Some(NOW + 4 * HOUR), NOW), Next::Wait(30));
+    // Inside the last half minute it sleeps to the moment itself, so the message lands within
+    // seconds of the reset rather than up to a tick after it.
+    assert_eq!(next_action(true, true, Some(5), Some(NOW + 5), NOW), Next::Wait(15));
+    assert_eq!(next_action(true, true, Some(5), Some(NOW - 5), NOW), Next::Wait(5));
+    // The reset itself is not the moment: arriving early would reopen the old window and waste
+    // the message, because this machine's clock is not the one that decides the boundary.
+    assert_eq!(next_action(true, true, Some(5), Some(NOW), NOW), Next::Wait(10));
+    assert_eq!(next_action(true, true, Some(5), Some(NOW - 9), NOW), Next::Wait(1));
+    assert_eq!(next_action(true, true, Some(5), Some(NOW - 10), NOW), Next::Send);
+    assert_eq!(next_action(true, true, Some(5), Some(NOW - HOUR), NOW), Next::Send);
+}

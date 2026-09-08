@@ -130,6 +130,15 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .enabled(signed_in)
         .build(app)?;
 
+    let auto_window = CheckMenuItemBuilder::with_id("auto-window", tr(lang, "auto_start_window"))
+        .checked({
+            let st = app.state::<crate::AppState>();
+            let c = st.cfg.lock().unwrap();
+            c.auto_start_window
+        })
+        .enabled(signed_in)
+        .build(app)?;
+
     let refresh = MenuItemBuilder::with_id("refresh", tr(lang, "refresh")).build(app)?;
     let refresh_creds =
         MenuItemBuilder::with_id("refresh-creds", tr(lang, "refresh_creds")).build(app)?;
@@ -151,6 +160,7 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .items(&[hook_item])
         .item(&sign_item)
         .item(&start_window)
+        .item(&auto_window)
         .separator()
         .item(&provider_menu)
         .item(&ring_menu)
@@ -252,6 +262,26 @@ fn handle(app: &AppHandle, id: &str) {
                 crate::config::save(&c);
             }
             crate::broadcast_prefs(app);
+            refresh_menu(app);
+        }
+        "auto-window" => {
+            let on = {
+                let st = app.state::<crate::AppState>();
+                let mut c = st.cfg.lock().unwrap();
+                c.auto_start_window = !c.auto_start_window;
+                crate::config::save(&c);
+                c.auto_start_window
+            };
+            // Said out loud, because this is the one setting here that spends something on its
+            // own. Somebody who turns it on should be told what they just agreed to.
+            let _ = app.emit(
+                "notice",
+                if on {
+                    "Codenotch will start a new five-hour window a few seconds after each reset. One Haiku message each time."
+                } else {
+                    "Automatic window starts are off."
+                },
+            );
             refresh_menu(app);
         }
         "start-window" => {

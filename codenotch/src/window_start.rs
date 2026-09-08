@@ -159,3 +159,111 @@ pub fn start_window(open_until: Option<u64>) -> Result<String, String> {
 #[cfg(test)]
 #[path = "window_start_tests.rs"]
 mod tests;
+
+// ---------------------------------------------------------------- keeping it running
+
+/// How long after a reset to send. Not zero: the reset is a server-side boundary and this
+/// machine's clock is not the one that decides it, so arriving a few seconds early would open
+/// the *old* window again and waste the message. Ten seconds is longer than any clock skew
+/// worth worrying about and short enough that nobody notices the gap.
+const AFTER_RESET_SECS: u64 = 10;
+
+/// How stale a reading may be and still be trusted to schedule from.
+///
+/// A reset time is an absolute instant, so an old reading is not wrong about *when* - but it
+/// can be wrong about whether a window exists at all, and acting on that spends a message. Ten
+/// minutes matches the refetch floor, so this never asks for fresher data than the app collects.
+const MAX_READING_AGE_SECS: u64 = 600;
+
+/// What the watcher should do next, given what it knows.
+///
+/// Every decision in one pure function so the whole schedule can be tested at any point in a
+/// five-hour cycle without waiting for one.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Next {
+    /// Send now.
+    Send,
+    /// Do nothing for this long, then look again.
+    Wait(u64),
+}
+
+pub(crate) fn next_action(
+    enabled: bool,
+    signed_in: bool,
+    reading_age: Option<u64>,
+    resets_at: Option<u64>,
+    now: u64,
+) -> Next {
+    // The idle tick. Long enough to cost nothing, short enough that switching the toggle on
+    // does something within a minute rather than feeling broken.
+    const IDLE: u64 = 30;
+    if !enabled || !signed_in {
+        return Next::Wait(IDLE);
+    }
+    // No reading, or one too old to act on. Waiting is the only honest move: the alternative is
+    // sending a message on the strength of information that may be five hours out of date.
+    match reading_age {
+        None => return Next::Wait(IDLE),
+        Some(age) if age > MAX_READING_AGE_SECS => return Next::Wait(IDLE),
+        _ => {}
+    }
+    match resets_at {
+        // A fresh reading with no five-hour window in it means none is running, which is
+        // exactly the state this feature exists to leave behind.
+        None => Next::Send,
+        Some(reset) => {
+            let due = reset + AFTER_RESET_SECS;
+            if now >= due {
+                Next::Send
+            } else {
+                // Sleep to the moment itself when it is close, so the message lands within
+                // seconds of the reset rather than up to a tick later; otherwise idle.
+                Next::Wait((due - now).min(IDLE))
+            }
+        }
+    }
+}
+
+/// Keep the five-hour window running back to back while the toggle is on.
+pub fn start_watcher(app: tauri::AppHandle) {
+    use tauri::Manager;
+    std::thread::spawn(move || loop {
+        let enabled = crate::config::load().auto_start_window;
+        let (age, resets_at) = {
+            let st = app.state::<crate::AppState>();
+            let u = st.usage.lock().unwrap();
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let age = if u.fetched_at == 0 {
+                None
+            } else {
+                Some(now_ms.saturating_sub(u.fetched_at) / 1000)
+            };
+            let reset = u
+                .windows
+                .iter()
+                .find(|w| w.id == "session" || w.id == "five_hour")
+                .and_then(|w| w.resets_at)
+                .map(|ms| ms / 1000);
+            (age, reset)
+        };
+        match next_action(enabled, oauth::is_signed_in(), age, resets_at, now_secs()) {
+            Next::Wait(secs) => std::thread::sleep(std::time::Duration::from_secs(secs)),
+            Next::Send => {
+                // `start_window` re-checks everything, including the five-minute floor, so a
+                // scheduling mistake here cannot become a burst of messages.
+                let msg = match start_window(resets_at) {
+                    Ok(m) => format!("auto: {m}"),
+                    Err(e) => format!("auto: {e}"),
+                };
+                crate::applog(&format!("window start {msg}"));
+                crate::usage::request_refresh();
+                // Long enough for the refresh to land, so the next pass reads the new window
+                // rather than deciding again from the reading that prompted this one.
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        }
+    });
+}

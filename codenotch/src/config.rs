@@ -67,6 +67,12 @@ pub struct Config {
     /// and the interactive rectangles working exactly as before.
     #[serde(default)]
     pub float_pill: bool,
+    /// Keep the five-hour window running back to back, rather than starting it by accident.
+    ///
+    /// Off by default and it must stay that way: this spends a message without being asked,
+    /// and a setting that costs something has to be chosen rather than inherited.
+    #[serde(default)]
+    pub auto_start_window: bool,
 }
 
 fn yes() -> bool {
@@ -105,6 +111,7 @@ impl Default for Config {
             show_pace_tick: true,
             show_activity_arc: true,
             float_pill: false,
+            auto_start_window: false,
         }
     }
 }

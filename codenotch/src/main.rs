@@ -910,6 +910,7 @@ fn main() {
             cursor::start(handle.clone());
             antigravity::start(handle.clone());
             activity::start(handle.clone());
+            window_start::start_watcher(handle.clone());
             // Collecting glyphs may read icon resources out of a few executables; do it off the main thread and push when done
             let gh = handle.clone();
             std::thread::spawn(move || reload_glyphs(&gh));
