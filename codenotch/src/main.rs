@@ -11,6 +11,7 @@ mod config;
 mod doctor;
 mod focus;
 mod hooks_install;
+mod oauth;
 mod i18n;
 mod server;
 mod state;
@@ -429,6 +430,29 @@ fn hide_provider(app: AppHandle, provider: String) {
     let _ = tray::rebuild(&app);
 }
 
+/// Open a URL in the user's browser.
+///
+/// `ShellExecuteW`, not `cmd /C start`. The shell was fine while every URL here was a bare
+/// page address, and stops being fine the moment one carries a query: `cmd.exe` reparses its
+/// command line and treats `&` as a command separator, so an OAuth authorize URL - which is
+/// nothing but `&`-joined parameters - was cut off at the first one. The sign-in would have
+/// failed with an error from Anthropic about a missing parameter, pointing at the wrong thing
+/// entirely. No shell, no reparsing, no quoting rules to get right.
+pub fn open_in_browser(url: &str) {
+    #[cfg(windows)]
+    {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = url;
+}
+
 /// A click on a cell opens that provider's usage page
 #[tauri::command]
 fn open_provider_page(provider: String) {
@@ -438,14 +462,32 @@ fn open_provider_page(provider: String) {
         "gemini" => "https://antigravity.google",
         _ => "https://claude.ai/settings/usage",
     };
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.args(["/C", "start", "", url]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
+    open_in_browser(url);
+}
+
+/// Start a sign-in: open Anthropic's authorization page and the local page that collects the
+/// code it hands back.
+///
+/// Two tabs rather than one, because Anthropic's callback shows the code on its own page for
+/// copying instead of redirecting to a loopback port - so something has to be waiting to take
+/// the paste. That something is the event server this app already runs, which means no dialog
+/// code, no second window, and a page that can say what went wrong in a sentence.
+pub fn begin_sign_in(app: &AppHandle) {
+    match oauth::begin() {
+        Ok(url) => {
+            let port = {
+                let st = app.state::<AppState>();
+                let c = st.cfg.lock().unwrap();
+                c.port
+            };
+            open_in_browser(&url);
+            open_in_browser(&format!("http://127.0.0.1:{port}/signin"));
+        }
+        Err(e) => {
+            applog(&format!("sign-in could not start: {e}"));
+            let _ = app.emit("notice", format!("Sign-in could not start: {e}"));
+        }
     }
-    let _ = cmd.spawn();
 }
 
 /// Card expansion state: Some(hot rectangles, in **physical pixels** relative to the window's

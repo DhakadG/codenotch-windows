@@ -165,8 +165,58 @@ fn persist(s: &UsageSnapshot) {
     }
 }
 
-/// Reads Claude Code's OAuth credential. Returns (token, expired hint).
+/// The Claude credential to use, and whether it has expired.
+///
+/// One choke point on purpose. The poll loop asks this question at six different decision
+/// points - before the backoff gate, after it, before the request, on a 401 retry - and a
+/// preference expressed in only some of them would be a preference the app applies at random.
+///
+/// **Our own session first.** `oauth::access_token` returns a token this application owns and
+/// has already refreshed if it was close to expiry, so it is never handed back expired; that is
+/// why the second element is false rather than a check. When nobody has signed in here, or the
+/// refresh was rejected, it returns None and the borrowed credential below is used exactly as
+/// before - so a user who never opens the sign-in sees no change at all.
 fn read_credentials() -> Option<(String, bool)> {
+    read_credentials_with_source().map(|(t, e, _)| (t, e))
+}
+
+/// Which credential a token came from.
+///
+/// This exists for one reason: the backoff fingerprint. A 429 deadline is tied to the
+/// credential that earned it, so that a *different* credential is not made to sit out someone
+/// else's hour. Our own access token rotates on every refresh, so fingerprinting it would make
+/// every refresh look like a new credential and silently discard a live rate-limit deadline -
+/// which is precisely the mistake this whole file exists to stop making.
+///
+/// So our session fingerprints as itself, not as its current token. There is only ever one of
+/// them, and it stays the same account across every rotation. Signing out and back in keeps the
+/// deadline too, which is correct: the account is what the server rate limited, not the token.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// This application's own OAuth session.
+    Own,
+    /// Claude Code's credential, borrowed.
+    Borrowed,
+}
+
+fn read_credentials_with_source() -> Option<(String, bool, CredentialSource)> {
+    if let Some(token) = crate::oauth::access_token() {
+        return Some((token, false, CredentialSource::Own));
+    }
+    read_borrowed_credentials().map(|(t, e)| (t, e, CredentialSource::Borrowed))
+}
+
+/// What to fingerprint for a given credential: a constant for ours, the token for a borrowed
+/// one. See `CredentialSource`.
+fn fingerprint_input(token: &str, source: CredentialSource) -> String {
+    match source {
+        CredentialSource::Own => "codenotch-own-oauth-session".to_string(),
+        CredentialSource::Borrowed => token.to_string(),
+    }
+}
+
+/// Claude Code's own credential, read and never written. Returns (token, expired hint).
+fn read_borrowed_credentials() -> Option<(String, bool)> {
     let home = dirs::home_dir()?;
     for name in [".credentials.json", "credentials.json"] {
         let p = home.join(".claude").join(name);
@@ -586,7 +636,8 @@ pub fn start(app: AppHandle) {
             // the note of whose it was did not, and a fresh credential B waited out A's
             // hour for nothing.
             {
-                let current = read_credentials().map(|(t, _)| credential_fingerprint(&t));
+                let current = read_credentials_with_source()
+                    .map(|(t, _, src)| credential_fingerprint(&fingerprint_input(&t, src)));
                 let st = app.state::<AppState>();
                 let mut u = st.usage.lock().unwrap();
                 let mismatch = u.backoff_until > 0
@@ -666,7 +717,7 @@ pub fn start(app: AppHandle) {
             if read_credentials().is_none() {
                 set_and_broadcast(&app, |u| {
                     u.status = if u.windows.is_empty() { "needsAuth".into() } else { "stale".into() };
-                    u.note = "No Claude Code credential found. Run `claude` in a terminal and sign in.".into();
+                    u.note = "Not signed in. Right-click the tray icon and choose Sign in to Claude - or run `claude` in a terminal, and Codenotch will borrow that credential instead.".into();
                 });
                 forced = sleep_interruptible(POLL_ACTIVE_SECS);
                 continue;
@@ -708,7 +759,7 @@ pub fn start(app: AppHandle) {
             match read_credentials() {
                 None => set_and_broadcast(&app, |u| {
                     u.status = "needsAuth".into();
-                    u.note = "No Claude Code credential found".into();
+                    u.note = "Not signed in - right-click the tray icon and choose Sign in to Claude".into();
                 }),
                 // Reachable despite the check above: the credential is read again here, and
                 // in between it can have expired on the clock, or Claude Code can have
@@ -757,7 +808,14 @@ pub fn start(app: AppHandle) {
                         Err(FetchErr::RateLimited(ra)) => {
                             consecutive_429 += 1;
                             let wait = backoff_secs(consecutive_429 - 1, ra);
-                            let fingerprint = credential_fingerprint(&token);
+                            // Fingerprinted by source, not by the token: ours rotates, and a
+                            // rotation must not read as a new credential and drop this deadline.
+                            let fingerprint = credential_fingerprint(&fingerprint_input(
+                                &token,
+                                read_credentials_with_source()
+                                    .map(|(_, _, s)| s)
+                                    .unwrap_or(CredentialSource::Borrowed),
+                            ));
                             set_and_broadcast(&app, |u| {
                                 u.backoff_for = fingerprint;
                                 // The status is always set, never left as whatever the

@@ -393,3 +393,29 @@ fn retry_after_raises_the_backoff_but_never_lowers_it() {
     // about the account's state than the cap does, and ignoring it earns a harder limit.
     assert_eq!(backoff_secs(4, 3600), 3600);
 }
+
+/// The backoff fingerprint has to be stable across a token rotation for our own session, and
+/// has to keep distinguishing borrowed credentials from each other.
+///
+/// This is the trap the whole file is built around: a 429 deadline is tied to the credential
+/// that earned it, and our access token changes on every refresh. Fingerprinting the token
+/// would make each refresh look like a new credential, discard a live rate-limit deadline, and
+/// go straight back to the endpoint that had just said no.
+#[test]
+fn our_own_session_fingerprints_the_same_across_a_rotation() {
+    use super::{credential_fingerprint, fingerprint_input, CredentialSource};
+    let before = credential_fingerprint(&fingerprint_input("access-token-v1", CredentialSource::Own));
+    let after = credential_fingerprint(&fingerprint_input("access-token-v2", CredentialSource::Own));
+    assert_eq!(before, after, "a refresh must not read as a different credential");
+
+    // Borrowed credentials still tell each other apart, which is what the mechanism was for.
+    let a = credential_fingerprint(&fingerprint_input("claude-code-token-a", CredentialSource::Borrowed));
+    let b = credential_fingerprint(&fingerprint_input("claude-code-token-b", CredentialSource::Borrowed));
+    assert_ne!(a, b);
+
+    // And ours is never confused with a borrowed one that happens to hold the same string.
+    assert_ne!(
+        credential_fingerprint(&fingerprint_input("same", CredentialSource::Own)),
+        credential_fingerprint(&fingerprint_input("same", CredentialSource::Borrowed))
+    );
+}
