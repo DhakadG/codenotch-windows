@@ -147,6 +147,12 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     let auto = CheckMenuItemBuilder::with_id("autostart", tr(lang, "autostart"))
         .checked(crate::autostart::is_enabled())
         .build(app)?;
+    // Offered only when it would change something: a faster shell exists, and the one in use
+    // is slow enough for the difference to matter. `probe_shell` runs the shell five times, so
+    // it is measured once here rather than on every menu rebuild.
+    let faster_shell = crate::hooks_install::cached_faster_shell();
+    let speed_up = MenuItemBuilder::with_id("speed-up-hooks", tr(lang, "speed_up_hooks")).build(app)?;
+
     let quit = MenuItemBuilder::with_id("quit", tr(lang, "quit")).build(app)?;
     // Only the action that applies. Offering "install hooks" to someone who already has
     // them, next to "uninstall hooks", makes the user work out the current state from a
@@ -156,8 +162,11 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     } else {
         &install
     };
-    MenuBuilder::new(app)
-        .items(&[hook_item])
+    let mut builder = MenuBuilder::new(app).items(&[hook_item]);
+    if faster_shell.is_some() {
+        builder = builder.item(&speed_up);
+    }
+    builder
         .item(&sign_item)
         .item(&start_window)
         .item(&auto_window)
@@ -321,6 +330,13 @@ fn handle(app: &AppHandle, id: &str) {
             // ceiling on a number that has not changed - the reading is about the account,
             // and the account is the same one whether this app or Claude Code is holding the
             // credential. The next scheduled poll picks up the fallback on its own.
+            refresh_menu(app);
+        }
+        "speed-up-hooks" => {
+            match crate::hooks_install::cached_faster_shell() {
+                Some(path) => notice(app, crate::hooks_install::use_faster_shell(&path)),
+                None => notice(app, Ok("The shell Claude Code uses is already fast.".into())),
+            }
             refresh_menu(app);
         }
         "reset" => crate::reset_bar(app),
