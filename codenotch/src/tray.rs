@@ -1,6 +1,6 @@
 use crate::hooks_install;
 use crate::i18n::tr;
-use tauri::menu::{CheckMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+use tauri::menu::{CheckMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
@@ -22,122 +22,31 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// The tray menu, deliberately short.
+///
+/// It used to carry everything: a Providers submenu, a Ring shows submenu, a six-item Show
+/// submenu, three display modes, the float toggle, sign in and out, two window-starter items,
+/// the hook shortcut, a language submenu, and five plain items. That is not a menu, it is a
+/// settings window that opens sideways and forgets its own state - and the entry in the roadmap
+/// saying so was written when it held a third of that.
+///
+/// What is left is the things you reach for *from the tray*: the state the tray is for
+/// (sign in, hooks), the action you want without opening anything (refresh), and the way in to
+/// everything else. The rest lives in the settings window, where a setting can have a sentence
+/// next to it explaining what it costs.
 pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     let install = MenuItemBuilder::with_id("install", tr(lang, "install")).build(app)?;
     let uninstall = MenuItemBuilder::with_id("uninstall", tr(lang, "uninstall")).build(app)?;
-    let l_auto = CheckMenuItemBuilder::with_id("lang-auto", tr(lang, "lang_auto"))
-        .checked(lang == "auto")
-        .build(app)?;
-    let l_zh = CheckMenuItemBuilder::with_id("lang-zh", "中文")
-        .checked(lang == "zh")
-        .build(app)?;
-    let l_en = CheckMenuItemBuilder::with_id("lang-en", "English")
-        .checked(lang == "en")
-        .build(app)?;
-    let l_ja = CheckMenuItemBuilder::with_id("lang-ja", "日本語")
-        .checked(lang == "ja")
-        .build(app)?;
-    let l_ko = CheckMenuItemBuilder::with_id("lang-ko", "한국어")
-        .checked(lang == "ko")
-        .build(app)?;
-    let lang_menu = SubmenuBuilder::new(app, tr(lang, "language"))
-        .items(&[&l_auto, &l_zh, &l_en, &l_ja, &l_ko])
-        .build()?;
-    // Providers the user can switch off, and which window the ring follows. Both read their
-    // checked state from the config, so the menu always shows what is actually in effect
-    // rather than what was in effect when the menu was last built.
-    let (hidden, ring_window) = {
-        let st = app.state::<crate::AppState>();
-        let c = st.cfg.lock().unwrap();
-        (c.hidden_providers.clone(), c.ring_window.clone())
+    // Only the action that applies. Offering "install hooks" to someone who already has them,
+    // next to "uninstall hooks", makes the user work out the current state from a menu that
+    // could simply have told them.
+    let hook_item: &dyn tauri::menu::IsMenuItem<Wry> = if hooks_install::is_installed() {
+        &uninstall
+    } else {
+        &install
     };
-    let mut provider_items = Vec::new();
-    for (id, label) in [
-        ("claude", "Claude"),
-        ("codex", "Codex"),
-        ("cursor", "Cursor"),
-        ("gemini", "Antigravity"),
-    ] {
-        provider_items.push(
-            CheckMenuItemBuilder::with_id(format!("prov-{id}"), label)
-                .checked(!hidden.iter().any(|h| h == id))
-                .build(app)?,
-        );
-    }
-    let provider_menu = SubmenuBuilder::new(app, tr(lang, "providers"))
-        .items(&provider_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<Wry>).collect::<Vec<_>>())
-        .build()?;
 
-    let r_auto = CheckMenuItemBuilder::with_id("ring-auto", tr(lang, "ring_auto"))
-        .checked(ring_window == "auto")
-        .build(app)?;
-    let r_session = CheckMenuItemBuilder::with_id("ring-session", tr(lang, "ring_session"))
-        .checked(ring_window == "session")
-        .build(app)?;
-    let r_weekly = CheckMenuItemBuilder::with_id("ring-weekly", tr(lang, "ring_weekly"))
-        .checked(ring_window == "weekly")
-        .build(app)?;
-    let ring_menu = SubmenuBuilder::new(app, tr(lang, "ring_shows"))
-        .items(&[&r_auto, &r_session, &r_weekly])
-        .build()?;
-
-    // Parts of a cell, each switchable on its own. The id after "show-" is the config field,
-    // so adding one here and in `Config` is the whole change.
-    let show = {
-        let st = app.state::<crate::AppState>();
-        let c = st.cfg.lock().unwrap();
-        [
-            ("percent", c.show_percent),
-            ("countdown", c.show_countdown),
-            ("pace_tick", c.show_pace_tick),
-            ("activity_arc", c.show_activity_arc),
-            ("weekly_ring", c.show_weekly_ring),
-            ("hour_marks", c.show_hour_marks),
-            ("stale_warning", c.show_stale_warning),
-        ]
-    };
-    let mut show_items = Vec::new();
-    for (name, on) in show {
-        show_items.push(
-            CheckMenuItemBuilder::with_id(format!("show-{name}"), tr(lang, &format!("show_{name}")))
-                .checked(on)
-                .build(app)?,
-        );
-    }
-    let show_menu = SubmenuBuilder::new(app, tr(lang, "show"))
-        .items(&show_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<Wry>).collect::<Vec<_>>())
-        .build()?;
-
-    // Three that change what the readings mean rather than which decorations are drawn, so
-    // they sit beside the pill's own options rather than inside "Show".
-    let mut mode_items = Vec::new();
-    for (name, on) in {
-        let st = app.state::<crate::AppState>();
-        let c = st.cfg.lock().unwrap();
-        [
-            ("notify_threshold", c.notify_threshold),
-            ("remaining_mode", c.remaining_mode),
-            ("colorblind", c.colorblind),
-        ]
-    } {
-        mode_items.push(
-            CheckMenuItemBuilder::with_id(format!("show-{name}"), tr(lang, name))
-                .checked(on)
-                .build(app)?,
-        );
-    }
-
-    let float_pill = CheckMenuItemBuilder::with_id("float-pill", tr(lang, "float_pill"))
-        .checked({
-            let st = app.state::<crate::AppState>();
-            let c = st.cfg.lock().unwrap();
-            c.float_pill
-        })
-        .build(app)?;
-
-    // Sign in, or sign out - never both. Which one applies is knowable, so offering the pair
-    // and letting the user work out which is live would be the menu asking a question it can
-    // answer itself, the same reasoning as the hook item below.
+    // Sign in, or sign out - never both, for the same reason.
     let signed_in = crate::oauth::is_signed_in();
     let sign_item = MenuItemBuilder::with_id(
         if signed_in { "sign-out" } else { "sign-in" },
@@ -145,45 +54,24 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     )
     .build(app)?;
 
-    // Offered only when there is a session of its own to send from. Sending inference on
-    // Claude Code's borrowed credential is a line this app does not cross, so an item that
-    // could only ever say so is an item not worth showing.
+    // Offered only when it would change something: a faster shell exists, and the one in use is
+    // slow enough for the difference to matter. Measured once per process, not per rebuild.
+    let faster_shell = crate::hooks_install::cached_faster_shell();
+    let speed_up =
+        MenuItemBuilder::with_id("speed-up-hooks", tr(lang, "speed_up_hooks")).build(app)?;
+
     let start_window = MenuItemBuilder::with_id("start-window", tr(lang, "start_window"))
         .enabled(signed_in)
         .build(app)?;
-
-    let auto_window = CheckMenuItemBuilder::with_id("auto-window", tr(lang, "auto_start_window"))
-        .checked({
-            let st = app.state::<crate::AppState>();
-            let c = st.cfg.lock().unwrap();
-            c.auto_start_window
-        })
-        .enabled(signed_in)
-        .build(app)?;
-
+    let settings = MenuItemBuilder::with_id("settings", tr(lang, "settings")).build(app)?;
     let refresh = MenuItemBuilder::with_id("refresh", tr(lang, "refresh")).build(app)?;
     let refresh_creds =
         MenuItemBuilder::with_id("refresh-creds", tr(lang, "refresh_creds")).build(app)?;
-    let reset = MenuItemBuilder::with_id("reset", tr(lang, "reset_pos")).build(app)?;
-    let open_data = MenuItemBuilder::with_id("open-data", tr(lang, "open_data")).build(app)?;
     let auto = CheckMenuItemBuilder::with_id("autostart", tr(lang, "autostart"))
         .checked(crate::autostart::is_enabled())
         .build(app)?;
-    // Offered only when it would change something: a faster shell exists, and the one in use
-    // is slow enough for the difference to matter. `probe_shell` runs the shell five times, so
-    // it is measured once here rather than on every menu rebuild.
-    let faster_shell = crate::hooks_install::cached_faster_shell();
-    let speed_up = MenuItemBuilder::with_id("speed-up-hooks", tr(lang, "speed_up_hooks")).build(app)?;
-
     let quit = MenuItemBuilder::with_id("quit", tr(lang, "quit")).build(app)?;
-    // Only the action that applies. Offering "install hooks" to someone who already has
-    // them, next to "uninstall hooks", makes the user work out the current state from a
-    // menu that could simply have told them.
-    let hook_item: &dyn tauri::menu::IsMenuItem<Wry> = if hooks_install::is_installed() {
-        &uninstall
-    } else {
-        &install
-    };
+
     let mut builder = MenuBuilder::new(app).items(&[hook_item]);
     if faster_shell.is_some() {
         builder = builder.item(&speed_up);
@@ -191,18 +79,10 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     builder
         .item(&sign_item)
         .item(&start_window)
-        .item(&auto_window)
         .separator()
-        .item(&provider_menu)
-        .item(&ring_menu)
-        .item(&show_menu)
-        .items(&mode_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<Wry>).collect::<Vec<_>>())
-        .item(&float_pill)
-        .item(&lang_menu)
+        .item(&settings)
         .item(&refresh)
         .item(&refresh_creds)
-        .item(&reset)
-        .item(&open_data)
         .item(&auto)
         .separator()
         .item(&quit)
@@ -368,6 +248,7 @@ fn handle(app: &AppHandle, id: &str) {
             }
             refresh_menu(app);
         }
+        "settings" => crate::open_settings(app),
         "reset" => crate::reset_bar(app),
         "open-data" => {
             let dir = crate::config::config_path().parent().map(|p| p.to_path_buf()).unwrap_or_default();

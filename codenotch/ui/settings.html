@@ -1,0 +1,219 @@
+<meta charset="UTF-8">
+<title>Codenotch settings</title>
+<style>
+  /* Deliberately plain, and deliberately not the pill's stylesheet.
+     The notch is a glanceable object on someone's wallpaper; this is a form they read once and
+     close. Sharing a stylesheet between the two would make every change to one a risk to the
+     other, and the only thing they genuinely share is the palette. */
+  :root{
+    --bg:#161616; --panel:#1e1e1e; --line:#2f2f2f; --text:#e8e8ea; --dim:#9a9a9a;
+    --accent:#c96442;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;background:var(--bg);color:var(--text);
+    font:13px/1.5 "Segoe UI",system-ui,sans-serif;
+  }
+  header{
+    position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);
+    padding:14px 18px 10px;z-index:2;
+  }
+  h1{font-size:15px;margin:0}
+  #build{color:var(--dim);font-size:11px;margin-top:2px}
+  main{padding:6px 18px 24px;max-width:640px}
+  section{border-bottom:1px solid var(--line);padding:14px 0}
+  section:last-of-type{border-bottom:none}
+  h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);
+     margin:0 0 10px;font-weight:600}
+  .row{display:flex;align-items:center;gap:10px;padding:3px 0}
+  .row label{flex:1;cursor:pointer}
+  .hint{color:var(--dim);font-size:11px;margin:-2px 0 8px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:2px 14px}
+  select,input[type=range]{background:var(--panel);color:var(--text);border:1px solid var(--line);
+    border-radius:6px;padding:5px 7px;font:inherit}
+  input[type=range]{padding:0;width:150px}
+  input[type=checkbox],input[type=radio]{accent-color:var(--accent);width:15px;height:15px}
+  .val{color:var(--dim);min-width:52px;text-align:right;font-variant-numeric:tabular-nums}
+  button{
+    background:var(--accent);color:#fff;border:0;border-radius:6px;padding:6px 12px;
+    font:inherit;cursor:pointer;
+  }
+  button.secondary{background:var(--panel);color:var(--text);border:1px solid var(--line)}
+  #saved{color:#7bd88f;font-size:11px;opacity:0;transition:opacity 160ms}
+  #saved.show{opacity:1}
+  .actions{display:flex;gap:8px;align-items:center;padding-top:6px}
+</style>
+
+<header>
+  <h1>Codenotch settings</h1>
+  <div id="build">…</div>
+</header>
+
+<main>
+  <section>
+    <h2>Where it sits</h2>
+    <div class="row"><label for="edge">Screen edge</label>
+      <select id="edge">
+        <option value="right">Right</option><option value="left">Left</option>
+        <option value="top">Top</option><option value="bottom">Bottom</option>
+      </select></div>
+    <div class="hint">Top and bottom lay the cells out in a row, because a column of them hung
+      off the top of the screen would reach a quarter of the way down it.</div>
+    <div class="row"><label for="monitor">Display</label>
+      <select id="monitor"></select></div>
+    <div class="hint">A display that is later unplugged falls back to the primary one, so the
+      pill never ends up on a screen that is not there.</div>
+    <div class="row"><label for="opacity">Opacity</label>
+      <input type="range" id="opacity" min="25" max="100" step="5">
+      <span class="val" id="opacityVal"></span></div>
+    <div class="row"><input type="checkbox" id="float_pill"><label for="float_pill">Float clear of the edge</label></div>
+    <div class="row"><input type="checkbox" id="hide_on_fullscreen"><label for="hide_on_fullscreen">Hide when something is full screen</label></div>
+    <div class="hint">Only on the display the pill is on. A film on one screen is no reason to
+      hide the pill on another.</div>
+  </section>
+
+  <section>
+    <h2>Providers</h2>
+    <div class="hint">Switching one off stops it being polled at all, not merely hidden.</div>
+    <div class="grid" id="providers"></div>
+  </section>
+
+  <section>
+    <h2>The ring</h2>
+    <div class="row"><label for="ring_window">Thick ring shows</label>
+      <select id="ring_window">
+        <option value="auto">Whichever is most used</option>
+        <option value="session">The 5-hour window</option>
+        <option value="weekly">The weekly window</option>
+      </select></div>
+    <div class="row"><label for="red_threshold">Red starts at</label>
+      <input type="range" id="red_threshold" min="50" max="95" step="5">
+      <span class="val" id="redVal"></span></div>
+    <div class="grid" id="show"></div>
+  </section>
+
+  <section>
+    <h2>How the numbers read</h2>
+    <div class="row"><input type="checkbox" id="remaining_mode"><label for="remaining_mode">Show what is left, not what is spent</label></div>
+    <div class="row"><input type="checkbox" id="colorblind"><label for="colorblind">Colourblind palette</label></div>
+    <div class="row"><input type="checkbox" id="notify_threshold"><label for="notify_threshold">Notify when a window fills up</label></div>
+  </section>
+
+  <section>
+    <h2>The five-hour window</h2>
+    <div class="row"><input type="checkbox" id="auto_start_window"><label for="auto_start_window">Start the next window automatically</label></div>
+    <div class="hint">Sends one small message a few seconds after each reset, so the window lands
+      where you decided rather than wherever the first message of the day fell. This is the one
+      setting here that spends something. Needs a Claude sign-in of this app's own.</div>
+  </section>
+
+  <section>
+    <h2>Application</h2>
+    <div class="row"><label for="lang">Language</label>
+      <select id="lang">
+        <option value="auto">Follow system</option><option value="en">English</option>
+        <option value="zh">中文</option><option value="ja">日本語</option><option value="ko">한국어</option>
+      </select></div>
+    <div class="actions">
+      <button class="secondary" id="openData">Open data folder</button>
+      <button class="secondary" id="resetPos">Reset position</button>
+    </div>
+  </section>
+
+  <div class="actions" style="padding-top:14px">
+    <button id="save">Save</button>
+    <span id="saved">Saved</span>
+  </div>
+</main>
+
+<script>
+const invoke = window.__TAURI__.core.invoke;
+
+/* Every switchable part of a cell, with the label the tray used to carry.
+   One list rather than a block of hand-written rows: adding a setting is a line here and a
+   field in `Config`, which is what stops the two drifting apart. */
+const SHOW = [
+  ['show_percent','Percentage'],
+  ['show_countdown','Time until reset'],
+  ['show_pace_tick','Pace mark'],
+  ['show_activity_arc','Activity arc'],
+  ['show_weekly_ring','Weekly ring'],
+  ['show_hour_marks','Hour marks'],
+  ['show_stale_warning','Stale warning dot'],
+];
+const PROVIDERS = [['claude','Claude'],['codex','Codex'],['cursor','Cursor'],['gemini','Antigravity']];
+
+function checkbox(id,label){
+  return `<div class="row"><input type="checkbox" id="${id}"><label for="${id}">${label}</label></div>`;
+}
+document.getElementById('show').innerHTML = SHOW.map(([id,l])=>checkbox(id,l)).join('');
+document.getElementById('providers').innerHTML = PROVIDERS.map(([id,l])=>checkbox('prov_'+id,l)).join('');
+
+let cfg = null;
+
+function bindRange(id,valId,fmt){
+  const r=document.getElementById(id), v=document.getElementById(valId);
+  const show=()=>v.textContent=fmt(+r.value);
+  r.addEventListener('input',show); show();
+}
+bindRange('opacity','opacityVal',n=>n+'%');
+bindRange('red_threshold','redVal',n=>n+'%');
+
+async function load(){
+  cfg = await invoke('settings_load');
+  document.getElementById('build').textContent = cfg.build;
+  for(const [id] of SHOW) document.getElementById(id).checked = !!cfg[id];
+  for(const id of ['float_pill','hide_on_fullscreen','remaining_mode','colorblind',
+                   'notify_threshold','auto_start_window']){
+    document.getElementById(id).checked = !!cfg[id];
+  }
+  // Stored as the set that is *off*, shown as the set that is on. The stored form is the one
+  // that makes a provider added in a later version appear by default rather than stay dark.
+  for(const [id] of PROVIDERS){
+    document.getElementById('prov_'+id).checked = !cfg.hidden_providers.includes(id);
+  }
+  document.getElementById('edge').value = cfg.edge;
+  document.getElementById('ring_window').value = cfg.ring_window;
+  document.getElementById('lang').value = cfg.lang;
+  document.getElementById('opacity').value = Math.round(cfg.opacity*100);
+  document.getElementById('red_threshold').value = Math.round(cfg.red_threshold*100);
+  document.getElementById('opacity').dispatchEvent(new Event('input'));
+  document.getElementById('red_threshold').dispatchEvent(new Event('input'));
+
+  const sel = document.getElementById('monitor');
+  sel.innerHTML = cfg.monitors.map(m=>`<option value="${m.id}">${m.label}</option>`).join('');
+  // A display that is no longer attached is still the stored choice, so it is offered rather
+  // than silently replaced - otherwise saving this form would quietly forget it.
+  if(!cfg.monitors.some(m=>m.id===cfg.monitor)){
+    sel.insertAdjacentHTML('beforeend',
+      `<option value="${cfg.monitor}">${cfg.monitor} (not attached)</option>`);
+  }
+  sel.value = cfg.monitor;
+}
+
+async function save(){
+  const next = Object.assign({}, cfg);
+  for(const [id] of SHOW) next[id] = document.getElementById(id).checked;
+  for(const id of ['float_pill','hide_on_fullscreen','remaining_mode','colorblind',
+                   'notify_threshold','auto_start_window']){
+    next[id] = document.getElementById(id).checked;
+  }
+  next.hidden_providers = PROVIDERS
+    .filter(([id])=>!document.getElementById('prov_'+id).checked).map(([id])=>id);
+  next.edge = document.getElementById('edge').value;
+  next.monitor = document.getElementById('monitor').value;
+  next.ring_window = document.getElementById('ring_window').value;
+  next.lang = document.getElementById('lang').value;
+  next.opacity = +document.getElementById('opacity').value/100;
+  next.red_threshold = +document.getElementById('red_threshold').value/100;
+  await invoke('settings_save',{next});
+  cfg = next;
+  const s=document.getElementById('saved');
+  s.classList.add('show'); setTimeout(()=>s.classList.remove('show'),1400);
+}
+
+document.getElementById('save').addEventListener('click',save);
+document.getElementById('openData').addEventListener('click',()=>invoke('open_data_folder'));
+document.getElementById('resetPos').addEventListener('click',()=>invoke('reset_position'));
+load();
+</script>
