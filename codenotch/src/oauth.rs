@@ -196,8 +196,14 @@ pub fn load() -> Option<Token> {
             return None;
         }
         let cred = &*pcred;
-        let blob = std::slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize)
-            .to_vec();
+        // A generic credential can legitimately carry no blob - something else may have
+        // written the target name with only a user name - and `from_raw_parts` on a null
+        // pointer is undefined behaviour rather than an empty slice.
+        let blob = if cred.CredentialBlob.is_null() || cred.CredentialBlobSize == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize).to_vec()
+        };
         CredFree(pcred as *const _);
         serde_json::from_slice(&blob).ok()
     }
@@ -407,10 +413,18 @@ pub(crate) fn parse_token_response(text: &str, now: u64) -> Result<Token, String
         .to_string();
     // `expires_in` is seconds from now. A response without one is stored as 0, which
     // `needs_refresh` reads as "refresh before every use".
+    //
+    // Clamped at both ends, because both ends have a failure mode. A lifetime shorter than the
+    // refresh skew means every call refreshes, which turns one poll into a token request; a
+    // lifetime of years - a malformed or hostile response - means a dead token is used forever
+    // and the app looks permanently signed out with no way to notice. A day is longer than
+    // anything this endpoint issues and short enough that being wrong costs one refresh.
+    const MIN_LIFETIME: u64 = REFRESH_SKEW_SECS + 60;
+    const MAX_LIFETIME: u64 = 24 * 60 * 60;
     let expires_at = v
         .get("expires_in")
         .and_then(|x| x.as_u64())
-        .map(|s| now + s)
+        .map(|s| now + s.clamp(MIN_LIFETIME, MAX_LIFETIME))
         .unwrap_or(0);
     Ok(Token {
         access_token: access,

@@ -31,6 +31,7 @@ windows = { version = "0.58", features = [
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_Security_Credentials",
   "Win32_Security_Cryptography",
+  "Win32_UI_Shell",
   "Win32_Graphics_Gdi",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_System_Threading",

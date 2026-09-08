@@ -432,18 +432,25 @@ fn hide_provider(app: AppHandle, provider: String) {
 
 /// Open a URL in the user's browser.
 ///
-/// `cmd /C start` rather than ShellExecute: it is what this file already used for provider
-/// pages, and the empty second argument is the window title `start` insists on before it will
-/// treat a quoted string as the target.
+/// `ShellExecuteW`, not `cmd /C start`. The shell was fine while every URL here was a bare
+/// page address, and stops being fine the moment one carries a query: `cmd.exe` reparses its
+/// command line and treats `&` as a command separator, so an OAuth authorize URL - which is
+/// nothing but `&`-joined parameters - was cut off at the first one. The sign-in would have
+/// failed with an error from Anthropic about a missing parameter, pointing at the wrong thing
+/// entirely. No shell, no reparsing, no quoting rules to get right.
 pub fn open_in_browser(url: &str) {
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.args(["/C", "start", "", url]);
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+        }
     }
-    let _ = cmd.spawn();
+    #[cfg(not(windows))]
+    let _ = url;
 }
 
 /// A click on a cell opens that provider's usage page

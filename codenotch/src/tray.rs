@@ -253,7 +253,11 @@ fn handle(app: &AppHandle, id: &str) {
             // to borrowing that credential exactly as it did before anyone signed in here.
             let gone = crate::oauth::sign_out();
             crate::applog(&format!("oauth: sign out {}", if gone { "ok" } else { "found nothing" }));
-            crate::usage::request_refresh();
+            // Deliberately no forced refresh. `request_refresh` skips the ten-minute refetch
+            // floor, and signing out repeatedly would then be a way to spend the hourly
+            // ceiling on a number that has not changed - the reading is about the account,
+            // and the account is the same one whether this app or Claude Code is holding the
+            // credential. The next scheduled poll picks up the fallback on its own.
             refresh_menu(app);
         }
         "reset" => crate::reset_bar(app),

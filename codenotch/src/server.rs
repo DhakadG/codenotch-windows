@@ -30,45 +30,69 @@ pub fn start(app: AppHandle, port: u16) {
                 .as_reader()
                 .take(256 * 1024)
                 .read_to_string(&mut body);
-            //
-            // tiny_http serves this loop on one thread, and the sender is codenotch-hook,
-            // which Claude Code runs before and after every tool call. Applying the event
-            // and repainting the notch before replying put all of that on Claude Code's
-            // critical path: a slow broadcast, a locked mutex or a busy WebView became
-            // seconds of latency in someone else's editor, and further hook connections
-            // queued behind it. The reply carries no information - it is the literal string
-            // "ok" - so there is nothing to be gained by making the caller wait for it.
-            // The sign-in page answers with its own body, so it is handled before the blanket
-            // "ok". Everything else keeps the answer-first rule below.
+            // The sign-in page answers with its own body, so it is handled before the
+            // blanket "ok" below.
             if url.starts_with("/signin") {
-                let is_post = *req.method() == tiny_http::Method::Post;
-                let html = if is_post {
-                    let pasted = form_field(&body, "code");
-                    match crate::oauth::complete(&pasted) {
+                if *req.method() != tiny_http::Method::Post {
+                    respond_html(req, signin_page(None));
+                    continue;
+                }
+                // Only this app's own page may submit.
+                //
+                // Listening on loopback stops nothing: any page in any browser on this machine
+                // can POST to 127.0.0.1. Such a page cannot steal anything - it holds no valid
+                // authorization code and this route returns no token - but every attempt would
+                // spend a request against Anthropic's token endpoint, and a loop of them is a
+                // way for a web page to get this machine rate limited. A browser sends `Origin`
+                // on every cross-origin form POST and a page cannot forge it, so requiring our
+                // own costs one comparison.
+                let origin = header_value(&req, "origin");
+                if !origin.is_empty()
+                    && origin != format!("http://127.0.0.1:{port}")
+                    && origin != format!("http://localhost:{port}")
+                {
+                    crate::applog(&format!("oauth: refused a sign-in POST from {origin}"));
+                    respond_html(
+                        req,
+                        signin_page(Some(Err("That request did not come from this page. Open the sign-in page from the tray menu and paste there.".into()))),
+                    );
+                    continue;
+                }
+
+                let pasted = form_field(&body, "code");
+                let app = app.clone();
+                // On its own thread, and this is not a nicety.
+                //
+                // The exchange is an HTTPS round trip to Anthropic with a twenty second
+                // timeout, and this loop is single-threaded and also serves codenotch-hook,
+                // which Claude Code runs on its own critical path. Doing the exchange here
+                // would put up to twenty seconds of someone else's editor latency behind a
+                // sign-in - the same mistake that froze sessions once already.
+                // `tiny_http::Request` is Send, so the reply is simply sent from there.
+                std::thread::spawn(move || {
+                    let outcome = crate::oauth::complete(&pasted);
+                    match &outcome {
                         Ok(()) => {
                             crate::applog("oauth: signed in");
                             crate::usage::request_refresh();
                             let _ = crate::tray::rebuild(&app);
-                            signin_page(Some(Ok(())))
                         }
-                        Err(e) => {
-                            crate::applog(&format!("oauth: sign-in failed: {e}"));
-                            signin_page(Some(Err(e)))
-                        }
+                        Err(e) => crate::applog(&format!("oauth: sign-in failed: {e}")),
                     }
-                } else {
-                    signin_page(None)
-                };
-                let header = "Content-Type: text/html; charset=utf-8".parse::<tiny_http::Header>();
-                let mut response = tiny_http::Response::from_string(html);
-                if let Ok(h) = header {
-                    response.add_header(h);
-                }
-                let _ = req.respond(response);
+                    respond_html(req, signin_page(Some(outcome)));
+                });
                 continue;
             }
 
             // Answer first, work afterwards.
+            //
+            // tiny_http serves this loop on one thread, and the sender is codenotch-hook,
+            // which Claude Code runs before and after every tool call. Applying the event and
+            // repainting the notch before replying put all of that on Claude Code's critical
+            // path: a slow broadcast, a locked mutex or a busy WebView became seconds of
+            // latency in someone else's editor, and further hook connections queued behind it.
+            // The reply carries no information - it is the literal string "ok" - so there is
+            // nothing to be gained by making the caller wait for it.
             let _ = req.respond(tiny_http::Response::from_string("ok"));
 
             if url.starts_with("/event") {
@@ -180,3 +204,21 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
+
+/// One request header by name, lower-cased comparison, empty when absent.
+fn header_value(req: &tiny_http::Request, name: &str) -> String {
+    req.headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str().to_string())
+        .unwrap_or_default()
+}
+
+/// Send an HTML body and consume the request.
+fn respond_html(req: tiny_http::Request, html: String) {
+    let mut response = tiny_http::Response::from_string(html);
+    if let Ok(h) = "Content-Type: text/html; charset=utf-8".parse::<tiny_http::Header>() {
+        response.add_header(h);
+    }
+    let _ = req.respond(response);
+}

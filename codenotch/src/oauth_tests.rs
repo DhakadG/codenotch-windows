@@ -112,3 +112,20 @@ fn random_bytes_are_the_requested_length_and_not_all_one_value() {
     assert_eq!(b.len(), 32);
     assert!(b.iter().any(|x| *x != b[0]), "32 identical bytes is not randomness");
 }
+
+/// A lifetime shorter than the refresh skew would make every call refresh, turning one poll
+/// into a token request; one of years - a malformed or hostile response - would use a dead
+/// token forever and look permanently signed out with nothing to notice.
+#[test]
+fn an_absurd_expires_in_is_clamped_at_both_ends() {
+    let short = parse_token_response(r#"{"access_token":"a","expires_in":1}"#, 1_000).unwrap();
+    assert_eq!(short.expires_at, 1_000 + REFRESH_SKEW_SECS + 60);
+    assert!(!short.needs_refresh(1_000), "a clamped lifetime must not be due immediately");
+
+    let long = parse_token_response(r#"{"access_token":"a","expires_in":99999999}"#, 1_000).unwrap();
+    assert_eq!(long.expires_at, 1_000 + 24 * 60 * 60);
+
+    // An ordinary hour passes through untouched.
+    let normal = parse_token_response(r#"{"access_token":"a","expires_in":3600}"#, 1_000).unwrap();
+    assert_eq!(normal.expires_at, 4_600);
+}
