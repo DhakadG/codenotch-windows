@@ -35,7 +35,38 @@
     bottom:calc(-1 * var(--fillet));
     background:radial-gradient(circle at 0 100%, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px));
   }
-  .cell{display:flex;flex-direction:column;align-items:center;gap:6px}
+  /* Floating: the pill lifts off the bezel instead of growing out of it. The window does not
+     move - only the pill inside it - so placement, dragging and the interactive rectangles are
+     untouched. The fillets go with it: they are the join to the bezel, and a shape that is not
+     touching the bezel has nothing to join. */
+  #root.float #pill{
+    right:8px;border-radius:20px;border-right:1px solid #2e2e2e;
+    box-shadow:0 6px 20px rgba(0,0,0,.45);
+  }
+  #root.float #pill::before,#root.float #pill::after{display:none}
+  /* Press feedback.
+     A click here does something invisible - it asks for a refetch - so without this the only
+     way to know the click registered is to watch the number and hope. The cell dips slightly
+     and dims, which is the gesture every button on the system makes and needs no explaining.
+     transform and opacity only: those are the two properties this WebView can animate without
+     repainting, and a repaint in a transparent always-on-top window stutters the desktop
+     compositor. 90ms out, 160ms back - fast enough to feel like a response rather than an
+     animation, slow enough to be seen on a click that is over in 40ms.
+     `.acted` is a second, brighter beat fired when the action actually goes out, so a click
+     that opens a page and a click that refreshes do not feel identical. */
+  .cell{display:flex;flex-direction:column;align-items:center;gap:6px;
+    transition:transform 160ms cubic-bezier(.2,.7,.3,1),opacity 160ms ease;
+    will-change:transform,opacity}
+  .cell.pressed{transform:scale(.9);opacity:.65;transition-duration:90ms}
+  @keyframes cell-ack{0%{transform:scale(.94)}55%{transform:scale(1.06)}100%{transform:scale(1)}}
+  .cell.acted{animation:cell-ack 260ms cubic-bezier(.2,.7,.3,1)}
+  /* Someone who asked the system to stop animating still needs to know the click landed, so
+     the dip stays and only its motion goes: it becomes an instant state change rather than a
+     transition, and the acknowledgement beat is dropped entirely. */
+  @media (prefers-reduced-motion:reduce){
+    .cell{transition:none}
+    .cell.acted{animation:none}
+  }
   .ringwrap{position:relative;width:56px;height:56px}
   .ringwrap > svg.ring{position:absolute;inset:0;overflow:visible} /* pins only the ring itself; an inline logo svg must not match this or it ends up in the top-left corner */
   .glyph{
@@ -52,14 +83,82 @@
   .c-head .mark{display:inline-block;width:16px;height:16px;color:#e8e8ea;margin-right:2px}
   .c-head .mark svg{width:16px;height:16px;fill:currentColor}
   .pct{font-size:15px;font-weight:600;color:#fff;font-variant-numeric:tabular-nums}
+  /* Time until the ring's window resets. Quiet on purpose: it qualifies the percentage above
+     it rather than competing with it, and 70 pt of pill is not much room. */
+  .cd{font-size:9px;color:#8a8a8a;font-variant-numeric:tabular-nums;letter-spacing:-.2px;margin-top:-3px}
   .dim{opacity:.55}
   /* Session arc animation */
   @keyframes spin{to{transform:rotate(360deg)}}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
-  /* A 60 fps SVG transform animation in a transparent always-on-top window slows the whole desktop
-     compositor (other apps stutter). steps() drops repaints to ~10 fps; it still reads as spinning/breathing. */
-  .arc-spin{animation:spin 1.2s steps(12) infinite;transform-origin:center}
-  .arc-pulse{animation:pulse 1.1s steps(6) infinite}
+  /* Smooth, and still cheap.
+     The original comment here was right about the cause and wrong about the only cure: a 60 fps
+     SVG transform in a transparent always-on-top window did stutter the desktop compositor, so
+     steps(12) cut it to ~10 fps - which is why it read as a slideshow rather than a spinner.
+     The expense was never the frame rate, it was that each frame repainted. `will-change` promotes
+     these two elements to their own compositor layers, after which a transform or an opacity change
+     is handled entirely on the GPU: no repaint, no layout, nothing for the main thread to do per
+     frame. That is the one pair of properties browsers can animate for free, which is exactly why
+     rotation and fade were chosen in the first place.
+     If this ever does cost anything on a weaker GPU, the honest fallback is a longer duration, not
+     a coarser one - 2s linear still reads as motion, steps() reads as a fault. */
+  /* No transform-box here on purpose. The spinner is a partial arc, so fill-box would put the
+     origin at the centre of that fragment's own bounds and it would wobble around the ring
+     instead of turning about it. The SVG default, view-box, is the ring's centre. */
+  .arc-spin{animation:spin 1.2s linear infinite;transform-origin:center;will-change:transform}
+  .arc-pulse{animation:pulse 1.1s ease-in-out infinite;will-change:opacity}
+  /* Amber (waiting on you) to green (working) and back.
+     The two states are drawn as different shapes - a full pulsing circle for attention, a
+     turning arc fragment for running - so there is no single element whose colour can simply
+     be transitioned. Cross-fading the two instead gives the change a duration without
+     pretending one shape becomes the other, and 220 ms is long enough to read as a change of
+     state rather than a flicker, short enough not to lag behind the thing it reports.
+     `attr` is animated rather than opacity alone so a state that arrives mid-fade replaces
+     the old one cleanly instead of compounding with it. */
+  @keyframes arc-in{from{opacity:0}to{opacity:1}}
+  @keyframes arc-out{from{opacity:1}to{opacity:0}}
+  /* Two animations on one element: the state's own motion, and the cross-fade. Listing both
+     keeps the spin or pulse running while the shape fades, so a state does not freeze on its
+     way out. The outgoing element also stops responding to the pointer, since it is on its
+     way to being removed. */
+  .arc-exit{animation:arc-out 220ms ease-in both;pointer-events:none}
+  .arc-exit.arc-spin{animation:arc-out 220ms ease-in both, spin 1.2s linear infinite}
+  .arc-exit.arc-pulse{animation:arc-out 220ms ease-in both, pulse 1.1s ease-in-out infinite}
+  .arc-enter.arc-spin{animation:arc-in 220ms ease-out both, spin 1.2s linear infinite}
+  .arc-enter.arc-pulse{animation:arc-in 220ms ease-out both, pulse 1.1s ease-in-out infinite}
+  /* Someone who has asked the system to stop animating things means it.
+     One block, and `animation:none` rather than a short duration. Shortening the duration
+     looks like the careful choice and is the opposite: these elements carry two animations,
+     the cross-fade and the state's own infinite spin or pulse, and animation-duration applies
+     to both - so setting it to 1ms left the spinner turning a thousand times a second at
+     exactly the person who asked for less movement. The state is still legible without
+     motion: green is present, amber is present and dimmed.
+     The exiting overlay is hidden outright, since with no animation there is no animationend
+     to remove it and it would otherwise sit on top of the incoming one until the fallback
+     timer fired. */
+  @media (prefers-reduced-motion:reduce){
+    .arc-spin,.arc-enter.arc-spin{animation:none}
+    .arc-pulse,.arc-enter.arc-pulse{animation:none;opacity:.6}
+    .arc-enter{animation:none}
+    /* The exit rules come last and match the incoming rules' specificity, because a bare
+       `.arc-exit{opacity:0}` loses to `.arc-exit.arc-pulse{opacity:.6}` above - two classes
+       beat one - and the outgoing amber would sit at 0.6 on top of the state replacing it
+       until the fallback timer removed it. With no animation there is no animationend to
+       trigger that removal promptly, so it has to be invisible from the moment it is marked. */
+    .arc-exit,.arc-exit.arc-spin,.arc-exit.arc-pulse{animation:none;opacity:0}
+  }
+
+  /* Right-click menu. Replaces the WebView's own Back/Reload/Save-as menu, which offers
+     nothing this app can do. Matches the hover card's surface so it reads as part of the
+     application rather than as browser furniture. */
+  #ctx{
+    position:absolute;display:none;z-index:50;min-width:172px;padding:5px;
+    background:#0a0a0a;border:1px solid #232326;border-radius:10px;
+    box-shadow:0 8px 24px rgba(0,0,0,.55);font-size:12px;color:#e8e8ea;
+  }
+  #ctx.show{display:block}
+  .ctx-item{padding:7px 10px;border-radius:6px;white-space:nowrap;cursor:default}
+  .ctx-item:hover{background:#1c1c20}
+  .ctx-sep{height:1px;margin:5px 6px;background:#232326}
 
   /* Hover card, shown to the left of the pill */
   #card{
@@ -103,6 +202,7 @@
   <div id="card"></div>
   <div id="pill"></div><!-- one .cell per provider, stacked vertically (upstream: data-driven, the same layout for 1–5 cells) -->
   <div id="notice"></div>
+<div id="ctx"></div>
 </div>
 <script>
 const invoke = window.__TAURI__.core.invoke;
@@ -140,20 +240,55 @@ function glyphHtml(p,small){
   return small?'':p.glyph; // fallback letter
 }
 // Provider table (order = top to bottom in the pill). `glyph` is the fallback letter used when no mark is available
+/* User preferences, pushed from the tray. Defaults match the previous behaviour exactly, so
+   a config that has never been touched changes nothing. */
+let prefs={hidden_providers:[],ring_window:'auto',show_percent:true,show_countdown:true,show_pace_tick:true,show_activity_arc:true,float_pill:false};
+
 function providers(){
   const list=[{id:'claude',name:'Claude',glyph:'C',snap:usage}];
   if(codexSnap.status!=='absent') list.push({id:'codex',name:'Codex',glyph:'Cx',snap:codexSnap});
   if(cursorSnap.status!=='absent') list.push({id:'cursor',name:'Cursor',glyph:'Cu',snap:cursorSnap});
   if(agSnap.status!=='absent') list.push({id:'gemini',name:'Antigravity',glyph:'Ag',snap:agSnap});
-  return list;
+  return list.filter(p=>!prefs.hidden_providers.includes(p.id));
 }
+
+/* Does this window belong to the 5-hour family or the weekly one?
+   Provider ids differ (`session`, `five_hour`, `primary`, `gemini-5h`), so the grouping is by
+   meaning rather than by a single name. Anything unrecognised belongs to neither and is only
+   ever chosen by "auto". */
+function windowFamily(w){
+  const id=(w.id||'').toLowerCase();
+  if(id==='session'||id==='five_hour'||id==='primary'||id.endsWith('-5h')) return 'session';
+  if(id.startsWith('seven_day')||id.startsWith('weekly')||id.endsWith('-weekly')||id==='secondary') return 'weekly';
+  return '';
+}
+
 function headlineOf(snap){
   if(!snap.windows.length) return null;
   const metered=snap.windows.filter(w=>w.count==null);
+  const pool=metered.length?metered:snap.windows;
+  // A pinned choice only applies when this provider actually has that window; otherwise fall
+  // back to auto rather than showing an empty ring for a window that does not exist here.
+  if(prefs.ring_window!=='auto'){
+    const pick=pool.filter(w=>windowFamily(w)===prefs.ring_window);
+    if(pick.length) return pick.reduce((a,b)=> b.used>a.used?b:a);
+  }
   if(metered.length) return metered.reduce((a,b)=> b.used>a.used?b:a);
   return snap.windows[0];
 }
-function staleOf(snap){ if(snap.status==='stale') return true; return snap.fetched_at>0 && (Date.now()-snap.fetched_at)>5*60*1000; }
+/* How old a reading may be before the cell is dimmed as stale.
+
+   Comfortably above the interval at which a reading is actually refetched, on purpose. With
+   the two equal, a ring dims the moment the first refresh is skipped or fails - which reads
+   as `nothing is being read any more` when what happened is one missed attempt out of many
+   that will keep being made. The upstream macOS app documents the same trap and keeps the
+   same margin.
+
+   This has to be revisited whenever MIN_REFETCH_SECS moves. Raising that floor to ten
+   minutes against a five minute staleness threshold would have left every ring permanently
+   dimmed while showing a perfectly current number. */
+const STALE_AFTER_MS=20*60*1000;
+function staleOf(snap){ if(snap.status==='stale') return true; return snap.fetched_at>0 && (Date.now()-snap.fetched_at)>STALE_AFTER_MS; }
 let stateSnap={sessions:[],agg:'idle'};
 
 function svgArc(r,frac,color,width,extra=''){
@@ -170,17 +305,50 @@ function headline(){ // the cell shows the most constrained window — the one t
 
 function isStale(){
   if(usage.status==='stale') return true;
-  return usage.fetched_at>0 && (Date.now()-usage.fetched_at)>5*60*1000;
+  return usage.fetched_at>0 && (Date.now()-usage.fetched_at)>STALE_AFTER_MS;
+}
+
+/* How long the window behind a reading is, inferred from which window it is.
+   The API sends when a window resets but never how long it runs, so the length has to come
+   from the kind. Only the two lengths that are actually published are claimed; anything else
+   returns 0 and simply gets no tick, because a pace mark drawn against a guessed window
+   length is worse than no pace mark at all. */
+function windowLenMs(w){
+  const id=(w.id||'').toLowerCase();
+  if(id==='session'||id==='five_hour'||id==='primary'||id.endsWith('-5h')||id==='extra_usage_5h') return 5*3600*1000;
+  if(id.startsWith('seven_day')||id.startsWith('weekly')||id.endsWith('-weekly')||id==='secondary') return 7*24*3600*1000;
+  return 0;
+}
+
+/* A mark on the ring showing how far through the reset window you are.
+   Usage alone cannot tell you whether you are in trouble: 60% used is comfortable an hour
+   before a reset and alarming five minutes in. The tick is the second half of that sentence,
+   and the same idea as the pace tick in the taskbar mod. Drawn as a dark line under a light
+   one so it stays visible over any ring colour, including where it crosses the filled arc. */
+function paceTick(w){
+  const len=windowLenMs(w);
+  if(!len||!w.resets_at) return '';
+  const remain=w.resets_at-Date.now();
+  // Outside the window we assumed, the assumption is wrong, so draw nothing rather than
+  // pinning the mark misleadingly at one end.
+  if(remain<=0||remain>len) return '';
+  const th=((1-remain/len)*360-90)*Math.PI/180;
+  const c=Math.cos(th), s=Math.sin(th);
+  const p=(r)=>[(28+r*c).toFixed(2),(28+r*s).toFixed(2)];
+  const [x1,y1]=p(21.9), [x2,y2]=p(28);
+  return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#0a0a0a" stroke-width="2.6" stroke-linecap="butt"/>`
+       + `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#f2f2f4" stroke-width="1.1" stroke-linecap="butt"/>`;
 }
 
 function renderRing(){
   const ps=providers();
+  document.getElementById('root').classList.toggle('float',!!prefs.float_pill);
   // Rebuild the DOM only when the structure changes (never swap the element under the cursor)
   const want=ps.map(p=>p.id+':'+(glyphs[p.id]?glyphs[p.id].kind:'-')).join(',');
   if(pill.dataset.cells!==want){
     pill.innerHTML=ps.map(p=>`<div class="cell" data-p="${p.id}">
-      <div class="ringwrap"><svg class="ring" viewBox="0 0 56 56"></svg><div class="glyph ${(!glyphs[p.id]&&p.glyph.length>1)?'small':''}">${glyphHtml(p)}</div></div>
-      <div class="pct">—</div></div>`).join('');
+      <div class="ringwrap"><svg class="ring" viewBox="0 0 56 56"><g class="base"></g></svg><div class="glyph ${(!glyphs[p.id]&&p.glyph.length>1)?'small':''}">${glyphHtml(p)}</div></div>
+      <div class="pct">—</div><div class="cd"></div></div>`).join('');
     pill.dataset.cells=want;
   }
   for(const p of ps){
@@ -188,17 +356,64 @@ function renderRing(){
     const svg=cell.querySelector('svg.ring'), pct=cell.querySelector('.pct'), glyph=cell.querySelector('.glyph'), wrap=cell.querySelector('.ringwrap');
     const h=headlineOf(p.snap);
     let inner=`<circle cx="28" cy="28" r="22" fill="#2a2a2a"/><circle cx="28" cy="28" r="25" fill="none" stroke="${TRACK}" stroke-width="5"/>`;
-    if(h && h.count==null) inner+=svgArc(25,Math.min(h.used,1),tone(h.used),5);
-    { // thin inner arc: spinning = working, amber pulse = waiting on you (one animation for all four, different sources)
-      const ws=workState(p.id);
-      if(ws==='running') inner+=`<g class="arc-spin">${svgArc(19,0.28,RUNGREEN,2.5)}</g>`;
-      else if(ws==='attention') inner+=`<g class="arc-pulse"><circle cx="28" cy="28" r="19" fill="none" stroke="${AMBER}" stroke-width="2.5"/></g>`;
+    if(h && h.count==null){
+      inner+=svgArc(25,Math.min(h.used,1),tone(h.used),5);
+      // Only for a metered window, and only when it is not stale: a pace mark computed from
+      // a reading of unknown age would point at a moment that has already passed.
+      if(prefs.show_pace_tick && !staleOf(p.snap)) inner+=paceTick(h);
     }
-    svg.innerHTML=inner;
+    // Only the base layer is rewritten. The animated arc is a sibling that survives, because
+    // replacing a node restarts its CSS animation - and this function runs on every usage,
+    // state, glyph and preference event as well as every 30 seconds, so the spinner was being
+    // yanked back to zero degrees several times a minute. That, not the frame rate alone, is
+    // what made it look broken.
+    svg.querySelector('g.base').innerHTML=inner;
+    { // thin inner arc: spinning = working, amber pulse = waiting on you (one animation for all four, different sources)
+      const ws=prefs.show_activity_arc?workState(p.id):'idle';
+      if(cell.dataset.ws!==ws){
+        cell.dataset.ws=ws;
+        // Fade the outgoing shape out *while* the incoming one fades in, rather than
+        // removing it first. Deleting it immediately meant amber vanished and green then
+        // appeared into the gap, which is a cut with a delay in front of it, not a
+        // transition. Both are absolutely positioned in the same SVG, so they overlap for
+        // the length of the fade and the eye reads one becoming the other.
+        const old=svg.querySelector('g.work:not(.arc-exit)');
+        if(old){
+          old.classList.add('arc-exit');
+          old.classList.remove('arc-enter');
+          // Remove on the animation's own end event rather than a matching timer, so the
+          // two can never drift apart, and unconditionally after a moment in case the
+          // element never animates - a hidden window fires no animation events.
+          const drop=()=>old.remove();
+          old.addEventListener('animationend',drop,{once:true});
+          setTimeout(drop,400);
+        }
+        if(ws==='running'||ws==='attention'){
+          const g=document.createElementNS('http://www.w3.org/2000/svg','g');
+          // arc-enter cross-fades the incoming shape. Amber and green are different shapes -
+          // a full pulsing circle against a turning fragment - so there is no one element
+          // whose colour could be transitioned; fading the replacement in is the honest
+          // equivalent and still gives the change a duration the eye can follow.
+          g.setAttribute('class','work arc-enter '+(ws==='running'?'arc-spin':'arc-pulse'));
+          g.innerHTML = ws==='running'
+            ? svgArc(19,0.28,RUNGREEN,2.5)
+            : `<circle cx="28" cy="28" r="19" fill="none" stroke="${AMBER}" stroke-width="2.5"/>`;
+          svg.appendChild(g);
+        }
+      }
+    }
     if(p.snap.status==='needsAuth'||p.snap.status==='none') pct.textContent='—';
     else if(h && h.count!=null) pct.textContent='~'+h.count;
     else if(h) pct.textContent=(h.derived?'~':'')+Math.round(h.used*100)+'%';
     else pct.textContent='…';
+    pct.hidden=!prefs.show_percent;
+    const cd=cell.querySelector('.cd');
+    // Only for the window the ring is actually showing, and only while the reading is fresh:
+    // a countdown is a claim about right now, and one computed from a stale reading keeps
+    // ticking towards a moment that has already passed.
+    const left=(prefs.show_countdown && h && !staleOf(p.snap)) ? untilReset(h.resets_at) : '';
+    cd.textContent=left;
+    cd.hidden=!left;
     glyph.classList.toggle('dim', !!(h && h.used>=1));
     wrap.classList.toggle('dim', staleOf(p.snap));
   }
@@ -212,7 +427,30 @@ function resetCopy(ms){
   const d=new Date(ms);
   const t=d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
   if(diff<24*60*60*1000) return `Resets at ${t}`;
+  // A weekday only identifies a day inside the coming week, which upstream's ResetCopy learned
+  // the hard way: Codex's monthly window resets 26 days out, and "Resets Mon 3:55 PM" reads as
+  // *this* Monday - six days away rather than nearly four weeks. At a week or more out, day
+  // and month, and no time of day: nobody plans around 3:55 PM in four weeks, and exactly
+  // seven days is the worst case rather than a mild one, since the weekday is then the same
+  // word as today's.
+  if(diff>=7*24*60*60*1000) return `Resets ${d.toLocaleDateString('en-US',{month:'short',day:'numeric'})}`;
   return `Resets ${d.toLocaleDateString('en-US',{weekday:'short'})} ${t}`;
+}
+
+/* The same fact as resetCopy, in the width a pill has: "47m", "2h14m", "3d".
+   Truncated rather than rounded, unlike the card's copy. A countdown that rounds up says
+   there is more time left than there is, and this one sits directly under the percentage it
+   qualifies - the two must not disagree about whether a window is nearly over. */
+function untilReset(ms){
+  if(!ms) return '';
+  const left=ms-Date.now();
+  if(left<=0) return '0m';
+  const mins=Math.floor(left/60000);
+  if(mins<1) return '<1m';
+  if(mins<60) return `${mins}m`;
+  const hours=Math.floor(mins/60);
+  if(hours<24) return `${hours}h${String(mins%60).padStart(2,'0')}m`;
+  return `${Math.floor(hours/24)}d`;
 }
 
 function ago(ms){
@@ -289,8 +527,8 @@ function esc(s){const d=document.createElement('div');d.textContent=s||'';return
 /* Hover: stays expanded while either the pill or the card is under the cursor; collapses after a 250 ms grace period (upstream motion rule) */
 const card=document.getElementById('card'), pill=document.getElementById('pill');
 let hideTimer=null;
-function showCard(){clearTimeout(hideTimer);card.classList.add('show');renderCard();armWatchdog();} // show first, then render: placeCard needs offsetHeight
-function hideCard(){card.classList.remove('show');invoke('set_expanded',{on:false,rects:null}).catch(()=>{});}
+function showCard(){clearTimeout(hideTimer);card.classList.add("show");renderCard();syncInteractive();} // show first, then render: placeCard needs offsetHeight
+function hideCard(){card.classList.remove("show");invoke("set_expanded",{on:false,rects:null}).catch(()=>{});syncInteractive();}
 function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(hideCard,250);}
 // ===== Diagnostics + geometry =====
 function jslog(m){invoke('log_js',{msg:String(m)}).catch(()=>{});}
@@ -299,12 +537,40 @@ function callq(cmd,args){ // invoke with visible failure: any command error is r
 }
 // Hot rectangles are reported in physical pixels (multiplied by this page's real DPR), so the Rust side does no conversion — WebView2's DPR and the window scale can disagree
 function rectOf(el){const r=el.getBoundingClientRect(),k=window.devicePixelRatio||1;return [r.left*k,r.top*k,r.width*k,r.height*k];}
-function armWatchdog(){
-  requestAnimationFrame(()=>{ // wait one frame so renderCard's new content is laid out before measuring
-    if(!card.classList.contains('show'))return;
-    callq('set_expanded',{on:true,rects:[rectOf(pill),rectOf(card)]}).catch(()=>{});
+/* Everything currently on screen, for both the collapse watchdog and click-through.
+   The pill is always there; the rest join while they are shown. */
+function hotRects(){
+  const out=[rectOf(pill)];
+  for(const id of ['card','ctx','notice']){
+    const el=document.getElementById(id);
+    if(el&&el.classList.contains('show')) out.push(rectOf(el));
+  }
+  return out;
+}
+/* One measurement, both consumers.
+   Click-through needs it because the window is 340 px wide while the pill uses 70 of them, so
+   the transparent remainder would otherwise swallow every click meant for what is underneath.
+   The collapse watchdog needs the same rectangles, and giving each its own update path is what
+   let them disagree: the menu could open, join the click-through set, and still be absent from
+   the watchdog's — which then read the cursor moving onto the menu as leaving and closed the
+   very menu being aimed at.
+   Measured after a frame so freshly shown elements are laid out, and repeated on a slow timer
+   as a backstop: a missed call here means a dead pill, which is worse than one spare invoke a
+   second. */
+let interactiveSyncQueued=false;
+function syncInteractive(){
+  if(interactiveSyncQueued)return;
+  interactiveSyncQueued=true;
+  requestAnimationFrame(()=>{
+    interactiveSyncQueued=false;
+    const rects=hotRects();
+    invoke('set_interactive_rects',{rects}).catch(()=>{});
+    // Only while the card is up: `set_expanded(false)` is hideCard's to send, and arming the
+    // watchdog against a collapsed pill would have it emit pointer_left at nothing.
+    if(card.classList.contains('show')) callq('set_expanded',{on:true,rects}).catch(()=>{});
   });
 }
+setInterval(syncInteractive,1000);
 // Viewport fit (pure front-end fallback, independent of Rust): the window is 340 × primary scale physical px,
 // so if this page's CSS viewport is not 340 wide the WebView's DPR disagrees with the monitor; CSS zoom pulls the layout back to the design size.
 function fitZoom(){
@@ -318,7 +584,7 @@ function reportDpr(){
   callq('report_dpr',{dpr:window.devicePixelRatio||1,w:innerWidth,h:innerHeight}).catch(()=>{});
 }
 reportDpr();
-window.addEventListener('resize',()=>{clearTimeout(window._dprT);window._dprT=setTimeout(()=>{reportDpr();if(card.classList.contains('show'))armWatchdog();},120);});
+window.addEventListener('resize',()=>{clearTimeout(window._dprT);window._dprT=setTimeout(()=>{reportDpr();syncInteractive();},120);});
 matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`).addEventListener('change',reportDpr);
 
 /* Collapse test: no trust in element-level mouseenter/mouseleave/e.target at all —
@@ -345,7 +611,7 @@ document.addEventListener('mousemove',e=>{
   if(hot){
     clearTimeout(hideTimer);
     const id=cellAt(e.clientX,e.clientY);
-    if(id&&id!==hoverId){ hoverId=id; if(card.classList.contains('show')){ renderCard(); armWatchdog(); } }
+    if(id&&id!==hoverId){ hoverId=id; if(card.classList.contains('show')){ renderCard(); syncInteractive(); } }
     if(!card.classList.contains('show')) showCard();
   }
   else if(card.classList.contains('show')){ if(hideLogged++<5) jslog(`mousemove left the hot area -> collapse at ${e.clientX},${e.clientY}`); scheduleHide(); }
@@ -355,12 +621,38 @@ document.addEventListener('mouseout',e=>{ // relatedTarget null = the cursor lef
 });
 listen('pointer_left',()=>{clearTimeout(hideTimer);hideCard();}).catch(()=>{});
 // Card content changes change its height -> report the hot rectangles again
-listen('usage',()=>{if(card.classList.contains('show'))armWatchdog();}).catch(()=>{});
-listen('state',()=>{if(card.classList.contains('show'))armWatchdog();}).catch(()=>{});
+listen('usage',()=>{syncInteractive();}).catch(()=>{});
+listen('state',()=>{syncInteractive();}).catch(()=>{});
 /* The pill can be dragged up and down the right edge. Press and move more than 4 px = drag (handed to Rust,
    which follows the system cursor; the card is collapsed first); release without moving = click (opens the provider's usage page). */
 let press=null, dragging=false;
-pill.addEventListener('mousedown',e=>{ if(e.button!==0)return; press={x:e.clientX,y:e.clientY,id:cellAt(e.clientX,e.clientY)||hoverId}; });
+function cellEl(id){return id?pill.querySelector(`.cell[data-p="${id}"]`):null;}
+/* Held while the button is down, released on mouseup wherever it happens - including outside
+   the window, which is why this listens on the document rather than on the cell. A cell left
+   looking pressed because the pointer wandered off is worse than no feedback at all. */
+let pressedEl=null;
+function setPressed(el){
+  if(pressedEl===el)return;
+  if(pressedEl)pressedEl.classList.remove('pressed');
+  pressedEl=el;
+  if(pressedEl)pressedEl.classList.add('pressed');
+}
+/* The beat that says the action went out. Restarted rather than queued: a second click during
+   the first beat should show its own, not be swallowed. */
+function ack(id){
+  const el=cellEl(id); if(!el)return;
+  el.classList.remove('acted');
+  void el.offsetWidth; // reflow, so removing and re-adding restarts the animation
+  el.classList.add('acted');
+  el.addEventListener('animationend',()=>el.classList.remove('acted'),{once:true});
+}
+pill.addEventListener('mousedown',e=>{
+  if(e.button!==0)return;
+  const id=cellAt(e.clientX,e.clientY)||hoverId;
+  press={x:e.clientX,y:e.clientY,id};
+  setPressed(cellEl(id));
+});
+document.addEventListener('mouseup',()=>setPressed(null),true);
 document.addEventListener('mousemove',e=>{
   if(!press||dragging)return;
   if(Math.abs(e.clientY-press.y)>4||Math.abs(e.clientX-press.x)>4){
@@ -368,17 +660,85 @@ document.addEventListener('mousemove',e=>{
     invoke('drag_begin').catch(err=>{notice('drag_begin failed: '+err);dragging=false;});
   }
 });
+/* Left click refreshes, double click opens the usage page.
+   Opening a browser tab was the single-click action, which made the most casual gesture in
+   the app the most disruptive one: a stray click on a pill pinned to the screen edge threw a
+   window in front of whatever you were doing. Refresh is what someone glancing at a stale
+   number actually wants, it is cheap, and it is undoable by ignoring it. The page is still
+   one double click or one right-click menu item away.
+   A pending single click waits out the double-click interval so the two do not both fire. */
+/* Pending clicks are tracked per provider, not globally. With one shared timer, clicking
+   Claude and then Cursor inside the double-click interval cancelled Claude's refresh and
+   opened Cursor's usage page - two single clicks on two different cells being read as one
+   double click on the second. Two clicks only pair when they land on the same provider. */
+const pendingClick=new Map();
+const DOUBLE_CLICK_MS=280;
 document.addEventListener('mouseup',e=>{
   if(e.button!==0)return;
-  if(press&&!dragging) invoke('open_provider_page',{provider:press.id}).catch(()=>{});
+  const hit=press;
   press=null;
+  if(!hit||dragging)return;
+  const queued=pendingClick.get(hit.id);
+  if(queued){ // second click on the same cell: cancel its refresh and open the page instead
+    clearTimeout(queued);pendingClick.delete(hit.id);
+    ack(hit.id);
+    invoke('open_provider_page',{provider:hit.id}).catch(()=>{});
+    return;
+  }
+  pendingClick.set(hit.id,setTimeout(()=>{
+    pendingClick.delete(hit.id);
+    // Acknowledged when the refresh actually goes out, not when the button came up: the
+    // single-click action waits out the double-click interval, and a beat fired early would
+    // be claiming something had happened that had not.
+    ack(hit.id);
+    invoke('refresh_provider',{provider:hit.id}).catch(()=>{});
+  },DOUBLE_CLICK_MS));
 });
-listen('drag_end',()=>{dragging=false;press=null;}).catch(()=>{});
+
+/* The window is a WebView, so without this the right button opens Chromium's own menu -
+   Back, Reload, Save as, Print - on an app that has no navigation, nothing to save and
+   nothing to print. */
+document.addEventListener('contextmenu',e=>{
+  e.preventDefault();
+  const cell=e.target.closest?.('.cell');
+  openMenu(e.clientX,e.clientY,cell?cell.dataset.p:null);
+});
+
+function closeMenu(){const m=document.getElementById("ctx");if(m)m.classList.remove("show");syncInteractive();}
+function openMenu(x,y,provider){
+  const m=document.getElementById('ctx');
+  const p=provider?providers().find(q=>q.id===provider):null;
+  const rows=[];
+  if(p){
+    rows.push({label:`Refresh ${p.name}`,run:()=>invoke('refresh_provider',{provider:p.id})});
+    rows.push({label:`Open ${p.name} usage page`,run:()=>invoke('open_provider_page',{provider:p.id})});
+    rows.push({label:`Hide ${p.name}`,run:()=>invoke('hide_provider',{provider:p.id})});
+    rows.push({sep:true});
+  }
+  rows.push({label:'Refresh all',run:()=>invoke('refresh_provider',{provider:'all'})});
+  m.innerHTML=rows.map((r,i)=>r.sep?'<div class="ctx-sep"></div>':`<div class="ctx-item" data-i="${i}">${r.label}</div>`).join('');
+  m.classList.add('show');
+  // Keep it inside the window; the pill lives at the right edge, so a menu placed naively
+  // would open past it and be clipped.
+  const w=m.offsetWidth,h=m.offsetHeight;
+  m.style.left=Math.max(4,Math.min(x,window.innerWidth-w-4))+'px';
+  m.style.top=Math.max(4,Math.min(y,window.innerHeight-h-4))+'px';
+  syncInteractive();
+  m.onclick=ev=>{
+    const it=ev.target.closest('.ctx-item');if(!it)return;
+    const r=rows[+it.dataset.i];closeMenu();
+    if(r&&r.run) r.run().catch?.(()=>{});
+  };
+}
+document.addEventListener('mousedown',e=>{if(!e.target.closest?.('#ctx'))closeMenu();},true);
+listen('pointer_left',()=>closeMenu()).catch(()=>{});
+listen('drag_end',()=>{dragging=false;press=null;setPressed(null);}).catch(()=>{});
 
 function notice(msg){
   const n=document.getElementById('notice');
   n.textContent=msg;n.classList.add('show');
-  clearTimeout(n._h);n._h=setTimeout(()=>n.classList.remove('show'),6000);
+  syncInteractive();
+  clearTimeout(n._h);n._h=setTimeout(()=>{n.classList.remove("show");syncInteractive();},6000);
 }
 
 listen('usage',e=>{usage=e.payload||usage;renderRing();if(card.classList.contains('show'))renderCard();})
@@ -392,6 +752,11 @@ invoke('get_cursor').then(u=>{cursorSnap=u||cursorSnap;renderRing();}).catch(()=
 listen('antigravity',e=>{agSnap=e.payload||agSnap;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_antigravity').then(u=>{agSnap=u||agSnap;renderRing();}).catch(()=>{});
 listen('glyphs',e=>{glyphs=e.payload||glyphs;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+// Preferences arrive like everything else. The cell signature is cleared so the pill is
+// rebuilt rather than patched, otherwise hiding a provider would leave its cell on screen
+// until some other change happened to alter the structure.
+listen('prefs',e=>{prefs=e.payload||prefs;pill.dataset.cells='';renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
+invoke('get_prefs').then(p=>{if(p){prefs=p;pill.dataset.cells='';renderRing();}}).catch(()=>{});
 listen('activity',e=>{activity=e.payload||activity;renderRing();if(card.classList.contains('show'))renderCard();}).catch(()=>{});
 invoke('get_activity').then(a=>{activity=a||activity;renderRing();}).catch(()=>{});
 invoke('get_glyphs').then(g=>{glyphs=g||glyphs;renderRing();}).catch(()=>{});

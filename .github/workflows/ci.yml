@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege. Without this block the workflow inherits the repository default, which
+# can include write access it has no use for; nothing here needs more than to read the code.
+# The audit job's action is given its token explicitly.
+permissions:
+  contents: read
+
+# One run per branch or pull request. Pushing three commits in a minute otherwise starts
+# three Windows jobs that each compile SQLite from C, and the two obsolete ones keep
+# reporting checks for code nobody is looking at any more.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # RUSTFLAGS is deliberately NOT set here. The environment variable *replaces*
+  # `.cargo/config.toml`'s `rustflags` rather than adding to it, so setting `-D warnings`
+  # this way silently dropped `-C target-feature=+crt-static` and produced a binary that
+  # needed the Visual C++ redistributable after all — while local builds, which read the
+  # config file, were fine. The "assert no VC++ dependency" step below caught it.
+  # Warnings are errors via `cargo clippy -- -D warnings`, which covers rustc's lints too.
+
+jobs:
+  check:
+    name: fmt, clippy, test, build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The build needs the code, not the token. Left persisted, the checkout
+          # credential stays in .git/config for every later step, including
+          # third-party actions and build scripts - a write-capable token sitting
+          # where nothing needs it.
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: rustfmt, clippy
+
+      # Caches the registry, the git checkouts and target/. The first build compiles
+      # SQLite from C, which is the slow part; without a cache every run pays for it.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # `cargo fmt --check` is deliberately not a gate. The tree predates this workflow and
+      # differs from rustfmt in 169 places, almost all of it in the original author's code.
+      # Enforcing it would mean opening the contribution with a whitespace commit that
+      # touches twelve files and buries the actual change in review. Revisit once upstream
+      # has an opinion on formatting; until then clippy carries the quality bar, and it is
+      # a hard gate.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Release build
+        run: cargo build --workspace --release
+
+      # The release binary must not depend on the Visual C++ redistributable; see
+      # .cargo/config.toml. This asserts it, so a dependency that quietly reintroduces
+      # a dynamic CRT import fails CI instead of failing on a user's clean machine.
+      - name: Assert no VC++ redistributable dependency
+        shell: pwsh
+        run: |
+          $dumpbin = Get-ChildItem -Path "${env:ProgramFiles}\Microsoft Visual Studio" `
+            -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue |
+            Where-Object FullName -like '*Hostx64\x64*' | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe not found on the runner' }
+          $deps = & $dumpbin.FullName /dependents target\release\codenotch.exe
+          $bad = $deps | Select-String -Pattern 'vcruntime140|msvcp140'
+          if ($bad) { throw "Dynamic CRT import found: $bad" }
+          Write-Host 'OK: no vcruntime140/msvcp140 imports'
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The build needs the code, not the token. Left persisted, the checkout
+          # credential stays in .git/config for every later step, including
+          # third-party actions and build scripts - a write-capable token sitting
+          # where nothing needs it.
+          persist-credentials: false
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

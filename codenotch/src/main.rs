@@ -1,4 +1,10 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
+// These two lints flag the shape of the module documentation, not the code: continuation
+// lines in the numbered lists that explain each provider's data paths. Reflowing that prose
+// would be churn of exactly the kind we chose to avoid by leaving `cargo fmt` out of CI,
+// and it would bury a real diff under whitespace in review. The docs render correctly as
+// written; revisit if they ever stop doing so.
+#![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
 mod autostart;
 mod config;
@@ -23,8 +29,32 @@ use tauri::{AppHandle, Emitter, Manager};
 
 /// Logical size of the notch window: the 70 pt pill column on the right plus room for the hover card on the left.
 pub const NOTCH_W: f64 = 340.0;
-/// Hand-bumped build tag, written to run.log at startup so a log can always be matched to the exe that wrote it.
-pub const BUILD: &str = "r31";
+/// Build identity, stamped by build.rs from the git commit rather than typed by hand.
+///
+/// Written to run.log at startup and printed by `codenotch.exe version`, so a running copy
+/// can always be matched to the source it was built from - and, just as importantly, so an
+/// installer that failed to replace the executable is immediately obvious instead of
+/// looking exactly like one that worked.
+pub const BUILD: &str = env!("CODENOTCH_BUILD");
+/// Unix seconds at which this binary was compiled.
+pub const BUILT_AT: &str = env!("CODENOTCH_BUILT_AT");
+
+/// One line identifying exactly what is running.
+pub fn version_line() -> String {
+    let built = BUILT_AT.parse::<i64>().ok().and_then(|s| {
+        chrono::DateTime::from_timestamp(s, 0).map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+    });
+    format!(
+        "Codenotch {} (build {}, compiled {})",
+        env!("CARGO_PKG_VERSION"),
+        BUILD,
+        built.unwrap_or_else(|| "unknown".into())
+    )
+}
 pub const NOTCH_H: f64 = 460.0; // 300 clipped the card once it held three window blocks plus the session list
 
 pub struct AppState {
@@ -309,6 +339,96 @@ fn get_codex(state: tauri::State<AppState>) -> usage::UsageSnapshot {
     state.codex.lock().unwrap().clone()
 }
 
+/// The subset of the config the pill needs: which providers to draw and which window the
+/// ring should follow. Kept to exactly that, so the UI never has to know about ports, drag
+/// state or window geometry.
+#[derive(serde::Serialize, Clone)]
+pub struct Prefs {
+    pub hidden_providers: Vec<String>,
+    pub ring_window: String,
+    pub show_percent: bool,
+    pub show_countdown: bool,
+    pub show_pace_tick: bool,
+    pub show_activity_arc: bool,
+    pub float_pill: bool,
+}
+
+impl Prefs {
+    /// Built in one place so a field added here cannot reach the page through the initial
+    /// read and then go missing from the update, or the other way round.
+    fn from_config(c: &config::Config) -> Self {
+        Prefs {
+            hidden_providers: c.hidden_providers.clone(),
+            ring_window: c.ring_window.clone(),
+            show_percent: c.show_percent,
+            show_countdown: c.show_countdown,
+            show_pace_tick: c.show_pace_tick,
+            show_activity_arc: c.show_activity_arc,
+            float_pill: c.float_pill,
+        }
+    }
+}
+
+#[tauri::command]
+fn get_prefs(state: tauri::State<AppState>) -> Prefs {
+    Prefs::from_config(&state.cfg.lock().unwrap())
+}
+
+/// Pushes the current preferences to the pill. Called after any tray toggle.
+pub fn broadcast_prefs(app: &AppHandle) {
+    let prefs = {
+        let st = app.state::<AppState>();
+        let c = st.cfg.lock().unwrap();
+        Prefs::from_config(&c)
+    };
+    let _ = app.emit("prefs", &prefs);
+}
+
+/// Re-poll one provider, or every provider when given "all".
+///
+/// This is what a single click on a cell now does. It only asks the existing poll loop to
+/// wake early; the refetch floor and the request ceiling still apply, so leaning on the
+/// mouse cannot turn into a burst of requests.
+#[tauri::command]
+fn refresh_provider(app: AppHandle, provider: String) {
+    let all = provider == "all";
+    if all || provider == "claude" {
+        {
+            let st = app.state::<AppState>();
+            let mut u = st.usage.lock().unwrap();
+            u.backoff_until = 0;
+        }
+        usage::request_refresh();
+    }
+    if all || provider == "codex" {
+        codex::request_refresh();
+    }
+    if all || provider == "cursor" {
+        cursor::request_refresh();
+    }
+    if all || provider == "gemini" {
+        antigravity::request_refresh();
+    }
+}
+
+/// Hide a provider from the pill, from its own right-click menu.
+///
+/// The same setting the tray offers; having it here too means the cell can be dismissed
+/// where it is, rather than by hunting for the tray icon.
+#[tauri::command]
+fn hide_provider(app: AppHandle, provider: String) {
+    {
+        let st = app.state::<AppState>();
+        let mut c = st.cfg.lock().unwrap();
+        if !c.hidden_providers.contains(&provider) {
+            c.hidden_providers.push(provider);
+            config::save(&c);
+        }
+    }
+    broadcast_prefs(&app);
+    let _ = tray::rebuild(&app);
+}
+
 /// A click on a cell opens that provider's usage page
 #[tauri::command]
 fn open_provider_page(provider: String) {
@@ -337,6 +457,28 @@ static HOT: Mutex<Option<Vec<[f64; 4]>>> = Mutex::new(None);
 #[tauri::command]
 fn set_expanded(on: bool, rects: Option<Vec<[f64; 4]>>) {
     *HOT.lock().unwrap() = if on { Some(rects.unwrap_or_default()) } else { None };
+}
+
+/// Everything the page currently draws, in the same physical-pixel window coordinates as `HOT`:
+/// the pill, and the card, menu and notice while they are on screen.
+///
+/// The window is 340×460 but the pill only uses a 70 pt column of it, so the rest is a
+/// transparent sheet that used to swallow every click aimed at whatever sits underneath.
+///
+/// This is upstream's `interactiveRects` under a different mechanism. `NotchHostingView` on
+/// macOS overrides `hitTest` and returns nil outside those rectangles, so AppKit resolves the
+/// click to whatever is behind — exact, per event, free. WebView2 offers no equivalent hook, so
+/// the same rule is applied the only way Windows allows: the watchdog compares the system cursor
+/// against these rectangles and toggles `WS_EX_TRANSPARENT` on the whole window. Same rule, same
+/// rectangles, sampled rather than exact — hence the margin in `point_in_rects`.
+///
+/// Empty means "the page has not told us yet", and click-through stays off — a page that fails
+/// to report must leave the app usable, not make it impossible to click.
+static INTERACTIVE_RECTS: Mutex<Vec<[f64; 4]>> = Mutex::new(Vec::new());
+
+#[tauri::command]
+fn set_interactive_rects(rects: Vec<[f64; 4]>) {
+    *INTERACTIVE_RECTS.lock().unwrap() = rects;
 }
 
 /// The WebView zoom currently applied (1.0 = uncorrected)
@@ -388,6 +530,44 @@ fn report_dpr(app: AppHandle, dpr: f64, w: f64, h: f64) {
     }
 }
 
+/// Whether a point lies in any of the rectangles, with a margin.
+///
+/// The margin matters for click-through rather than for hit-testing: the cursor is sampled on a
+/// timer, so a fast approach can be a few pixels short of the pill on the tick before the click
+/// arrives. Widening the interactive area slightly costs nothing — the widened band is
+/// transparent and does nothing on click — and it removes the dead first click.
+fn point_in_rects(x: f64, y: f64, rects: &[[f64; 4]], pad: f64) -> bool {
+    rects
+        .iter()
+        .any(|r| x >= r[0] - pad && y >= r[1] - pad && x < r[0] + r[2] + pad && y < r[1] + r[3] + pad)
+}
+
+/// Make the window transparent to the mouse everywhere the page draws nothing.
+///
+/// Called on every watchdog tick. It only touches the window when the answer changes, because
+/// `set_ignore_cursor_events` is a real window-style change and calling it at 20 Hz for no reason
+/// is exactly the kind of churn that makes an always-on-top overlay feel unstable.
+fn update_click_through(app: &AppHandle) {
+    // Never during a drag: the cursor leaves the pill as the window follows it, and turning the
+    // window click-through mid-drag would hand the button press to whatever is underneath.
+    if DRAGGING.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let Some(w) = app.get_webview_window("notch") else { return };
+    let (Ok(pos), Ok(cur)) = (w.outer_position(), app.cursor_position()) else { return };
+    let rects = INTERACTIVE_RECTS.lock().unwrap().clone();
+    // No rectangles means the whole window stays clickable, and it has to be handled here
+    // rather than by returning early: an empty list arriving *after* click-through was turned
+    // on would otherwise leave the window transparent to the mouse with nothing able to turn
+    // it back, which is the one outcome this guard exists to prevent.
+    let want_ignore =
+        !rects.is_empty() && !point_in_rects(cur.x - pos.x as f64, cur.y - pos.y as f64, &rects, 6.0);
+    static IGNORING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if IGNORING.swap(want_ignore, std::sync::atomic::Ordering::SeqCst) != want_ignore {
+        let _ = w.set_ignore_cursor_events(want_ignore);
+    }
+}
+
 /// WebView2's mouseleave is unreliable inside a NOACTIVATE transparent window — a cursor that
 /// leaves quickly often produces no WM_MOUSELEAVE, and the card stays up. Rather than trust DOM
 /// events, the Rust side watches the system cursor while the card is expanded and emits
@@ -395,11 +575,25 @@ fn report_dpr(app: AppHandle, dpr: f64, w: f64, h: f64) {
 /// "Outside the window" is not the test, though: the window has a 340×460 transparent area, so
 /// the cursor is compared against the hot rectangles the page reports (pill, card, and the gap
 /// between them), and two consecutive misses (300 ms) count as leaving.
+///
+/// The same cursor reading drives click-through, on a shorter tick: the window is only
+/// interactive where the page actually draws something, so everything else falls through to
+/// whatever is underneath. See `INTERACTIVE_RECTS`.
 fn start_pointer_watchdog(app: AppHandle) {
     std::thread::spawn(move || {
         let mut miss = 0u8;
+        // Three 50 ms ticks per watchdog evaluation keeps the collapse timing exactly as it was
+        // (two misses = 300 ms) while click-through reacts within 50 ms. Anything slower is felt
+        // as a click that lands nowhere because the cursor arrived at the pill first.
+        let mut tick = 0u8;
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            update_click_through(&app);
+            tick += 1;
+            if tick < 3 {
+                continue;
+            }
+            tick = 0;
             let rects = match HOT.lock().unwrap().clone() {
                 Some(r) => r,
                 None => {
@@ -417,9 +611,7 @@ fn start_pointer_watchdog(app: AppHandle) {
                 .outer_size()
                 .map(|s| lx >= 0.0 && ly >= 0.0 && lx < s.width as f64 && ly < s.height as f64)
                 .unwrap_or(true);
-            let mut inside = in_window && rects.iter().any(|r| {
-                lx >= r[0] - PAD && ly >= r[1] - PAD && lx < r[0] + r[2] + PAD && ly < r[1] + r[3] + PAD
-            });
+            let mut inside = in_window && point_in_rects(lx, ly, &rects, PAD);
             // The gap between hot rectangles (pill and card) counts as inside: use the bounding box of all of them
             if !inside && in_window && rects.len() > 1 {
                 let x0 = rects.iter().map(|r| r[0]).fold(f64::MAX, f64::min);
@@ -550,6 +742,22 @@ fn report(r: Result<String, String>) {
     let _ = std::fs::write(log, &msg);
 }
 
+/// Path of the marker that records a deliberate quit from the tray.
+///
+/// codenotch-hook reads it before deciding whether to launch the application, so that
+/// quitting is not undone by the user's next Claude Code tool call.
+pub fn quit_marker_path() -> std::path::PathBuf {
+    config::config_path().with_file_name("quit")
+}
+
+pub fn mark_user_quit() {
+    let p = quit_marker_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&p, b"");
+}
+
 fn main() {
     attach_console();
     let args: Vec<String> = std::env::args().collect();
@@ -561,6 +769,16 @@ fn main() {
             }
             "uninstall-hooks" => {
                 report(hooks_install::uninstall());
+                return;
+            }
+            // The tray item's command-line twin, so the behaviour can be tested and
+            // scripted rather than only clicked.
+            "refresh-creds" => {
+                report(Ok(usage::nudge_claude_credential()));
+                return;
+            }
+            "version" | "--version" | "-V" => {
+                report(Ok(version_line()));
                 return;
             }
             "autostart" => {
@@ -582,6 +800,13 @@ fn main() {
             _ => {}
         }
     }
+
+    // Only a real launch clears the quit marker, which is why this sits after the
+    // subcommands rather than before them. `doctor`, `version` and `refresh-creds` all exit
+    // without starting anything, and clearing the marker on their way past told the hook
+    // that the user had changed their mind - so running `codenotch.exe doctor` after
+    // quitting brought the whole application back on the next tool call.
+    let _ = std::fs::remove_file(quit_marker_path());
 
     let cfg = config::load();
     let port = cfg.port;
@@ -609,6 +834,9 @@ fn main() {
             get_codex,
             get_cursor,
             get_antigravity,
+            get_prefs,
+            refresh_provider,
+            hide_provider,
             get_glyphs,
             get_activity,
             open_data_dir,
@@ -616,6 +844,7 @@ fn main() {
             open_provider_page,
             refresh_usage,
             open_usage_page,
+            set_interactive_rects,
             set_expanded,
             report_dpr,
             log_js,
@@ -676,4 +905,28 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("Codenotch failed to start");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::point_in_rects;
+
+    /// The pill column of a 340x460 window at 100 %: x 270..340, vertically centred.
+    const PILL: [f64; 4] = [270.0, 180.0, 70.0, 100.0];
+
+    #[test]
+    fn interactive_rect_test_covers_the_pill_and_nothing_else() {
+        assert!(point_in_rects(300.0, 200.0, &[PILL], 0.0), "middle of the pill");
+        assert!(!point_in_rects(100.0, 200.0, &[PILL], 0.0), "transparent area left of it");
+        assert!(!point_in_rects(300.0, 50.0, &[PILL], 0.0), "transparent area above it");
+        // Half-open on the far edges, so two rectangles that share a boundary do not both claim it.
+        assert!(point_in_rects(270.0, 180.0, &[PILL], 0.0), "top-left corner is inside");
+        assert!(!point_in_rects(340.0, 200.0, &[PILL], 0.0), "right edge is not");
+        // The margin exists so a cursor sampled a few pixels short still counts as arriving.
+        assert!(point_in_rects(266.0, 200.0, &[PILL], 6.0));
+        assert!(!point_in_rects(263.0, 200.0, &[PILL], 6.0));
+        // No rectangles means nothing is interactive; the caller is what decides that click-through
+        // stays off in that case, and it must not be this returning true by accident.
+        assert!(!point_in_rects(300.0, 200.0, &[], 6.0));
+    }
 }

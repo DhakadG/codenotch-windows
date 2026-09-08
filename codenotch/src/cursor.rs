@@ -111,7 +111,45 @@ fn item(conn: &rusqlite::Connection, key: &str) -> Option<String> {
 
 struct Creds {
     cookie: String,
+    /// The raw access token, kept so its own `exp` claim can be checked before a request is
+    /// spent on it. Never logged or persisted.
+    token: String,
     plan: Option<String>,
+}
+
+/// The `sub` claim of the stored access token, which is the account id the session cookie
+/// needs — `google-oauth2|…`, `auth0|…`, and so on.
+///
+/// Nothing is verified here; the token is the editor's and the server checks it. This only
+/// reads a field the editor already put on disk.
+fn jwt_sub(token: &str) -> Option<String> {
+    let sub = jwt_claims(token)?.get("sub")?.as_str()?.to_string();
+    if sub.is_empty() {
+        return None;
+    }
+    Some(sub)
+}
+
+/// The second JWT segment, decoded. Nothing is verified; the token is the editor's and the
+/// server checks it. This only reads fields the editor already wrote to disk.
+fn jwt_claims(token: &str) -> Option<serde_json::Value> {
+    let part = token.split('.').nth(1)?;
+    let raw = crate::antigravity::b64_decode(part)?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// True when the stored token's own `exp` claim is in the past.
+///
+/// Cursor's access token is short-lived and the editor refreshes it. With the editor closed
+/// the stored copy simply ages out, and sending it earns a rejection that is indistinguishable
+/// from a real sign-out - which is what "Cursor session was rejected, sign in again" used to
+/// tell people who were perfectly well signed in. Reading `exp` first costs nothing, spends no
+/// request, and lets the note name the actual remedy: open the editor.
+fn token_expired(token: &str) -> bool {
+    jwt_claims(token)
+        .and_then(|v| v.get("exp").and_then(|x| x.as_f64()))
+        .map(|exp| (exp * 1000.0) as u64 <= now_ms())
+        .unwrap_or(false)
 }
 
 /// Re-read every time: the editor rotates the token, and holding on to an old value signs us out
@@ -119,28 +157,51 @@ fn read_credentials() -> Option<Creds> {
     let path = store_url()?;
     let conn = open_ro(&path)?;
     let token = item(&conn, "cursorAuth/accessToken")?;
-    let auth_id = item(&conn, "cursorAuth/stripeMembershipAuthId")?;
+    // `stripeMembershipAuthId` is not written for every account — a free account has no
+    // Stripe membership and so never gets the key. Requiring it took the whole Cursor cell
+    // dark for those users. The id it holds is the token's own `sub` claim, so read that
+    // when the key is absent rather than giving up.
+    let auth_id = item(&conn, "cursorAuth/stripeMembershipAuthId").or_else(|| jwt_sub(&token))?;
     let plan = item(&conn, "cursorAuth/stripeMembershipType");
-    Some(Creds { cookie: format!("WorkosCursorSessionToken={auth_id}::{token}"), plan })
+    Some(Creds {
+        cookie: format!("WorkosCursorSessionToken={auth_id}::{token}"),
+        token,
+        plan,
+    })
 }
 
-/// For doctor: contains no secret values
+/// For doctor: contains no secret values.
+///
+/// Each failure gets its own message. "not signed in, or SQLite failed to open" told the
+/// reader two different fixes and left them to guess which applied.
 pub fn probe() -> String {
     let Some(p) = store_url() else { return "Cursor: cannot locate %APPDATA%".into() };
     if !p.is_file() {
-        return format!("Cursor: {} not found (not installed, or not signed in)", p.display());
+        return format!("Cursor: {} not found (not installed, or never signed in)", p.display());
     }
-    match read_credentials() {
-        Some(c) => format!(
-            "Cursor: session borrowed (cookie {} chars, plan={})",
-            c.cookie.len(),
-            c.plan.unwrap_or_else(|| "?".into())
-        ),
-        None => format!("Cursor: {} exists but cursorAuth/* could not be read (editor not signed in, or SQLite failed to open)", p.display()),
+    let Some(conn) = open_ro(&p) else {
+        return format!("Cursor: {} exists but SQLite could not open it (is the editor mid-write?)", p.display());
+    };
+    let Some(token) = item(&conn, "cursorAuth/accessToken") else {
+        return format!("Cursor: {} opened, but cursorAuth/accessToken is absent — sign in to the editor", p.display());
+    };
+    let stripe_id = item(&conn, "cursorAuth/stripeMembershipAuthId");
+    let source = if stripe_id.is_some() { "stripeMembershipAuthId" } else { "the token's sub claim" };
+    if stripe_id.is_none() && jwt_sub(&token).is_none() {
+        return format!(
+            "Cursor: signed in (token {} chars) but no account id — stripeMembershipAuthId is absent and the token carries no readable sub claim",
+            token.len()
+        );
     }
+    let plan = item(&conn, "cursorAuth/stripeMembershipType").unwrap_or_else(|| "?".into());
+    format!("Cursor: session borrowed (token {} chars, account id from {source}, plan={plan})", token.len())
 }
 
 // ---------------- Parsing ----------------
+
+#[cfg(test)]
+#[path = "cursor_tests.rs"]
+mod tests;
 
 fn pct(v: Option<&serde_json::Value>) -> Option<f64> {
     v.and_then(|x| x.as_f64()).map(|p| (p / 100.0).clamp(0.0, 1.0))
@@ -185,17 +246,26 @@ pub fn parse_summary(v: &serde_json::Value) -> (Vec<LimitWindow>, String) {
     if !out.is_empty() {
         return (out, String::new());
     }
-    let membership = v.get("membershipType").and_then(|x| x.as_str()).unwrap_or("this");
-    let note = if v.get("isUnlimited").and_then(|x| x.as_bool()) == Some(true) {
-        format!("Unlimited on the {membership} plan — nothing to meter")
-    } else {
-        format!("The {membership} plan has nothing for Cursor to meter yet")
+    // Named plan or not, the sentence has to read. Substituting a placeholder into "the
+    // {} plan" produced "The this plan has nothing for Cursor to meter yet".
+    let membership = v
+        .get("membershipType")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty());
+    let unlimited = v.get("isUnlimited").and_then(|x| x.as_bool()) == Some(true);
+    let note = match (unlimited, membership) {
+        (true, Some(m)) => format!("Unlimited on the {m} plan — nothing to meter"),
+        (true, None) => "Unlimited on this plan — nothing to meter".to_string(),
+        (false, Some(m)) => format!("The {m} plan has nothing for Cursor to meter yet"),
+        (false, None) => "This plan has nothing for Cursor to meter yet".to_string(),
     };
     (out, note)
 }
 
 enum FetchErr {
     NeedsAuth,
+    /// Suggested wait in seconds, from Retry-After where the server sent one.
+    RateLimited(u64),
     Other(String),
 }
 
@@ -204,6 +274,12 @@ fn fetch_once(cookie: &str) -> Result<serde_json::Value, FetchErr> {
     match agent.get(ENDPOINT).set("Cookie", cookie).set("Accept", "application/json").call() {
         Ok(r) => r.into_json::<serde_json::Value>().map_err(|e| FetchErr::Other(format!("parse: {e}"))),
         Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => Err(FetchErr::NeedsAuth),
+        // 429 was previously indistinguishable from any other failure, so a rate-limited
+        // Cursor kept being asked every five minutes with no acknowledgement that it had
+        // said no. Named so the caller can hold off and say why.
+        Err(ureq::Error::Status(429, r)) => {
+            Err(FetchErr::RateLimited(crate::usage::retry_after_secs(r.header("retry-after")).unwrap_or(300)))
+        }
         Err(ureq::Error::Status(code, _)) => Err(FetchErr::Other(format!("HTTP {code}"))),
         Err(e) => Err(FetchErr::Other(format!("{e}"))),
     }
@@ -224,6 +300,22 @@ fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
         snap.note = "Sign in to Cursor (the editor) to see usage.".into();
         return snap;
     };
+    // Do not spend a request on a token that has already expired on its own clock. Keep the
+    // last reading rather than blanking it: an aged-out token says nothing about the account.
+    if token_expired(&creds.token) {
+        snap.status = if snap.windows.is_empty() { "needsAuth".into() } else { "stale".into() };
+        snap.note = "Cursor's stored session has expired. Open the Cursor editor to refresh it — Codenotch borrows its session and cannot sign in.".into();
+        return snap;
+    }
+    // The hourly ceiling, on the only path here that reaches the network. Cursor has no local
+    // record of its own usage - `state.vscdb` holds the credential, not the numbers - so
+    // unlike Codex there is nothing to read instead, and the ceiling is the whole protection.
+    if crate::usage::budget_check(&mut snap.request_log, now_ms()).is_err() {
+        snap.status = if snap.windows.is_empty() { "backoff".into() } else { "stale".into() };
+        snap.note = "Holding off: this app's own hourly limit for usage checks".into();
+        return snap;
+    }
+    snap.request_log.push(now_ms());
     match fetch_once(&creds.cookie) {
         Ok(v) => {
             let (windows, note) = parse_summary(&v);
@@ -245,6 +337,13 @@ fn read_once(prev: &UsageSnapshot) -> UsageSnapshot {
         Err(FetchErr::NeedsAuth) => {
             snap.status = "needsAuth".into();
             snap.note = "Cursor session was rejected — sign in again in the editor".into();
+        }
+        Err(FetchErr::RateLimited(secs)) => {
+            // Hold off rather than asking again on the next tick. A poll that keeps firing
+            // into a rate limit is how you stay rate limited.
+            snap.status = if snap.windows.is_empty() { "backoff" } else { "stale" }.into();
+            snap.note = format!("Cursor rate limited this reading, retrying in {secs}s");
+            snap.backoff_until = now_ms() + secs * 1000;
         }
         Err(FetchErr::Other(msg)) => {
             // Stale beats invented: keep the old reading, marked stale
@@ -288,11 +387,30 @@ pub fn start(app: AppHandle) {
             }
         }
         loop {
+            // Switched off in the tray: keep the last reading, spend nothing. Checked here
+            // rather than at start-up so switching it back on resumes without a restart.
+            if crate::config::is_disconnected("cursor") {
+                sleep_interruptible(60);
+                continue;
+            }
             let prev = {
                 let st = app.state::<AppState>();
                 let s = st.cursor.lock().unwrap().clone();
                 s
             };
+            // A reading restored from disk is the same answer the endpoint would give. The
+            // hook restarts this app whenever it is not running, and without this every
+            // start spent a request here too - the same restart storm that rate-limited the
+            // Claude endpoint, just against a different host.
+            if crate::usage::too_fresh(prev.fetched_at, now_ms()) {
+                sleep_interruptible(60);
+                continue;
+            }
+            // Respect a backoff the server asked for, across restarts.
+            if prev.backoff_until > now_ms() {
+                sleep_interruptible(((prev.backoff_until - now_ms()) / 1000).clamp(1, 60));
+                continue;
+            }
             let snap = read_once(&prev);
             if snap.status == "error" || snap.status == "stale" {
                 crate::applog(&format!("cursor: {}", snap.note));

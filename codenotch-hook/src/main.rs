@@ -22,15 +22,65 @@ fn main() {
     if send(port, &event, ppid, &body).is_ok() {
         return;
     }
-    // Main app not running: launch it detached, then retry briefly
+    // The app is not running. Two rules apply, and both exist because this code runs on
+    // Claude Code's hot path: it is invoked before and after *every* tool call.
+    //
+    // 1. If the user quit from the tray, that decision stands. Relaunching the application
+    //    they just closed, seconds later, because they happened to keep working, makes the
+    //    quit menu item look broken.
+    // 2. Launch and return. There used to be a retry loop here - twenty attempts, 100 ms
+    //    apart - so that the event which triggered the launch would not be lost. That put
+    //    up to two seconds on every hook, and with PreToolUse and PostToolUse both wired
+    //    it added around four seconds to every single tool call. Losing one event is
+    //    invisible; the next one lands milliseconds later and the transcript watcher
+    //    reports the same state anyway. A slow hook is not.
+    if user_quit() {
+        return;
+    }
+    // Spawn cooldown. If the application fails to start - a bad build, a missing WebView2,
+    // a crash on launch - then without this every tool call would launch another doomed
+    // process, and the user's machine would be busy failing several times a second while
+    // Claude Code waited on each attempt. One attempt per cooldown at most; a working app
+    // answers on the socket and never reaches this line anyway.
+    if !spawn_allowed() {
+        return;
+    }
     spawn_main();
-    for _ in 0..20 {
-        std::thread::sleep(Duration::from_millis(100));
-        if send(port, &event, ppid, &body).is_ok() {
-            return;
+}
+
+/// How long to wait between launch attempts when the app is not answering.
+const SPAWN_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Whether enough time has passed since the last launch attempt, recording this one.
+///
+/// The timestamp is the mtime of a marker file, because this process exists for a few
+/// milliseconds and cannot remember anything between invocations.
+fn spawn_allowed() -> bool {
+    let Ok(appdata) = std::env::var("APPDATA") else {
+        return true;
+    };
+    let dir = std::path::PathBuf::from(appdata).join("codenotch");
+    let marker = dir.join("last-spawn");
+    if let Ok(meta) = std::fs::metadata(&marker) {
+        if let Ok(age) = meta.modified().and_then(|t| t.elapsed().map_err(std::io::Error::other)) {
+            if age < SPAWN_COOLDOWN {
+                return false;
+            }
         }
     }
-    // Give up quietly — never affect Claude Code
+    let _ = std::fs::create_dir_all(&dir);
+    // Truncating rewrite is what moves the mtime forward.
+    let _ = std::fs::write(&marker, b"");
+    true
+}
+
+/// True when the user quit from the tray. The application removes this marker whenever it
+/// starts, so it only ever means "closed on purpose, and not reopened since".
+fn user_quit() -> bool {
+    match std::env::var("APPDATA") {
+        Ok(a) => std::path::Path::new(&format!("{a}\\codenotch\\quit")).exists(),
+        Err(_) => false,
+    }
 }
 
 /// Pulls "port": N out of %APPDATA%\codenotch\config.json (hand-rolled scan, no dependency)
@@ -55,11 +105,28 @@ fn read_port() -> u16 {
     DEFAULT_PORT
 }
 
+/// The whole budget for one hook invocation, connect and write together.
+///
+/// Per-operation timeouts bound each step but not their sum, and this program sits on
+/// Claude Code's critical path twice per tool call. One number is easier to reason about
+/// than two that add up.
+const SEND_BUDGET: Duration = Duration::from_millis(250);
+
 fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
+    let started = std::time::Instant::now();
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(300))?;
-    s.set_write_timeout(Some(Duration::from_millis(700)))?;
-    s.set_read_timeout(Some(Duration::from_millis(700)))?;
+    // Every timeout here is a bound on how long Claude Code can be delayed by this
+    // program, which runs before and after each of its tool calls. They are deliberately
+    // tight: a notch that misses one event is invisible, a tool call that waits a second is
+    // not. Worst case for a hook is now roughly 300 ms rather than 1.7 s.
+    let mut s = TcpStream::connect_timeout(&addr, SEND_BUDGET)?;
+    // Whatever the connect used comes out of the same budget, so the two cannot add up to
+    // more than SEND_BUDGET no matter how slow the loopback was.
+    let left = SEND_BUDGET
+        .checked_sub(started.elapsed())
+        .filter(|d| !d.is_zero())
+        .unwrap_or(Duration::from_millis(1));
+    s.set_write_timeout(Some(left))?;
     let req = format!(
         "POST /event?e={}&ppid={} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         event,
@@ -68,8 +135,14 @@ fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
         body
     );
     s.write_all(req.as_bytes())?;
-    let mut buf = [0u8; 64];
-    let _ = s.read(&mut buf); // wait for a response fragment to confirm delivery; failure does not matter
+    // No read. The reply was only ever a delivery confirmation that nothing acted on - the
+    // old comment said as much, "failure does not matter" - and waiting for it coupled
+    // Claude Code's latency to whatever the application happened to be doing. A successful
+    // connect and write already prove the app is listening and has the bytes.
+    //
+    // The write half is shut down explicitly so the server sees a clean end of request
+    // rather than a reset when this process exits a moment later.
+    let _ = s.shutdown(std::net::Shutdown::Write);
     Ok(())
 }
 

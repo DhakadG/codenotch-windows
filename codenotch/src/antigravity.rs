@@ -14,11 +14,20 @@
 //!      so both are tried),
 //!      POST `https://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`
 //!      with header `x-codeium-csrf-token: <t>` (Antigravity sits on the Codeium stack; the header
-//!      name never changed) and body `{"forceRefresh":true}` (otherwise the server answers from
-//!      QuotaSummaryCache). Self-signed certificate → verification is relaxed for 127.0.0.1 only.
-//!      Reply `{response:{groups:[{displayName, buckets:[{bucketId, displayName, remainingFraction, resetTime}]}]}}`
-//!      — it reports what **remains**, so used = 1 - remainingFraction; the label is
-//!      group.displayName (buckets only ever say "Weekly Limit Remaining").
+//!      name never changed) and body `{"forceRefresh":false}` — the server answers from its
+//!      QuotaSummaryCache. `true` bypasses that cache and makes the language server call Cloud
+//!      Code upstream; sending it on every poll meant this app forced another application's
+//!      process into a network round trip every five minutes, on both ports, even while that
+//!      application was idle. Reserved for an explicit user-initiated refresh, and not wired to
+//!      one yet. Self-signed certificate → verification is relaxed for 127.0.0.1 only.
+//!      Reply `{response:{groups:[{displayName, buckets:[{bucketId, displayName, window,
+//!      remainingFraction, resetTime}]}]}}` — it reports what **remains**, so
+//!      used = 1 - remainingFraction.
+//!      Verified against a live install on 2026-09-07: a group now carries **two** buckets,
+//!      not one — `window` is `"5h"` or `"weekly"` (`gemini-5h`/`gemini-weekly`,
+//!      `3p-5h`/`3p-weekly`), and `displayName` says "Five Hour Limit Remaining" or
+//!      "Weekly Limit Remaining". Labelling a bucket with its group name alone therefore
+//!      produces two identical labels per group, so the window is appended.
 //!   2. Bridge answered before and does not now = Antigravity is closed (the port changes on every
 //!      launch): keep the last percentage marked stale rather than switching to a count.
 //!   3. Credential path (when a Google token exists): Windows Credential Manager target
@@ -125,7 +134,17 @@ fn discover() -> Option<Endpoint> {
             "Get-CimInstance Win32_Process -Filter \"Name LIKE '%language_server%'\" | ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }",
         ],
     );
-    let line = table.lines().find(|l| l.contains("--csrf_token"))?;
+    // More than one language_server can be running at once — an Antigravity install ships
+    // both a production client and one pointed at `daily-cloudcode-pa.googleapis.com`, and
+    // they answer with different numbers for different accounts. Taking whichever the
+    // process table listed first is a coin flip, so prefer the production endpoint and use
+    // a staging one only when it is the only thing running.
+    let candidates: Vec<&str> = table.lines().filter(|l| l.contains("--csrf_token")).collect();
+    let line = candidates
+        .iter()
+        .find(|l| !is_staging_endpoint(l))
+        .or_else(|| candidates.first())
+        .copied()?;
     let (pid_s, cmdline) = line.split_once('\t')?;
     let pid: u32 = pid_s.trim().parse().ok()?;
     let csrf = flag_value(cmdline, "--csrf_token")?;
@@ -151,6 +170,31 @@ fn discover() -> Option<Endpoint> {
         return None;
     }
     Some(Endpoint { ports, csrf })
+}
+
+#[cfg(test)]
+#[path = "antigravity_tests.rs"]
+mod tests;
+
+/// True when a `language_server` command line points at a pre-release Cloud Code host
+/// rather than the production one — `daily-cloudcode-pa.googleapis.com` and friends.
+fn is_staging_endpoint(cmdline: &str) -> bool {
+    match flag_value(cmdline, "--cloud_code_endpoint") {
+        Some(url) => {
+            let host = url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            // Match the host label, not the whole string: "daily-cloudcode-pa…" is staging,
+            // a hypothetical "cloudcode-pa-daily-release" is not something to guess about.
+            host.starts_with("daily-") || host.starts_with("staging-") || host.starts_with("autopush-")
+        }
+        // No endpoint flag at all: nothing marks it as staging, so treat it as production.
+        None => false,
+    }
 }
 
 fn flag_value(line: &str, flag: &str) -> Option<String> {
@@ -190,23 +234,82 @@ fn local_agent() -> Option<ureq::Agent> {
     Some(ureq::AgentBuilder::new().tls_connector(Arc::new(tls)).timeout(Duration::from_secs(10)).build())
 }
 
-fn bridge_quota(ep: &Endpoint) -> Result<Vec<LimitWindow>, String> {
+/// Asks the local language server for its quota summary.
+///
+/// `force` controls whether the server is made to go upstream. `forceRefresh: true` exists
+/// to bypass its own `QuotaSummaryCache`, so sending it on every poll compelled Antigravity's
+/// language server into a Cloud Code round trip every five minutes, on both of its ports,
+/// forever - including while the IDE was idle and nobody was looking at the notch. That is
+/// not a reasonable thing to do to another application's process, and it is the most likely
+/// reason Antigravity became unstable and rate limited while this app was running.
+///
+/// Routine polling now reads whatever the server already has, which is the same number it
+/// would compute anyway. Only an explicit refresh from the user forces it.
+/// The port that last served the quota RPC.
+///
+/// Upstream's own comment says the language server "opens two and only one serves this RPC, and
+/// which is which is not advertised - so both are tried rather than guessed at." Trying both is
+/// right the first time and wrong every time after: the port that does *not* serve it was still
+/// being sent a Connect-RPC POST on every poll, and a listener handed a protocol it does not
+/// speak tears the stream down. That is what
+///
+///     [Error] Stopping server failed
+///       Message: Cannot call write after a stream was destroyed
+///
+/// in Antigravity's own output is, and it is why the IDE was stable whenever this provider was
+/// switched off.
+///
+/// So the answer is remembered. The wrong port is now poked once, when the endpoint is first
+/// discovered, and never again while that discovery holds.
+static LAST_GOOD_PORT: std::sync::Mutex<Option<u16>> = std::sync::Mutex::new(None);
+
+fn bridge_quota(ep: &Endpoint, force: bool) -> Result<Vec<LimitWindow>, String> {
     let agent = local_agent().ok_or("TLS setup failed")?;
     let mut last = String::from("no port answered");
-    for port in &ep.ports {
+    // Known-good port first, and alone when it works. Only a failure falls through to the
+    // others, which is also what re-discovers the RPC after the language server restarts on
+    // different ports.
+    let remembered = *LAST_GOOD_PORT.lock().unwrap();
+    let order: Vec<u16> = remembered
+        .filter(|p| ep.ports.contains(p))
+        .into_iter()
+        .chain(ep.ports.iter().copied().filter(|p| Some(*p) != remembered))
+        .collect();
+    // Whether any port replied with a well-formed quota document that simply listed no
+    // groups. That is a working bridge reporting nothing to meter, which is a different
+    // outcome from every port refusing, timing out or returning something unparseable -
+    // and reporting it as "the quota RPC failed" sent people looking for a fault that was
+    // not there. Only settled after every port has been tried, so that a genuinely empty
+    // answer from the first port cannot mask real windows on the second.
+    let mut answered_empty = false;
+    for port in &order {
         let url = format!("https://127.0.0.1:{port}{LS_SERVICE}");
         match agent
             .post(&url)
             .set("Content-Type", "application/json")
             .set(CSRF_HEADER, &ep.csrf)
-            .send_string(r#"{"forceRefresh":true}"#)
+            .send_string(if force {
+                r#"{"forceRefresh":true}"#
+            } else {
+                r#"{"forceRefresh":false}"#
+            })
         {
             Ok(r) => match r.into_json::<serde_json::Value>() {
                 Ok(v) => {
                     let w = windows_from_bridge(&v);
+                    // A well-formed reply means this is the port that serves the RPC, whether
+                    // or not it had anything to report. Remember it either way.
+                    *LAST_GOOD_PORT.lock().unwrap() = Some(*port);
                     if !w.is_empty() {
                         return Ok(w);
                     }
+                    // An empty answer from the port we already know serves this is the answer.
+                    // Only an empty answer from a port we were still identifying is worth
+                    // following with another attempt, in case the real one is further down.
+                    if remembered == Some(*port) {
+                        return Ok(Vec::new());
+                    }
+                    answered_empty = true;
                     last = format!("port {port}: no recognisable groups");
                 }
                 Err(e) => last = format!("port {port}: {e}"),
@@ -215,6 +318,9 @@ fn bridge_quota(ep: &Endpoint) -> Result<Vec<LimitWindow>, String> {
             Err(e) => last = format!("port {port}: {e}"),
         }
     }
+    if answered_empty {
+        return Ok(Vec::new());
+    }
     Err(last)
 }
 
@@ -222,6 +328,33 @@ fn parse_iso(v: Option<&serde_json::Value>) -> Option<u64> {
     v.and_then(|x| x.as_str())
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.timestamp_millis().max(0) as u64)
+}
+
+/// Names one bucket's ring.
+///
+/// The group says which models ("Gemini Models", "Claude and GPT models") and the bucket
+/// says over what period. Neither alone is enough: the group repeats across its buckets,
+/// and the bucket's own name repeats across groups. Both together are unique and read the
+/// way the rest of the card does.
+fn bucket_label(group: Option<&str>, bucket: Option<&str>, window: Option<&str>) -> String {
+    // The wire values seen in practice. An unrecognised one is passed through rather than
+    // dropped, so a new window type still gets a distinguishable label.
+    let period = match window {
+        Some("5h") => Some("5h".to_string()),
+        Some("weekly") => Some("weekly".to_string()),
+        Some(other) if !other.is_empty() => Some(other.to_string()),
+        // No `window` field: fall back to the bucket's own name, trimmed of the
+        // " Remaining" suffix that every one of them carries.
+        _ => bucket
+            .map(|b| b.trim_end_matches(" Remaining").trim().to_string())
+            .filter(|b| !b.is_empty()),
+    };
+    match (group, period) {
+        (Some(g), Some(p)) => format!("{g} ({p})"),
+        (Some(g), None) => g.to_string(),
+        (None, Some(p)) => p,
+        (None, None) => "Usage".to_string(),
+    }
 }
 
 /// The server reports what remains and the notch shows what is used: flip it here so the view never learns about provider differences
@@ -237,9 +370,10 @@ pub fn windows_from_bridge(v: &serde_json::Value) -> Vec<LimitWindow> {
                 continue;
             }
             let bname = b.get("displayName").and_then(|x| x.as_str());
+            let window = b.get("window").and_then(|x| x.as_str());
             out.push(LimitWindow {
                 id: b.get("bucketId").and_then(|x| x.as_str()).or(gname).unwrap_or("quota").to_string(),
-                label: gname.or(bname).unwrap_or("Usage").to_string(),
+                label: bucket_label(gname, bname, window),
                 used: (1.0 - rem).clamp(0.0, 1.0),
                 resets_at: parse_iso(b.get("resetTime")),
                 ..Default::default()
@@ -291,7 +425,7 @@ fn read_credential_raw() -> Option<Vec<u8>> {
 fn decode_credential(raw: &[u8]) -> Option<Creds> {
     let mut text = String::from_utf8(raw.to_vec()).unwrap_or_else(|_| {
         // Some writers store the blob as UTF-16LE
-        let u16s: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let u16s: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         String::from_utf16_lossy(&u16s)
     });
     text = text.trim_matches('\0').trim().to_string();
@@ -464,13 +598,20 @@ struct Runtime {
 }
 
 fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
-    let mut snap = UsageSnapshot::default();
+    // The request log is this provider's record of what it has spent against Google's
+    // endpoint, and it has to survive a reading or the ceiling below means nothing. The local
+    // bridge is not counted: it is a loopback call to a process already running on this
+    // machine, costs nobody anything, and is exactly what should be preferred.
+    let mut snap = UsageSnapshot {
+        request_log: prev.request_log.clone(),
+        ..Default::default()
+    };
     // 1. Local bridge (the cached endpoint first; the port changes on every launch, so a miss is normal)
     let mut bridge_err = String::new();
     let mut tried = false;
     if let Some(ep) = rt.endpoint.clone() {
         tried = true;
-        match bridge_quota(&ep) {
+        match bridge_quota(&ep, false) {
             Ok(w) => {
                 rt.ever_bridged = true;
                 snap.status = "ok".into();
@@ -487,7 +628,7 @@ fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
     }
     if let Some(ep) = discover() {
         tried = true;
-        match bridge_quota(&ep) {
+        match bridge_quota(&ep, false) {
             Ok(w) => {
                 rt.endpoint = Some(ep);
                 rt.ever_bridged = true;
@@ -510,18 +651,33 @@ fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
         snap.note = "Antigravity is closed — last reading kept".into();
         return snap;
     }
-    // 3. Credential path
+    // 3. Credential path — the only step here that leaves the machine, so the only one the
+    // hourly ceiling applies to. Reached only when the local bridge could not answer, which
+    // is the case worth spending a request on.
     let mut tier: Option<String> = None;
-    match read_credentials() {
-        Some(c) if !c.expired => match load_tier(&c.access_token) {
+    if crate::usage::budget_check(&mut snap.request_log, now_ms()).is_err() {
+        // Fall through to the transcript count below rather than returning: a local number,
+        // honestly labelled, beats no number at all while the budget recovers.
+        crate::applog("antigravity: hourly request ceiling reached, using the local count");
+    } else {
+        match read_credentials() {
+        Some(c) if !c.expired => {
+            snap.request_log.push(now_ms());
+            match load_tier(&c.access_token) {
             Ok(t) => {
                 tier = Some(t);
-                if let Some(w) = direct_quota(&c.access_token) {
-                    snap.status = "ok".into();
-                    snap.windows = w;
-                    snap.fetched_at = now_ms();
-                    snap.note = format!("{} · via Google", tier.clone().unwrap_or_default());
-                    return snap;
+                // The tier lookup and the quota call are two separate requests to Cloud
+                // Code, so the second is checked and recorded in its own right. Counting the
+                // pair as one entry let this path spend twice what the ceiling allowed.
+                if crate::usage::budget_check(&mut snap.request_log, now_ms()).is_ok() {
+                    snap.request_log.push(now_ms());
+                    if let Some(w) = direct_quota(&c.access_token) {
+                        snap.status = "ok".into();
+                        snap.windows = w;
+                        snap.fetched_at = now_ms();
+                        snap.note = format!("{} · via Google", tier.clone().unwrap_or_default());
+                        return snap;
+                    }
                 }
             }
             Err(e) if e == "needsAuth" => {
@@ -530,12 +686,14 @@ fn read_once(rt: &mut Runtime, prev: &UsageSnapshot) -> UsageSnapshot {
                 return snap;
             }
             Err(e) => crate::applog(&format!("antigravity: loadCodeAssist {e}")),
-        },
+            }
+        }
         Some(c) => {
             // Expired ≠ signed out: Antigravity refreshes it on its next run; auth_method stands in for the tier
             tier = Some(if c.auth_method == "consumer" { "Personal".into() } else { c.auth_method.clone() });
         }
         None => {}
+        }
     }
     // 4. Count fallback (derived: the card gets a ~ prefix and the ring draws only its track)
     let (n, latest) = requests_today();
@@ -590,11 +748,26 @@ pub fn start(app: AppHandle) {
         }
         let mut rt = Runtime { endpoint: None, ever_bridged: false };
         loop {
+            // Switched off in the tray: keep the last reading, spend nothing. Checked here
+            // rather than at start-up so switching it back on resumes without a restart.
+            // The id is "gemini" because that is what the tray and the page call this
+            // provider; the module is named after the application it reads.
+            if crate::config::is_disconnected("gemini") {
+                sleep_interruptible(60);
+                continue;
+            }
             let prev = {
                 let st = app.state::<AppState>();
                 let s = st.antigravity.lock().unwrap().clone();
                 s
             };
+            // Same restart-storm guard as the other providers. The local bridge is cheap,
+            // but the credential and Cloud Code fallbacks in read_once are not, and a
+            // relaunch per tool call would exercise them.
+            if crate::usage::too_fresh(prev.fetched_at, now_ms()) {
+                sleep_interruptible(60);
+                continue;
+            }
             let snap = read_once(&mut rt, &prev);
             broadcast(&app, snap);
             sleep_interruptible(POLL_SECS);
@@ -617,7 +790,26 @@ pub fn probe() -> String {
             None => "not found".into(),
         },
         match ep {
-            Some(e) => format!("running, ports {:?}", e.ports),
+            // Finding the process only proves discovery works. The question a reader
+            // actually has is whether the quota RPC answers, so ask it: which port
+            // replied, and how many windows came back.
+            Some(e) => {
+                let ports = format!("{:?}", e.ports);
+                match bridge_quota(&e, false) {
+                    Ok(ws) if ws.is_empty() => {
+                        format!("running, ports {ports}, bridge answered with no quota groups")
+                    }
+                    Ok(ws) => format!(
+                        "running, ports {ports}, bridge returned {} window(s): {}",
+                        ws.len(),
+                        ws.iter()
+                            .map(|w| format!("{}={:.0}%", w.label, w.used * 100.0))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    Err(e) => format!("running, ports {ports}, but the quota RPC failed: {e}"),
+                }
+            }
             None => "not running".into(),
         }
     )
