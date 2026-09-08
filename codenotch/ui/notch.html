@@ -35,6 +35,74 @@
     bottom:calc(-1 * var(--fillet));
     background:radial-gradient(circle at 0 100%, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px));
   }
+  /* The other three edges.
+
+     The right edge is the shape everything else is written against, so the rules below say what
+     changes rather than restating it. Left is a mirror. Top and bottom turn the stack on its
+     side, which is upstream's reasoning and is arithmetic rather than taste: four cells stacked
+     vertically are about 400 pt long, and hanging that off the top of the screen would reach a
+     quarter of the way down it.
+
+     The fillets turn with the pill. They are the concave joins between the pill and the bezel,
+     so each one belongs to the two corners that touch the edge - which corners those are is the
+     whole difference between one edge and another. */
+  #root.edge-left #pill{
+    right:auto;left:0;border-radius:0 20px 20px 0;
+    border-right:1px solid #2e2e2e;border-left:none;
+  }
+  #root.edge-left #pill::before,#root.edge-left #pill::after{right:auto;left:0}
+  #root.edge-left #pill::before{
+    background:radial-gradient(circle at 100% 0, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px));
+  }
+  #root.edge-left #pill::after{
+    background:radial-gradient(circle at 100% 100%, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px));
+  }
+  #root.edge-left #card{left:80px;right:10px}
+  #root.edge-left #card::after{right:auto;left:-8px;border-width:8px 8px 8px 0;border-color:transparent #141414 transparent transparent}
+
+  /* Horizontal edges: the column becomes a row, and the card leaves along the other axis. */
+  #root.edge-top #pill,#root.edge-bottom #pill{
+    top:auto;left:50%;right:auto;transform:translateX(-50%);
+    flex-direction:row;width:auto;padding:0 18px;gap:14px;
+  }
+  #root.edge-top #pill{
+    top:0;border-radius:0 0 20px 20px;
+    border:1px solid #2e2e2e;border-top:none;
+  }
+  #root.edge-bottom #pill{
+    bottom:0;border-radius:20px 20px 0 0;
+    border:1px solid #2e2e2e;border-bottom:none;
+  }
+  /* The fillets move to the left and right of the pill rather than above and below it. */
+  #root.edge-top #pill::before,#root.edge-top #pill::after,
+  #root.edge-bottom #pill::before,#root.edge-bottom #pill::after{right:auto}
+  #root.edge-top #pill::before{top:0;left:calc(-1 * var(--fillet));
+    background:radial-gradient(circle at 0 100%, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px));}
+  #root.edge-top #pill::after{top:0;right:calc(-1 * var(--fillet));left:auto;
+    background:radial-gradient(circle at 100% 100%, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px));}
+  #root.edge-bottom #pill::before{bottom:0;top:auto;left:calc(-1 * var(--fillet));
+    background:radial-gradient(circle at 0 0, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px));}
+  #root.edge-bottom #pill::after{bottom:0;top:auto;right:calc(-1 * var(--fillet));left:auto;
+    background:radial-gradient(circle at 100% 0, transparent calc(var(--fillet) - 1.5px), #2e2e2e calc(var(--fillet) - 0.5px), #000 calc(var(--fillet) + 0.5px));}
+  #root.edge-top #card,#root.edge-bottom #card{
+    left:10px;right:10px;top:auto;transform:none;--tail:50%;
+  }
+  #root.edge-top #card{top:96px;bottom:10px}
+  #root.edge-bottom #card{top:10px;bottom:96px}
+  /* The tail points at the pill, so it moves to the card's top or bottom face. */
+  #root.edge-top #card::after{
+    right:auto;top:-8px;left:var(--tail);transform:translateX(-50%);
+    border-width:0 8px 8px 8px;border-color:transparent transparent #141414 transparent;
+  }
+  #root.edge-bottom #card::after{
+    right:auto;top:auto;bottom:-8px;left:var(--tail);transform:translateX(-50%);
+    border-width:8px 8px 0 8px;border-color:#141414 transparent transparent transparent;
+  }
+  /* Floating on a horizontal edge lifts along the other axis. */
+  #root.float.edge-top #pill{top:8px}
+  #root.float.edge-bottom #pill{bottom:8px}
+  #root.float.edge-left #pill{left:8px;right:auto;border-radius:20px;border-left:1px solid #2e2e2e}
+
   /* Floating: the pill lifts off the bezel instead of growing out of it. The window does not
      move - only the pill inside it - so placement, dragging and the interactive rectangles are
      untouched. The fillets go with it: they are the join to the bezel, and a shape that is not
@@ -308,7 +376,7 @@ function glyphHtml(p,small){
 // Provider table (order = top to bottom in the pill). `glyph` is the fallback letter used when no mark is available
 /* User preferences, pushed from the tray. Defaults match the previous behaviour exactly, so
    a config that has never been touched changes nothing. */
-let prefs={hidden_providers:[],ring_window:'auto',show_percent:true,show_countdown:true,show_pace_tick:true,show_activity_arc:true,float_pill:false,show_weekly_ring:true,show_hour_marks:true,remaining_mode:false,colorblind:false,show_stale_warning:true,red_threshold:0.8};
+let prefs={hidden_providers:[],ring_window:'auto',show_percent:true,show_countdown:true,show_pace_tick:true,show_activity_arc:true,float_pill:false,show_weekly_ring:true,show_hour_marks:true,remaining_mode:false,colorblind:false,show_stale_warning:true,red_threshold:0.8,edge:'right',opacity:1};
 
 function providers(){
   const list=[{id:'claude',name:'Claude',glyph:'C',snap:usage}];
@@ -465,7 +533,16 @@ function paceTick(w,r0,r1,style){
 
 function renderRing(){
   const ps=providers();
-  document.getElementById('root').classList.toggle('float',!!prefs.float_pill);
+  const root=document.getElementById('root');
+  root.classList.toggle('float',!!prefs.float_pill);
+  // One class rather than four booleans, so an edge that is added later cannot leave an old one
+  // still applied.
+  root.className=root.className.replace(/\bedge-\w+\b/g,'').trim();
+  root.classList.add('edge-'+(prefs.edge||'right'));
+  // Opacity on the pill alone, never on the root. The hover card and the menu are read rather
+  // than glanced at, and a translucent block of text over a bright window is unreadable in a
+  // way a translucent ring is not.
+  pill.style.opacity=String(Math.max(0.25,Math.min(1,prefs.opacity??1)));
   // Rebuild the DOM only when the structure changes (never swap the element under the cursor)
   const want=ps.map(p=>p.id+':'+(glyphs[p.id]?glyphs[p.id].kind:'-')).join(',');
   if(pill.dataset.cells!==want){
@@ -669,6 +746,17 @@ function renderCard(){
 function placeCard(){
   const cell=pill.querySelector(`.cell[data-p="${hoverId}"]`)||pill;
   const cr=cell.getBoundingClientRect();
+  const horizontal=(prefs.edge==='top'||prefs.edge==='bottom');
+  if(horizontal){
+    // The card spans the window and only the tail tracks the cell, because a card that slid
+    // sideways with the cursor would run off the end of a 460 pt window at the outer cells.
+    const cx=cr.left+cr.width/2;
+    const cardRect=card.getBoundingClientRect();
+    const tail=Math.max(16,Math.min(cardRect.width-16,Math.round(cx-cardRect.left)));
+    card.style.top=''; card.style.transform='none';
+    card.style.setProperty('--tail',tail+'px');
+    return;
+  }
   const cy=cr.top+cr.height/2;
   const H=innerHeight, ch=card.offsetHeight||0;
   let top=Math.round(cy-ch/2); top=Math.max(8,Math.min(top,H-ch-8));
@@ -728,7 +816,11 @@ setInterval(syncInteractive,1000);
 // Viewport fit (pure front-end fallback, independent of Rust): the window is 340 × primary scale physical px,
 // so if this page's CSS viewport is not 340 wide the WebView's DPR disagrees with the monitor; CSS zoom pulls the layout back to the design size.
 function fitZoom(){
-  const z=innerWidth/340;
+  // The design width depends on the edge: 340 for a side edge, 460 for a horizontal one, which
+  // is the window's own logical width in each case. Dividing by the wrong one applies a zoom of
+  // 1.35 and everything comes out oversized.
+  const design=(prefs.edge==='top'||prefs.edge==='bottom')?460:340;
+  const z=innerWidth/design;
   document.documentElement.style.zoom=(Math.abs(z-1)>0.02)?String(z):'';
   return z;
 }

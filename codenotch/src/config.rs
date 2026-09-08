@@ -104,6 +104,33 @@ pub struct Config {
     /// and the interactive rectangles working exactly as before.
     #[serde(default)]
     pub float_pill: bool,
+    /// Which screen edge the pill lives on: "right" | "left" | "top" | "bottom".
+    ///
+    /// Upstream's `NotchEdge`, and its reasoning: the edge decides which way the stack runs and
+    /// which way the hover card leaves. A side edge keeps the vertical column; top and bottom
+    /// turn it on its side, because four cells stacked vertically are about 400 pt long and
+    /// hanging that off the top of the screen would reach a quarter of the way down it.
+    #[serde(default = "default_edge")]
+    pub edge: String,
+    /// Which display: "primary" | "cursor" | the device name Windows gives it.
+    ///
+    /// A remembered name that is no longer attached falls back to the primary rather than being
+    /// honoured, because coordinates on a screen that does not exist put the pill somewhere the
+    /// user can neither see nor reach the setting to fix.
+    #[serde(default = "default_monitor")]
+    pub monitor: String,
+    /// How solid the pill is, 0.25 to 1.
+    ///
+    /// Applied in the page rather than to the window. A layered window's alpha would fade the
+    /// hover card and the menu with it, and those are things being read rather than glanced at.
+    #[serde(default = "default_opacity")]
+    pub opacity: f64,
+    /// Get out of the way when something goes full screen on the pill's own display.
+    ///
+    /// Per display on purpose. A game full screen on the left monitor is no reason to hide a
+    /// pill on the right one, and hiding it anyway is what makes people switch this off.
+    #[serde(default)]
+    pub hide_on_fullscreen: bool,
     /// Keep the five-hour window running back to back, rather than starting it by accident.
     ///
     /// Off by default and it must stay that way: this spends a message without being asked,
@@ -114,6 +141,18 @@ pub struct Config {
 
 fn yes() -> bool {
     true
+}
+
+fn default_edge() -> String {
+    "right".into()
+}
+
+fn default_monitor() -> String {
+    "primary".into()
+}
+
+fn default_opacity() -> f64 {
+    1.0
 }
 
 /// Eighty per cent, matching the ring's own red band and the mod's default.
@@ -161,6 +200,10 @@ impl Default for Config {
             show_stale_warning: true,
             float_pill: false,
             auto_start_window: false,
+            edge: default_edge(),
+            monitor: default_monitor(),
+            opacity: default_opacity(),
+            hide_on_fullscreen: false,
         }
     }
 }

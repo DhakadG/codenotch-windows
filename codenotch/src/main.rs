@@ -12,6 +12,7 @@ mod doctor;
 mod focus;
 mod hooks_install;
 mod notify;
+mod placement;
 mod oauth;
 mod window_start;
 mod i18n;
@@ -92,58 +93,201 @@ pub fn broadcast(app: &AppHandle) {
     let _ = app.emit("state", &snap);
 }
 
-/// Pins the notch to the right edge of the primary monitor; the other edges are a later milestone.
+/// Every attached display, as `placement` wants them.
+///
+/// Tauri gives names, positions, sizes and scale factors already, so nothing here needs Win32.
+/// The name is what gets persisted, because index and position both change when a display is
+/// unplugged and a remembered index would silently mean a different screen.
+fn monitors_of(w: &tauri::WebviewWindow) -> Vec<(String, placement::Rect, bool, f64)> {
+    let primary = w
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .and_then(|m| m.name().cloned());
+    w.available_monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| {
+            let name = m.name().cloned().unwrap_or_default();
+            let is_primary = primary.as_ref() == Some(&name);
+            (
+                name,
+                placement::Rect {
+                    x: m.position().x,
+                    y: m.position().y,
+                    w: m.size().width as i32,
+                    h: m.size().height as i32,
+                },
+                is_primary,
+                m.scale_factor(),
+            )
+        })
+        .collect()
+}
+
+/// The monitor the pill is currently placed on, for the full-screen watcher to compare against.
+static PILL_MONITOR: Mutex<Option<placement::Rect>> = Mutex::new(None);
+
+/// Put the pill on the configured edge of the configured display.
+///
+/// Was twenty lines pinning it to the right edge of the primary monitor. Each of those is now a
+/// setting, and the mixed-DPI care the original needed applies to all of them: a second monitor
+/// at a different scale can have the physical size computed with the *other* monitor's factor,
+/// which left the WebView 256 logical pixels wide instead of 340. So the size is pinned from the
+/// chosen monitor's own scale before positioning, and pinned again if it still disagrees.
 pub fn place_notch(app: &AppHandle) {
     let Some(w) = app.get_webview_window("notch") else {
         return;
     };
-    let scale = w.scale_factor().unwrap_or(1.0);
-    if let Ok(Some(mon)) = w.primary_monitor() {
-        // Two monitors at different scales (150 % and 200 % in practice): the physical size can
-        // end up converted with the *other* monitor's scale factor depending on where the window
-        // is created and then moved, leaving the WebView ~256 logical px wide instead of 340.
-        // So the physical size is pinned straight from mon.scale_factor() before placing the
-        // window; if it still reports a different scale afterwards, it is pinned once more.
-        let ms = mon.scale_factor();
-        let target = tauri::PhysicalSize::new((NOTCH_W * ms).round() as u32, (NOTCH_H * ms).round() as u32);
-        let _ = w.set_size(target);
-        // Position from the window's measured physical size — deriving it from the scale factor
-        // pushed the window past the right edge at 125 % / 150 % (the ring's right side was clipped).
-        let (ww, wh) = w
-            .outer_size()
-            .map(|s| (s.width as i32, s.height as i32))
-            .unwrap_or(((NOTCH_W * scale) as i32, (NOTCH_H * scale) as i32));
-        let x = mon.position().x + mon.size().width as i32 - ww;
-        // Vertical position comes from the configured ratio (the pill can be dragged; it persists), clamped to the monitor
-        let ratio = {
-            let st = app.state::<AppState>();
-            let c = st.cfg.lock().unwrap();
-            c.notch_y.clamp(0.0, 1.0)
-        };
-        let mh = mon.size().height as i32;
-        let y = (mon.position().y as f64 + mh as f64 * ratio - wh as f64 / 2.0).round() as i32;
-        let y = y.clamp(mon.position().y, mon.position().y + (mh - wh).max(0));
-        let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
-        if w.outer_size().map(|s| s.width != target.width).unwrap_or(false) {
-            let _ = w.set_size(target);
-            let x = mon.position().x + mon.size().width as i32 - target.width as i32;
-            let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+    let (target, edge, along) = {
+        let st = app.state::<AppState>();
+        let c = st.cfg.lock().unwrap();
+        (
+            placement::Target::parse(&c.monitor),
+            placement::Edge::parse(&c.edge),
+            c.notch_y.clamp(0.0, 1.0),
+        )
+    };
+
+    let all = monitors_of(&w);
+    let simple: Vec<(String, placement::Rect, bool)> =
+        all.iter().map(|(n, r, p, _)| (n.clone(), *r, *p)).collect();
+    let cursor = app.cursor_position().ok().map(|c| (c.x as i32, c.y as i32));
+    let Some((name, mon, _)) = placement::choose_monitor(&target, &simple, cursor) else {
+        applog("notch placement: no monitors reported; leaving the window where it is");
+        return;
+    };
+    // Said once when it happens, because a pill that moved on its own is otherwise inexplicable.
+    if let placement::Target::Named(wanted) = &target {
+        if wanted != name {
+            applog(&format!(
+                "notch placement: display {wanted} is not attached; using {name} instead"
+            ));
         }
-        // Placement log line: the first thing to check when the notch is not visible
-        let log = config::config_path().with_file_name("run.log");
-        let _ = std::fs::write(
-            log,
-            format!(
-                "notch placed build={BUILD}: pos=({x},{y}) size=({ww}x{wh}) inner={:?} win_scale={scale} mon_scale={ms} monitor=({},{} {}x{})\n",
-                w.inner_size().map(|s| (s.width, s.height)).unwrap_or((0, 0)),
-                mon.position().x,
-                mon.position().y,
-                mon.size().width,
-                mon.size().height
-            ),
-        );
     }
+    let ms = all
+        .iter()
+        .find(|(n, _, _, _)| n == name)
+        .map(|(_, _, _, s)| *s)
+        .unwrap_or(1.0);
+
+    let (lw, lh) = edge.size();
+    let target_size =
+        tauri::PhysicalSize::new((lw * ms).round() as u32, (lh * ms).round() as u32);
+    let _ = w.set_size(target_size);
+    // Measured rather than derived: computing the position from the scale factor pushed the
+    // window past the edge at 125 % and 150 %, clipping the ring.
+    let (ww, wh) = w
+        .outer_size()
+        .map(|s| (s.width as i32, s.height as i32))
+        .unwrap_or((target_size.width as i32, target_size.height as i32));
+    let (x, y) = placement::window_origin(mon, edge, along, (ww, wh));
+    let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+    if w.outer_size().map(|s| s.width != target_size.width).unwrap_or(false) {
+        let _ = w.set_size(target_size);
+        let (x2, y2) = placement::window_origin(
+            mon,
+            edge,
+            along,
+            (target_size.width as i32, target_size.height as i32),
+        );
+        let _ = w.set_position(tauri::PhysicalPosition::new(x2, y2));
+    }
+    *PILL_MONITOR.lock().unwrap() = Some(mon);
+
+    // Placement log line: the first thing to check when the notch is not visible.
+    let log = config::config_path().with_file_name("run.log");
+    let _ = std::fs::write(
+        log,
+        format!(
+            "notch placed build={BUILD}: edge={} display={name} pos=({x},{y}) size=({ww}x{wh}) mon_scale={ms} monitor=({},{} {}x{})\n",
+            edge.as_str(),
+            mon.x,
+            mon.y,
+            mon.w,
+            mon.h
+        ),
+    );
 }
+
+/// Hide the pill while something is full screen on its own display, and bring it back after.
+///
+/// Polled rather than hooked. `SetWinEventHook` would be the tidy answer and needs a message
+/// loop of its own on a thread that must then outlive every other thread here; a second of
+/// latency on a state that changes when someone alt-tabs into a game is not worth that.
+#[cfg(windows)]
+pub fn start_fullscreen_watcher(app: AppHandle) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
+
+    std::thread::spawn(move || {
+        let mut hidden = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            let enabled = config::load().hide_on_fullscreen;
+            let pill = *PILL_MONITOR.lock().unwrap();
+            let Some(pill) = pill else { continue };
+
+            let foreground = unsafe {
+                let hwnd = GetForegroundWindow();
+                if hwnd.0.is_null() {
+                    None
+                } else {
+                    let mut wr = RECT::default();
+                    let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    let mut mi = MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    if GetWindowRect(hwnd, &mut wr).is_ok()
+                        && GetMonitorInfoW(hmon, &mut mi).as_bool()
+                    {
+                        let to_rect = |r: RECT| placement::Rect {
+                            x: r.left,
+                            y: r.top,
+                            w: r.right - r.left,
+                            h: r.bottom - r.top,
+                        };
+                        Some((to_rect(wr), to_rect(mi.rcMonitor)))
+                    } else {
+                        None
+                    }
+                }
+            };
+            // Our own window is never the reason to hide our own window. It is borderless and
+            // always on top, so on a small display its rect can cover the monitor and the check
+            // would hide the pill the moment it was clicked.
+            let foreground = foreground.filter(|(win, _)| {
+                app.get_webview_window("notch")
+                    .and_then(|w| w.outer_position().ok().zip(w.outer_size().ok()))
+                    .map(|(p, s)| {
+                        !(win.x == p.x && win.y == p.y
+                            && win.w == s.width as i32
+                            && win.h == s.height as i32)
+                    })
+                    .unwrap_or(true)
+            });
+
+            let want_hidden = placement::should_hide(enabled, foreground, pill);
+            if want_hidden != hidden {
+                if let Some(w) = app.get_webview_window("notch") {
+                    let _ = if want_hidden { w.hide() } else { w.show() };
+                }
+                applog(&format!(
+                    "fullscreen watcher: {} the pill",
+                    if want_hidden { "hid" } else { "restored" }
+                ));
+                hidden = want_hidden;
+            }
+        }
+    });
+}
+
+#[cfg(not(windows))]
+pub fn start_fullscreen_watcher(_app: AppHandle) {}
 
 /// Older entry point name still used by tray.rs
 pub fn reset_bar(app: &AppHandle) {
@@ -182,45 +326,66 @@ fn drag_begin(app: AppHandle) {
             DRAGGING.store(false, std::sync::atomic::Ordering::SeqCst);
             return;
         };
-        let (Ok(start_cur), Ok(start_pos), Ok(size), Ok(Some(mon))) =
-            (app.cursor_position(), w.outer_position(), w.outer_size(), w.primary_monitor())
+        let (Ok(start_cur), Ok(start_pos), Ok(size)) =
+            (app.cursor_position(), w.outer_position(), w.outer_size())
         else {
             DRAGGING.store(false, std::sync::atomic::Ordering::SeqCst);
             return;
         };
-        let (my, mh) = (mon.position().y, mon.size().height as i32);
-        let wh = size.height as i32;
-        let lo = my;
-        let hi = my + (mh - wh).max(0);
-        let mut last_y = start_pos.y;
+        // The monitor the pill is actually on, not the primary one. Dragging a pill that lives
+        // on a second display used to be clamped to the primary display's height, which on a
+        // taller secondary meant it stopped half way down and on a shorter one meant it could be
+        // dragged off the bottom.
+        let edge = placement::Edge::parse(&app.state::<AppState>().cfg.lock().unwrap().edge);
+        let Some(mon) = *PILL_MONITOR.lock().unwrap() else {
+            DRAGGING.store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        };
+        let win = (size.width as i32, size.height as i32);
+        let mut last = (start_pos.x, start_pos.y);
         let mut moved = false;
         loop {
             if !left_button_down() {
                 break;
             }
             if let Ok(cur) = app.cursor_position() {
-                let ny = (start_pos.y as f64 + (cur.y - start_cur.y)).round() as i32;
-                let ny = ny.clamp(lo, hi);
-                if ny != last_y {
-                    last_y = ny;
+                // Only the axis the edge runs along moves. The other stays welded, which is what
+                // makes this a slide rather than a free drag - the pill belongs to an edge, and
+                // letting it come away from one would need somewhere to put it back.
+                let along = if edge.is_vertical() {
+                    let y = (start_pos.y as f64 + (cur.y - start_cur.y)).round() as i32;
+                    placement::along_from_origin(mon, edge, (start_pos.x, y), win)
+                } else {
+                    let x = (start_pos.x as f64 + (cur.x - start_cur.x)).round() as i32;
+                    placement::along_from_origin(mon, edge, (x, start_pos.y), win)
+                };
+                let next = placement::window_origin(mon, edge, along, win);
+                if next != last {
+                    last = next;
                     moved = true;
-                    let _ = w.set_position(tauri::PhysicalPosition::new(start_pos.x, ny));
+                    let _ = w.set_position(tauri::PhysicalPosition::new(next.0, next.1));
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
         if moved {
-            let ratio = ((last_y + wh / 2 - my) as f64 / mh as f64).clamp(0.0, 1.0);
+            let ratio = placement::along_from_origin(mon, edge, last, win);
             let st = app.state::<AppState>();
             let mut c = st.cfg.lock().unwrap();
             c.notch_y = ratio;
             config::save(&c);
-            applog(&format!("notch drag: y={last_y} ratio={ratio:.3}"));
+            applog(&format!(
+                "notch drag: edge={} pos=({},{}) ratio={ratio:.3}",
+                edge.as_str(),
+                last.0,
+                last.1
+            ));
         }
         DRAGGING.store(false, std::sync::atomic::Ordering::SeqCst);
         let _ = app.emit("drag_end", moved);
     });
 }
+
 pub fn place_bar(app: &AppHandle) {
     place_notch(app);
 }
@@ -359,6 +524,8 @@ pub struct Prefs {
     pub colorblind: bool,
     pub show_stale_warning: bool,
     pub red_threshold: f64,
+    pub edge: String,
+    pub opacity: f64,
     pub float_pill: bool,
 }
 
@@ -379,6 +546,8 @@ impl Prefs {
             colorblind: c.colorblind,
             show_stale_warning: c.show_stale_warning,
             red_threshold: c.red_threshold,
+            edge: c.edge.clone(),
+            opacity: c.opacity.clamp(0.25, 1.0),
             float_pill: c.float_pill,
         }
     }
@@ -920,6 +1089,7 @@ fn main() {
             antigravity::start(handle.clone());
             activity::start(handle.clone());
             window_start::start_watcher(handle.clone());
+            start_fullscreen_watcher(handle.clone());
             notify::start_watcher(handle.clone());
             // Collecting glyphs may read icon resources out of a few executables; do it off the main thread and push when done
             let gh = handle.clone();
