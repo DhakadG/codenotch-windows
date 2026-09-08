@@ -33,6 +33,15 @@ reviews:
       - main
       - ship-it
       - 'release/.*'
+      # Stacked pull requests target the branch below them rather than `ship-it`, and every one
+      # of those was silently skipped - the note in the summary says "auto reviews are disabled
+      # on base/target branches other than the default branch", which reads like a plan
+      # limitation rather than a list this file controls. Five reviews were lost to that before
+      # anyone noticed the pattern.
+      - 'feat/.*'
+      - 'fix/.*'
+      - 'chore/.*'
+      - 'docs/.*'
     drafts: false
 
   path_filters:
