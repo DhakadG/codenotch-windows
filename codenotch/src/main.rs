@@ -673,6 +673,135 @@ pub fn begin_sign_in(app: &AppHandle) {
     }
 }
 
+
+/// The whole configuration, plus the things the settings window needs to render choices it
+/// cannot work out on its own.
+///
+/// The config is sent as itself rather than through a hand-written data transfer object. A DTO
+/// would be one more list of fields to keep in step with `Config`, and the failure mode of
+/// forgetting is a setting that silently cannot be changed - which is exactly the class of bug
+/// this window exists to remove.
+#[derive(serde::Serialize)]
+pub struct SettingsView {
+    #[serde(flatten)]
+    cfg: config::Config,
+    /// Build identity, so a screenshot of this window is attributable to a build.
+    build: String,
+    monitors: Vec<MonitorChoice>,
+}
+
+#[derive(serde::Serialize)]
+pub struct MonitorChoice {
+    /// What gets stored: the device name, or the two special values.
+    id: String,
+    /// What a person can recognise.
+    label: String,
+}
+
+#[tauri::command]
+fn settings_load(app: AppHandle, state: tauri::State<AppState>) -> SettingsView {
+    let cfg = state.cfg.lock().unwrap().clone();
+    let mut monitors = vec![
+        MonitorChoice { id: "primary".into(), label: "Primary display".into() },
+        MonitorChoice { id: "cursor".into(), label: "Wherever the pointer is".into() },
+    ];
+    if let Some(w) = app.get_webview_window("notch") {
+        for (name, rect, is_primary, scale) in monitors_of(&w) {
+            // The device name is unreadable on its own - "\\.\DISPLAY2" tells nobody which
+            // screen that is - so it is offered with the size and position that identify it.
+            monitors.push(MonitorChoice {
+                label: format!(
+                    "{}\u{00d7}{} at ({}, {}){}{}",
+                    rect.w,
+                    rect.h,
+                    rect.x,
+                    rect.y,
+                    if is_primary { " \u{2013} primary" } else { "" },
+                    if (scale - 1.0).abs() > 0.01 {
+                        format!(" \u{2013} {}%", (scale * 100.0).round())
+                    } else {
+                        String::new()
+                    }
+                ),
+                id: name,
+            });
+        }
+    }
+    SettingsView { cfg, build: version_line(), monitors }
+}
+
+#[tauri::command]
+fn settings_save(app: AppHandle, next: config::Config) {
+    // Clamped here rather than trusted from the page. The window is ours, but it is still the
+    // outside of this boundary, and an opacity of zero or a threshold above one would be a
+    // setting the user cannot see well enough to undo.
+    let mut next = next;
+    next.opacity = next.opacity.clamp(0.25, 1.0);
+    next.red_threshold = next.red_threshold.clamp(0.5, 0.95);
+    next.notch_y = next.notch_y.clamp(0.0, 1.0);
+    next.edge = placement::Edge::parse(&next.edge).as_str().to_string();
+
+    let lang_changed = {
+        let st = app.state::<AppState>();
+        let mut c = st.cfg.lock().unwrap();
+        let changed = c.lang != next.lang;
+        *c = next;
+        config::save(&c);
+        changed
+    };
+    broadcast_prefs(&app);
+    place_notch(&app);
+    if lang_changed {
+        apply_lang(&app, &config::load().lang);
+    }
+    let _ = tray::rebuild(&app);
+    applog("settings: saved");
+}
+
+#[tauri::command]
+fn open_data_folder() {
+    let dir = config::config_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let _ = std::fs::create_dir_all(&dir);
+    open_in_browser(&dir.display().to_string());
+}
+
+#[tauri::command]
+fn reset_position(app: AppHandle) {
+    reset_bar(&app);
+}
+
+/// Show the settings window, creating it if it has been closed.
+///
+/// Closing a Tauri window destroys it, so a second open has to build it again rather than
+/// unhide something that is no longer there.
+pub fn open_settings(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("settings") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        return;
+    }
+    match tauri::WebviewWindowBuilder::new(
+        app,
+        "settings",
+        tauri::WebviewUrl::App("settings.html".into()),
+    )
+    .title("Codenotch settings")
+    .inner_size(640.0, 720.0)
+    .min_inner_size(460.0, 420.0)
+    .center()
+    .build()
+    {
+        Ok(w) => {
+            let _ = w.set_focus();
+        }
+        Err(e) => applog(&format!("settings window could not be created: {e}")),
+    }
+}
+
 /// Card expansion state: Some(hot rectangles, in **physical pixels** relative to the window's
 /// top-left as x,y,w,h) = expanded; None = collapsed. The page converts the rectangles with its
 /// own devicePixelRatio before reporting them, so no scale conversion happens on this side —
@@ -1056,6 +1185,10 @@ fn main() {
             get_cursor,
             get_antigravity,
             get_prefs,
+            settings_load,
+            settings_save,
+            open_data_folder,
+            reset_position,
             refresh_provider,
             hide_provider,
             get_glyphs,
