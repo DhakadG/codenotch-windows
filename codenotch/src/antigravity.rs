@@ -245,9 +245,36 @@ fn local_agent() -> Option<ureq::Agent> {
 ///
 /// Routine polling now reads whatever the server already has, which is the same number it
 /// would compute anyway. Only an explicit refresh from the user forces it.
+/// The port that last served the quota RPC.
+///
+/// Upstream's own comment says the language server "opens two and only one serves this RPC, and
+/// which is which is not advertised - so both are tried rather than guessed at." Trying both is
+/// right the first time and wrong every time after: the port that does *not* serve it was still
+/// being sent a Connect-RPC POST on every poll, and a listener handed a protocol it does not
+/// speak tears the stream down. That is what
+///
+///     [Error] Stopping server failed
+///       Message: Cannot call write after a stream was destroyed
+///
+/// in Antigravity's own output is, and it is why the IDE was stable whenever this provider was
+/// switched off.
+///
+/// So the answer is remembered. The wrong port is now poked once, when the endpoint is first
+/// discovered, and never again while that discovery holds.
+static LAST_GOOD_PORT: std::sync::Mutex<Option<u16>> = std::sync::Mutex::new(None);
+
 fn bridge_quota(ep: &Endpoint, force: bool) -> Result<Vec<LimitWindow>, String> {
     let agent = local_agent().ok_or("TLS setup failed")?;
     let mut last = String::from("no port answered");
+    // Known-good port first, and alone when it works. Only a failure falls through to the
+    // others, which is also what re-discovers the RPC after the language server restarts on
+    // different ports.
+    let remembered = *LAST_GOOD_PORT.lock().unwrap();
+    let order: Vec<u16> = remembered
+        .filter(|p| ep.ports.contains(p))
+        .into_iter()
+        .chain(ep.ports.iter().copied().filter(|p| Some(*p) != remembered))
+        .collect();
     // Whether any port replied with a well-formed quota document that simply listed no
     // groups. That is a working bridge reporting nothing to meter, which is a different
     // outcome from every port refusing, timing out or returning something unparseable -
@@ -255,7 +282,7 @@ fn bridge_quota(ep: &Endpoint, force: bool) -> Result<Vec<LimitWindow>, String> 
     // not there. Only settled after every port has been tried, so that a genuinely empty
     // answer from the first port cannot mask real windows on the second.
     let mut answered_empty = false;
-    for port in &ep.ports {
+    for port in &order {
         let url = format!("https://127.0.0.1:{port}{LS_SERVICE}");
         match agent
             .post(&url)
@@ -270,8 +297,17 @@ fn bridge_quota(ep: &Endpoint, force: bool) -> Result<Vec<LimitWindow>, String> 
             Ok(r) => match r.into_json::<serde_json::Value>() {
                 Ok(v) => {
                     let w = windows_from_bridge(&v);
+                    // A well-formed reply means this is the port that serves the RPC, whether
+                    // or not it had anything to report. Remember it either way.
+                    *LAST_GOOD_PORT.lock().unwrap() = Some(*port);
                     if !w.is_empty() {
                         return Ok(w);
+                    }
+                    // An empty answer from the port we already know serves this is the answer.
+                    // Only an empty answer from a port we were still identifying is worth
+                    // following with another attempt, in case the real one is further down.
+                    if remembered == Some(*port) {
+                        return Ok(Vec::new());
                     }
                     answered_empty = true;
                     last = format!("port {port}: no recognisable groups");

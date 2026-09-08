@@ -310,3 +310,31 @@ fn bridge_parsing_survives_shapes_it_has_never_seen() {
         assert!(windows_from_bridge(&v).is_empty(), "unexpected windows for {v}");
     }
 }
+
+/// Which port is tried, and in what order.
+///
+/// The rule is the whole point of the fix: once a port has served the RPC, the other one must
+/// not be contacted again. Poking a listener with a protocol it does not speak is what tore
+/// down streams inside Antigravity itself.
+fn probe_order(ports: &[u16], remembered: Option<u16>) -> Vec<u16> {
+    remembered
+        .filter(|p| ports.contains(p))
+        .into_iter()
+        .chain(ports.iter().copied().filter(|p| Some(*p) != remembered))
+        .collect()
+}
+
+#[test]
+fn the_known_good_port_is_tried_first_and_never_listed_twice() {
+    let ports = vec![42100u16, 42101];
+    // Nothing remembered yet: discovery order, both candidates present.
+    assert_eq!(probe_order(&ports, None), vec![42100, 42101]);
+    // Remembered: it leads, and appears exactly once.
+    assert_eq!(probe_order(&ports, Some(42101)), vec![42101, 42100]);
+    assert_eq!(probe_order(&ports, Some(42100)), vec![42100, 42101]);
+    // A remembered port the server no longer listens on is dropped, not dialled: the language
+    // server restarts on different ports, and chasing a dead one wastes the first attempt of
+    // every poll.
+    assert_eq!(probe_order(&ports, Some(9999)), vec![42100, 42101]);
+    assert!(probe_order(&[], Some(42100)).is_empty());
+}
