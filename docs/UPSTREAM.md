@@ -141,8 +141,12 @@ that worked, and an hour went into debugging the wrong binary.
 The macOS app has moved on since this port was written. Not yet here:
 
 - **Providers**: GLM, Grok, OpenCode, Perplexity.
-- **`WebSessionProvider`** — a session this app owns, rather than one borrowed, which is the
-  only route by which a real sign-out or in-app sign-in is possible.
+- ~~**`WebSessionProvider`**~~ — done, differently. Upstream's description of it, "a session
+  this app owns, rather than one borrowed, which is the only route by which a real sign-out or
+  in-app sign-in is possible", is exactly what `oauth.rs` implements here: PKCE against the
+  same public client the CLI uses, the token in Windows Credential Manager, refreshed before
+  it expires. Sign-in and sign-out are both real. The borrowed credential remains the fallback
+  for anyone who has not signed in, so nothing was taken away.
 - **`ClaudeProfile`** — multiple Claude accounts, each with its own credential.
 - **`CredentialCache`** — holds a credential until it expires. On macOS this saves a keychain
   prompt; here it would only save a file read, so the value is smaller, but it is free.

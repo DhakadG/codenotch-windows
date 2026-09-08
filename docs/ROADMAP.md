@@ -1,14 +1,18 @@
 # Roadmap
 
-## Open question: does `claude auth status` refresh an expired token?
+## Settled: `claude auth status` does not refresh an expired token
 
-The credential nudge assumes it might, and records what actually happened either way. The
-answer is in `run.log` the first time a token expires with the app running - look for
-`claude credential nudge:`. If it reports "did not refresh the expired credential", the
-heavier option is to start a real Claude Code session and kill it after a few seconds, which
-does refresh but writes a transcript. That transcript would appear in this app as a phantom
-working session, so taking that route means teaching `watcher.rs` to ignore the directory the
-refresh session runs in. Not worth building until the log says it is needed.
+It was asked because the answer decided how the app should behave when a borrowed credential
+aged out. In practice neither the nudge nor the tray's Refresh credentials ever refreshed
+anything, and the only cure was opening Claude Code and signing in again - every time.
+
+The route out was not the heavier one this file proposed. The application now holds **its own
+Claude session** (`oauth.rs`), which it can refresh because it owns it, so an expired borrowed
+credential is no longer the end of the road. The nudge remains as the fallback for anyone who
+has not signed in here, where it is still the only move available.
+
+The phantom-session hazard described below never had to be faced, and `watcher.rs` needs no
+directory exclusion.
 
 ## Upstream has moved on
 
@@ -35,12 +39,15 @@ Ordered roughly by how much a user would notice its absence.
 
 ## Native settings window
 
-Today the tray menu carries every choice: refresh, reset position, open the data folder,
-start with Windows, install or uninstall the Claude Code hooks, and language. That is
-already at the limit of what a menu should hold, and the next setting will not fit.
+The tray menu was described here as "already at the limit of what a menu should hold". It
+has since gained a Providers submenu, a Ring shows submenu, a six-item Show submenu, sign in
+and sign out, two window-starter items, three display modes, the float toggle and the hook
+shell shortcut. It is well past that limit and the argument for a settings window is now much
+stronger than when this was written.
 
-Needed once there is anything to configure that is not a toggle — provider order, per-window
-thresholds, or a poll interval. Wants a second Tauri window rather than more menu items.
+Needed for anything that is not a toggle - provider order, per-window thresholds, a poll
+interval, the red threshold that currently only exists in `config.json`. Wants a second Tauri
+window rather than more menu items.
 
 ## Four-edge placement
 
@@ -52,13 +59,6 @@ Related and larger: pinning to a chosen display rather than the primary one. Ups
 two open pull requests on exactly this for macOS, so the design should follow whichever one
 lands rather than inventing a third answer.
 
-## Click-through outside the pill
-
-The window is a 340 x 460 rectangle that is mostly transparent, and the transparent part
-still swallows clicks. On Windows this is `WS_EX_TRANSPARENT` toggled by hit-testing against
-the pill's actual bounds, which interacts awkwardly with the non-activating window and the
-`mouseleave` handling that already needed care.
-
 ## Session list with click-to-jump
 
 The hover card shows per-window bars and the working arc, but not which sessions are
@@ -67,7 +67,8 @@ raising the right terminal or editor window when one is clicked.
 
 ## More locales
 
-`i18n.rs` covers English, Chinese and Japanese, chosen because the author could verify them.
+`i18n.rs` covers English, Chinese, Japanese and Korean, chosen because the author could
+verify them.
 Everything user-visible is already routed through it, so a new locale is a data change
 rather than a code change. Contributions welcome; machine-translated strings are not, since
 nobody can review them.
