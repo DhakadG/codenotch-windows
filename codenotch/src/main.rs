@@ -352,6 +352,8 @@ pub struct Prefs {
     pub show_countdown: bool,
     pub show_pace_tick: bool,
     pub show_activity_arc: bool,
+    pub show_weekly_ring: bool,
+    pub show_hour_marks: bool,
     pub float_pill: bool,
 }
 
@@ -366,6 +368,8 @@ impl Prefs {
             show_countdown: c.show_countdown,
             show_pace_tick: c.show_pace_tick,
             show_activity_arc: c.show_activity_arc,
+            show_weekly_ring: c.show_weekly_ring,
+            show_hour_marks: c.show_hour_marks,
             float_pill: c.float_pill,
         }
     }

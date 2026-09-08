@@ -91,6 +91,8 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
             ("countdown", c.show_countdown),
             ("pace_tick", c.show_pace_tick),
             ("activity_arc", c.show_activity_arc),
+            ("weekly_ring", c.show_weekly_ring),
+            ("hour_marks", c.show_hour_marks),
         ]
     };
     let mut show_items = Vec::new();
@@ -253,6 +255,8 @@ fn handle(app: &AppHandle, id: &str) {
                     "countdown" => c.show_countdown = !c.show_countdown,
                     "pace_tick" => c.show_pace_tick = !c.show_pace_tick,
                     "activity_arc" => c.show_activity_arc = !c.show_activity_arc,
+                    "weekly_ring" => c.show_weekly_ring = !c.show_weekly_ring,
+                    "hour_marks" => c.show_hour_marks = !c.show_hour_marks,
                     // An id built here that nothing matches would silently do nothing, which is
                     // the failure mode worth naming rather than the one worth ignoring.
                     other => crate::applog(&format!("tray: unknown show toggle {other:?}")),

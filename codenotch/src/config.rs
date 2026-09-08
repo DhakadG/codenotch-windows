@@ -56,6 +56,16 @@ pub struct Config {
     /// The inner arc: turning while a session works, amber while one waits on you.
     #[serde(default = "yes")]
     pub show_activity_arc: bool,
+    /// The thin weekly ring inside the thick one.
+    ///
+    /// Both windows at once, because they answer different questions and the answer to one
+    /// does not imply the other: a comfortable weekly figure says nothing about the next five
+    /// hours, and a spent five-hour window says nothing about the week.
+    #[serde(default = "yes")]
+    pub show_weekly_ring: bool,
+    /// The five faint hour boundaries on the five-hour ring.
+    #[serde(default = "yes")]
+    pub show_hour_marks: bool,
     /// Lift the pill off the screen edge instead of welding it there.
     ///
     /// Upstream is welded on purpose - the fillets that join the pill to the bezel are the
@@ -110,6 +120,8 @@ impl Default for Config {
             show_countdown: true,
             show_pace_tick: true,
             show_activity_arc: true,
+            show_weekly_ring: true,
+            show_hour_marks: true,
             float_pill: false,
             auto_start_window: false,
         }
