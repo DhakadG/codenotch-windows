@@ -123,6 +123,13 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     )
     .build(app)?;
 
+    // Offered only when there is a session of its own to send from. Sending inference on
+    // Claude Code's borrowed credential is a line this app does not cross, so an item that
+    // could only ever say so is an item not worth showing.
+    let start_window = MenuItemBuilder::with_id("start-window", tr(lang, "start_window"))
+        .enabled(signed_in)
+        .build(app)?;
+
     let refresh = MenuItemBuilder::with_id("refresh", tr(lang, "refresh")).build(app)?;
     let refresh_creds =
         MenuItemBuilder::with_id("refresh-creds", tr(lang, "refresh_creds")).build(app)?;
@@ -143,6 +150,7 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     MenuBuilder::new(app)
         .items(&[hook_item])
         .item(&sign_item)
+        .item(&start_window)
         .separator()
         .item(&provider_menu)
         .item(&ring_menu)
@@ -245,6 +253,31 @@ fn handle(app: &AppHandle, id: &str) {
             }
             crate::broadcast_prefs(app);
             refresh_menu(app);
+        }
+        "start-window" => {
+            // The reset time of the five-hour window as last read, so the request can be
+            // refused when one is already running rather than spending a message to learn it.
+            let open_until = {
+                let st = app.state::<crate::AppState>();
+                let u = st.usage.lock().unwrap();
+                u.windows
+                    .iter()
+                    .find(|w| w.id == "session" || w.id == "five_hour")
+                    .and_then(|w| w.resets_at)
+                    .map(|ms| ms / 1000)
+            };
+            let app = app.clone();
+            // Off the menu thread: this is a network call, and a tray menu that stays open
+            // while it waits looks like the click did nothing.
+            std::thread::spawn(move || {
+                let msg = match crate::window_start::start_window(open_until) {
+                    Ok(m) => m,
+                    Err(e) => e,
+                };
+                crate::applog(&format!("window start: {msg}"));
+                let _ = app.emit("notice", msg);
+                crate::usage::request_refresh();
+            });
         }
         "sign-in" => crate::begin_sign_in(app),
         "sign-out" => {

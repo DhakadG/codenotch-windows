@@ -12,6 +12,7 @@ mod doctor;
 mod focus;
 mod hooks_install;
 mod oauth;
+mod window_start;
 mod i18n;
 mod server;
 mod state;
