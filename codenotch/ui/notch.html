@@ -44,7 +44,29 @@
     box-shadow:0 6px 20px rgba(0,0,0,.45);
   }
   #root.float #pill::before,#root.float #pill::after{display:none}
-  .cell{display:flex;flex-direction:column;align-items:center;gap:6px}
+  /* Press feedback.
+     A click here does something invisible - it asks for a refetch - so without this the only
+     way to know the click registered is to watch the number and hope. The cell dips slightly
+     and dims, which is the gesture every button on the system makes and needs no explaining.
+     transform and opacity only: those are the two properties this WebView can animate without
+     repainting, and a repaint in a transparent always-on-top window stutters the desktop
+     compositor. 90ms out, 160ms back - fast enough to feel like a response rather than an
+     animation, slow enough to be seen on a click that is over in 40ms.
+     `.acted` is a second, brighter beat fired when the action actually goes out, so a click
+     that opens a page and a click that refreshes do not feel identical. */
+  .cell{display:flex;flex-direction:column;align-items:center;gap:6px;
+    transition:transform 160ms cubic-bezier(.2,.7,.3,1),opacity 160ms ease;
+    will-change:transform,opacity}
+  .cell.pressed{transform:scale(.9);opacity:.65;transition-duration:90ms}
+  @keyframes cell-ack{0%{transform:scale(.94)}55%{transform:scale(1.06)}100%{transform:scale(1)}}
+  .cell.acted{animation:cell-ack 260ms cubic-bezier(.2,.7,.3,1)}
+  /* Someone who asked the system to stop animating still needs to know the click landed, so
+     the dip stays and only its motion goes: it becomes an instant state change rather than a
+     transition, and the acknowledgement beat is dropped entirely. */
+  @media (prefers-reduced-motion:reduce){
+    .cell{transition:none}
+    .cell.acted{animation:none}
+  }
   .ringwrap{position:relative;width:56px;height:56px}
   .ringwrap > svg.ring{position:absolute;inset:0;overflow:visible} /* pins only the ring itself; an inline logo svg must not match this or it ends up in the top-left corner */
   .glyph{
@@ -604,7 +626,33 @@ listen('state',()=>{syncInteractive();}).catch(()=>{});
 /* The pill can be dragged up and down the right edge. Press and move more than 4 px = drag (handed to Rust,
    which follows the system cursor; the card is collapsed first); release without moving = click (opens the provider's usage page). */
 let press=null, dragging=false;
-pill.addEventListener('mousedown',e=>{ if(e.button!==0)return; press={x:e.clientX,y:e.clientY,id:cellAt(e.clientX,e.clientY)||hoverId}; });
+function cellEl(id){return id?pill.querySelector(`.cell[data-p="${id}"]`):null;}
+/* Held while the button is down, released on mouseup wherever it happens - including outside
+   the window, which is why this listens on the document rather than on the cell. A cell left
+   looking pressed because the pointer wandered off is worse than no feedback at all. */
+let pressedEl=null;
+function setPressed(el){
+  if(pressedEl===el)return;
+  if(pressedEl)pressedEl.classList.remove('pressed');
+  pressedEl=el;
+  if(pressedEl)pressedEl.classList.add('pressed');
+}
+/* The beat that says the action went out. Restarted rather than queued: a second click during
+   the first beat should show its own, not be swallowed. */
+function ack(id){
+  const el=cellEl(id); if(!el)return;
+  el.classList.remove('acted');
+  void el.offsetWidth; // reflow, so removing and re-adding restarts the animation
+  el.classList.add('acted');
+  el.addEventListener('animationend',()=>el.classList.remove('acted'),{once:true});
+}
+pill.addEventListener('mousedown',e=>{
+  if(e.button!==0)return;
+  const id=cellAt(e.clientX,e.clientY)||hoverId;
+  press={x:e.clientX,y:e.clientY,id};
+  setPressed(cellEl(id));
+});
+document.addEventListener('mouseup',()=>setPressed(null),true);
 document.addEventListener('mousemove',e=>{
   if(!press||dragging)return;
   if(Math.abs(e.clientY-press.y)>4||Math.abs(e.clientX-press.x)>4){
@@ -633,11 +681,16 @@ document.addEventListener('mouseup',e=>{
   const queued=pendingClick.get(hit.id);
   if(queued){ // second click on the same cell: cancel its refresh and open the page instead
     clearTimeout(queued);pendingClick.delete(hit.id);
+    ack(hit.id);
     invoke('open_provider_page',{provider:hit.id}).catch(()=>{});
     return;
   }
   pendingClick.set(hit.id,setTimeout(()=>{
     pendingClick.delete(hit.id);
+    // Acknowledged when the refresh actually goes out, not when the button came up: the
+    // single-click action waits out the double-click interval, and a beat fired early would
+    // be claiming something had happened that had not.
+    ack(hit.id);
     invoke('refresh_provider',{provider:hit.id}).catch(()=>{});
   },DOUBLE_CLICK_MS));
 });
@@ -679,7 +732,7 @@ function openMenu(x,y,provider){
 }
 document.addEventListener('mousedown',e=>{if(!e.target.closest?.('#ctx'))closeMenu();},true);
 listen('pointer_left',()=>closeMenu()).catch(()=>{});
-listen('drag_end',()=>{dragging=false;press=null;}).catch(()=>{});
+listen('drag_end',()=>{dragging=false;press=null;setPressed(null);}).catch(()=>{});
 
 function notice(msg){
   const n=document.getElementById('notice');

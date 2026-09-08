@@ -13,12 +13,151 @@ documented behaviour and the wire formats.
 
 | Cell | Source | How it reads it |
 |---|---|---|
-| **Claude** | `GET https://api.anthropic.com/api/oauth/usage` with the token Claude Code keeps in `~/.claude/.credentials.json` | Session / weekly windows, 429 back-off with a persisted deadline, stale readings dimmed with their age. A thin arc spins inside the ring while a Claude session is working, and pulses amber when one is waiting on you (Claude Code hooks + transcript watcher, desktop app included). |
+| **Claude** | `GET https://api.anthropic.com/api/oauth/usage` with this app's own OAuth session, or Claude Code's borrowed token when you have not signed in | Session / weekly windows, 429 back-off with a persisted deadline, stale readings dimmed with their age. A thin arc spins inside the ring while a Claude session is working, and pulses amber when one is waiting on you (Claude Code hooks + transcript watcher, desktop app included). |
 | **Codex** | `GET https://chatgpt.com/backend-api/wham/usage` with the session Codex keeps in `~/.codex/auth.json` (read only, never refreshed), falling back to the `rate_limits` snapshot in the newest rollout log | Live primary/secondary windows (5h + weekly on paid plans, a monthly window on free) while Codex is signed in; otherwise the last snapshot, marked stale by its own timestamp. |
 | **Cursor** | The editor's own session from `state.vscdb` → `cursor.com/api/usage-summary` | Included usage / API usage / on-demand, reset at billing-cycle end. Nothing to sign into: it borrows the editor's session, so there is only ever one account. |
 | **Antigravity** | The local `language_server` bridge (quota summary), then Google's Cloud Code API for licensed accounts, then a plain count of today's model turns | Honest degradation: a percentage only when one exists, a `~count` when it does not. |
 
 Providers that are not installed simply do not get a cell.
+
+## Reading the pill
+
+Every provider gets one cell, and every cell is the same four things: a ring, a mark, a
+percentage and a countdown. Nothing here is decorative — each part answers a different question.
+
+```
+      ╭─────────╮
+      │  ╭───╮  │   ← ring:      how much of the window is used
+      │  │ ✳ │  │   ← mark:      which provider
+      │  ╰───╯  │   ← inner arc: whether a session is working right now
+      │   55%   │   ← percentage
+      │  2h14m  │   ← countdown: time until this window resets
+      ╰─────────╯
+```
+
+### The ring, and its colour
+
+The ring fills clockwise from twelve o'clock as the window is used up. Its colour is a
+judgement about how much room is left, not a decoration:
+
+| Colour | Used | What it means |
+|---|---|---|
+| **Green** `#00FF88` | under 50 % | Ample. Nothing to think about. |
+| **Yellow** `#F2FF00` | 50 % – 80 % | Worth knowing. Pace yourself if the reset is far off. |
+| **Red** `#FF3F00` | 80 % and over | Close to the cap. |
+| **Grey** `#303030` | — | The track: the part of the window still unused. A ring showing *only* grey is not an error, it is a window with no published denominator (see below). |
+
+The whole cell **dims to 55 %** when the reading is stale — older than twenty minutes, or the
+last fetch failed. The number stays: a stale reading is still the truth about your account,
+just old, and blanking it would be less informative rather than more. The hover card says how
+old it is.
+
+### The mark in the middle
+
+The provider's own brand mark, or the installed application's icon if the app is on this
+machine. It dims when the window is fully used (100 %), which is the one state where the
+number alone is easy to misread as "fine, it says a number".
+
+### The pace mark
+
+A short white tick on the ring showing **how far through the reset window you are**, drawn at
+the same angle the ring would reach if you were spending evenly.
+
+That is the second half of the sentence the percentage starts. Sixty percent used is
+comfortable an hour before a reset and alarming five minutes into a new window — so:
+
+- **Ring ahead of the tick** — spending faster than the window replenishes.
+- **Ring behind the tick** — comfortable.
+
+No tick is drawn when the window's length is not one of the two Anthropic publishes, because a
+pace mark computed from a guessed length is worse than none.
+
+### The inner arc: is it working?
+
+A thinner arc *inside* the ring, and the only moving part.
+
+| What you see | State | Meaning |
+|---|---|---|
+| **Green fragment turning** `#28E07B` | running | A session is working right now. |
+| **Amber circle pulsing** `#FFBF00` | attention | A session is waiting on **you** — a permission prompt, a question, a finished turn. |
+| **Nothing** | idle | No session, or the app cannot tell. |
+
+The two are different shapes on purpose, not one shape in two colours: colour alone is not a
+signal everyone can read, and the difference between "it is busy" and "it needs you" is the
+most important thing on the pill. They cross-fade over 220 ms so the change reads as a change
+of state rather than a flicker.
+
+For Claude the state comes from Claude Code's hooks and the transcript watcher; for the others
+it is inferred from recent local activity, so those cells can show *running* and never *attention* —
+the signal available cannot tell the difference, and inventing it would be a lie with a colour.
+
+### The percentage, and the tilde
+
+`55%` is a real percentage: the provider published both a used figure and a limit.
+
+`~12` is a **count**, not a percentage, and the tilde says so. Some windows publish what you
+have spent but never what the ceiling is; rather than invent a denominator, the cell shows the
+count, marks it derived, and the ring draws only its track. A window with no reset time is not
+shown at all. This rule is inherited from the macOS original and it is the one rule the whole
+app is built on: **never invent a number.**
+
+`—` means no reading: not signed in, or nothing to report.
+
+### The countdown
+
+Time until the ring's window resets: `47m`, `2h14m`, `3d`. It truncates rather than rounds —
+rounding up would claim more time than you have, directly under a percentage that says how
+little is left.
+
+It disappears while a reading is stale, because a countdown is a claim about *right now*, and
+one computed from an old reading keeps ticking toward a moment that has already passed.
+
+### Clicking
+
+| Gesture | What happens |
+|---|---|
+| **Click** a cell | Refresh that provider. The cell dips as you press and beats once when the request goes out. |
+| **Double-click** a cell | Open that provider's usage page in a browser. |
+| **Right-click** | Menu: refresh, open usage page, hide this provider. |
+| **Drag** the pill | Move it up and down the edge. The position persists. |
+| **Hover** | The card, with every window listed and the sessions behind them. |
+
+Refresh is the single-click action deliberately. Opening a browser tab used to be, which made
+the most casual gesture in the app the most disruptive one — a stray click on something pinned
+to the screen edge threw a window in front of whatever you were doing.
+
+Everything outside the pill and the card is click-through: the window is wider than what it
+draws, and the rest belongs to whatever is underneath it.
+
+## Signing in
+
+Tray → **Sign in to Claude**. Two tabs open: Anthropic's authorization page, and a local page
+that takes the code it hands back. Paste it, and that is the last time you are asked — the app
+holds its own session in Windows Credential Manager and refreshes it before it expires.
+
+If you never sign in, the app falls back to borrowing Claude Code's credential from
+`~/.claude/.credentials.json`, read and never written, exactly as it always did. A borrowed
+credential cannot be renewed by the borrower, which is why signing in is worth the one click:
+when it expires, the only cure is opening Claude Code and signing in there again.
+
+Signing out here forgets only this app's token. Claude Code's credential is never read,
+written or invalidated by any of it.
+
+## Keeping out of the way
+
+This app reads endpoints that rate-limit hard, and a lockout costs hours of freshness. Several
+guards exist because each was earned:
+
+- **A refetch floor.** A reading younger than ten minutes is served from disk rather than
+  refetched — this app is rarely the only thing reading these endpoints.
+- **An hourly request ceiling per provider**, persisted, so a burst spread across restarts is
+  still visible to it.
+- **Local sources first.** Codex records the limits it saw into its own rollout log; Antigravity
+  has a bridge on this machine. Reading those costs nobody anything, so the endpoint is asked
+  only when the local record is too old to trust.
+- **Backoff survives a restart.** A `Retry-After` deadline is written to disk, so relaunching
+  cannot bypass it.
+- **A provider switched off is not polled at all**, not merely hidden.
 
 ## Install / build
 
@@ -31,8 +170,10 @@ cargo build --release
 .\target\release\codenotch.exe doctor   # self-diagnosis: credentials, data sources, icons, hooks
 ```
 
-Tray menu: refresh now, reset position, open data folder (`%APPDATA%\codenotch` — logs,
-persisted readings, icon overrides), start with Windows, install/uninstall Claude Code hooks.
+Tray menu: sign in / out, providers on and off, which window the ring follows, which parts of
+a cell to show, float the pill clear of the edge, refresh now, reset position, open data folder
+(`%APPDATA%\codenotch` — logs, persisted readings, icon overrides), start with Windows,
+install/uninstall Claude Code hooks.
 
 ### Icons
 
@@ -46,7 +187,8 @@ The marks remain the trademarks of their owners.
 ```
 .
 ├── codenotch/          Tauri 2 app: window, tray, providers (usage.rs, codex.rs, cursor.rs, antigravity.rs),
-│   ├── src/            session engine (watcher.rs, state.rs, focus.rs), glyphs.rs, doctor.rs
+│   ├── src/            oauth.rs (this app's own Claude session), session engine (watcher.rs,
+│   │                   state.rs, focus.rs), glyphs.rs, doctor.rs
 │   ├── ui/notch.html   the pill + hover card (single file, no framework)
 │   └── glyphs/         provider marks (+ NOTICE.md)
 └── codenotch-hook/     <5 ms hook messenger Claude Code calls; forwards events to the app
