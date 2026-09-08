@@ -15,7 +15,7 @@ const HOOK: &str = r"C:\Program Files\Codenotch\codenotch-hook.exe";
 
 fn install_fresh() -> Value {
     let mut root = json!({});
-    merge_install(&mut root, HOOK);
+    merge_install_default(&mut root, HOOK);
     root
 }
 
@@ -141,7 +141,7 @@ fn upgrading_removes_our_entries_from_events_we_no_longer_wire() {
             ]
         }
     });
-    merge_install(&mut root, HOOK);
+    merge_install_default(&mut root, HOOK);
 
     // Ours are gone from both retired events...
     assert!(ours(&root, "PreToolUse").is_empty(), "a stale PreToolUse entry survived the upgrade");
@@ -203,7 +203,7 @@ fn installing_over_a_mixed_entry_keeps_the_user_command() {
             }]
         }
     });
-    merge_install(&mut root, HOOK);
+    merge_install_default(&mut root, HOOK);
     let pre = entries(&root, "PreToolUse");
     assert_eq!(pre.len(), 1);
     let cmds = pre[0]["hooks"].as_array().unwrap();
@@ -232,7 +232,7 @@ fn upgrading_from_a_legacy_name_also_clears_the_retired_events() {
             ]
         }
     });
-    merge_install(&mut root, HOOK);
+    merge_install_default(&mut root, HOOK);
     assert!(root["hooks"].get("PostToolUse").is_none());
 }
 
@@ -240,7 +240,7 @@ fn upgrading_from_a_legacy_name_also_clears_the_retired_events() {
 fn installing_twice_is_the_same_as_installing_once() {
     let once = install_fresh();
     let mut twice = install_fresh();
-    merge_install(&mut twice, HOOK);
+    merge_install_default(&mut twice, HOOK);
     assert_eq!(once, twice);
 }
 
@@ -249,8 +249,8 @@ fn reinstalling_after_a_move_replaces_the_stale_path() {
     // Upgrading or relocating the application must not leave a hook pointing at a binary
     // that no longer exists; Claude Code would report a failing hook on every event.
     let mut root = json!({});
-    merge_install(&mut root, r"C:\Old\codenotch-hook.exe");
-    merge_install(&mut root, HOOK);
+    merge_install_default(&mut root, r"C:\Old\codenotch-hook.exe");
+    merge_install_default(&mut root, HOOK);
     let cmds: Vec<String> = entries(&root, "Stop")
         .iter()
         .map(|e| e["hooks"][0]["command"].as_str().unwrap_or_default().to_string())
@@ -277,7 +277,7 @@ fn install_preserves_the_users_own_hooks_and_settings() {
             ]
         }
     });
-    merge_install(&mut root, HOOK);
+    merge_install_default(&mut root, HOOK);
 
     // Unrelated top-level settings are untouched.
     assert_eq!(root["model"], json!("opus"));
@@ -305,7 +305,7 @@ fn install_repairs_a_settings_file_it_cannot_understand() {
         json!({ "hooks": "nonsense" }),
         json!({ "hooks": [] }),
     ] {
-        merge_install(&mut root, HOOK);
+        merge_install_default(&mut root, HOOK);
         assert_eq!(ours(&root, "Stop").len(), 1, "failed to repair");
     }
 }
@@ -313,7 +313,7 @@ fn install_repairs_a_settings_file_it_cannot_understand() {
 #[test]
 fn install_survives_an_event_array_holding_junk() {
     let mut root = json!({ "hooks": { "Stop": [null, 7, { "hooks": "x" }] } });
-    merge_install(&mut root, HOOK);
+    merge_install_default(&mut root, HOOK);
     // Nothing is discarded, because none of it is ours to discard.
     assert_eq!(entries(&root, "Stop").len(), 4);
     assert_eq!(ours(&root, "Stop").len(), 1);
@@ -335,7 +335,7 @@ fn uninstall_is_the_exact_inverse_of_install() {
         }
     });
     let mut root = original.clone();
-    merge_install(&mut root, HOOK);
+    merge_install_default(&mut root, HOOK);
     let removed = merge_uninstall(&mut root);
 
     assert_eq!(removed, WIRING.len());
@@ -394,4 +394,59 @@ fn uninstall_ignores_a_document_with_no_hooks_section() {
         assert_eq!(merge_uninstall(&mut root), 0);
         assert_eq!(root, before);
     }
+}
+
+
+/// Test helper: the full wiring, which is what every existing test in this file assumed before
+/// the set became a function of how slow the shell is.
+fn merge_install_default(root: &mut Value, hook_exe: &str) {
+    merge_install(root, hook_exe, WIRING);
+}
+
+/// How many hooks to ask for, given what one costs.
+///
+/// The numbers are measured, not chosen: on the machine this port is developed on, the WSL
+/// `bash` that Claude Code picks up from PATH takes 4095, 196, 199, 159 and 172 ms to start,
+/// while the Git Bash already installed beside it takes 100, 75, 71, 78 and 84 ms. Wiring the
+/// tool events through the first is what froze sessions.
+#[test]
+fn a_slow_shell_buys_fewer_hooks() {
+    // A healthy shell: everything, as before.
+    assert_eq!(wiring_for(0).len(), WIRING.len());
+    assert_eq!(wiring_for(82).len(), WIRING.len(), "Git Bash, measured");
+    assert_eq!(wiring_for(150).len(), WIRING.len(), "the boundary is usable");
+
+    // Slow: the bookends and the one signal the transcript cannot provide.
+    let frugal = wiring_for(151);
+    assert_eq!(frugal.len(), 3);
+    assert!(frugal.iter().any(|(e, _, _)| *e == "Notification"));
+    assert!(!frugal.iter().any(|(e, _, _)| *e == "UserPromptSubmit"));
+
+    // Very slow: only the signal nothing else can give.
+    let minimal = wiring_for(964); // WSL bash, measured on this machine
+    assert_eq!(minimal.len(), 1);
+    assert_eq!(minimal[0].0, "Notification");
+    assert_eq!(wiring_for(u128::MAX).len(), 1);
+}
+
+/// Every reduced set has to be a subset of the full one, or dropping an event from `WIRING`
+/// would leave a slow machine wiring something the sweep in `merge_install` no longer removes.
+#[test]
+fn the_reduced_sets_are_subsets_of_the_full_one() {
+    for ms in [151u128, 964, u128::MAX] {
+        for entry in wiring_for(ms) {
+            assert!(
+                WIRING.iter().any(|w| w.0 == entry.0 && w.2 == entry.2),
+                "{} is wired only when the shell is slow, which no sweep would clean up",
+                entry.0
+            );
+        }
+    }
+}
+
+/// A shell that is already fast has nothing to suggest, however many alternatives exist.
+#[test]
+fn a_faster_shell_is_only_offered_when_it_would_help() {
+    assert_eq!(faster_shell(r"C:\any\bash.exe",10), None);
+    assert_eq!(faster_shell(r"C:\any\bash.exe",150), None);
 }

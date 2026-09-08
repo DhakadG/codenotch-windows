@@ -31,6 +31,163 @@ const WIRING: &[(&str, bool, &str)] = &[
     ("SessionEnd", false, "session_end"),
 ];
 
+/// When the shell is slow, the three events that still earn their cost.
+///
+/// `Notification` is the one signal the transcript watcher genuinely cannot replace: a
+/// permission prompt is Claude Code waiting on a person, and nothing is written to the
+/// transcript while it waits. Session start and end are bookends that fire once each.
+///
+/// `UserPromptSubmit` and `Stop` are dropped rather than kept, because both are visible in the
+/// transcript within a second or two anyway - they buy latency, not information, and latency is
+/// exactly what is expensive on a slow shell.
+const WIRING_FRUGAL: &[(&str, bool, &str)] = &[
+    ("SessionStart", false, "session_start"),
+    ("Notification", false, "attention"),
+    ("SessionEnd", false, "session_end"),
+];
+
+/// The single event worth paying a very slow shell for.
+const WIRING_MINIMAL: &[(&str, bool, &str)] = &[("Notification", false, "attention")];
+
+/// How much shell start-up is acceptable per hook, in milliseconds.
+///
+/// Not guesses. Measured on the machine this port is developed on, where `bash` on PATH is the
+/// WSL one: five runs of `bash -c "exit 0"` gave 4095, 196, 199, 159 and 172 ms - a first-run
+/// cost of over four seconds. Git Bash, already installed on the same machine and unused, gave
+/// 100, 75, 71, 78 and 84 ms.
+///
+/// A hundred and fifty sits comfortably above a healthy shell and far below an unhealthy one,
+/// so the classification is not a close call in either direction.
+const SHELL_FAST_MS: u128 = 150;
+/// Above this, only the event the watcher cannot replace is worth paying for.
+const SHELL_VERY_SLOW_MS: u128 = 600;
+
+/// Which events to wire, given what the shell costs.
+///
+/// Every hook costs one shell start-up, and that cost is the shell's rather than the
+/// messenger's - 57 ms for `codenotch-hook.exe` against up to 4.2 seconds for the shell around
+/// it. So the honest unit of this decision is milliseconds per hook, and the only lever this
+/// application has is how many hooks it asks for.
+pub(crate) fn wiring_for(shell_ms: u128) -> &'static [(&'static str, bool, &'static str)] {
+    if shell_ms <= SHELL_FAST_MS {
+        WIRING
+    } else if shell_ms <= SHELL_VERY_SLOW_MS {
+        WIRING_FRUGAL
+    } else {
+        WIRING_MINIMAL
+    }
+}
+
+/// What the shell costs to start, measured rather than assumed.
+pub struct ShellProbe {
+    /// The shell Claude Code will use.
+    pub path: String,
+    /// Median of several runs of `bash -c "exit 0"`, in milliseconds.
+    ///
+    /// Median, not mean: the first start of WSL bash took 4.2 seconds and the rest took under
+    /// 200 ms, and an average is a poor summary of a distribution shaped like that. The median
+    /// describes the typical hook, which is what this decision is about.
+    pub median_ms: u128,
+    /// A faster shell that is installed but not being used, if there is one.
+    pub faster: Option<String>,
+}
+
+/// Time the shell Claude Code will actually invoke.
+///
+/// This measures the invocation, not the messenger. Measuring the binary was the original
+/// mistake: `codenotch-hook.exe` runs in 57 ms, which looked fine and explained nothing,
+/// because Claude Code does not run it directly. It runs it through a POSIX shell, and on a
+/// Windows machine whose `bash` is the WSL one that shell is the entire cost.
+pub fn probe_shell() -> ShellProbe {
+    let path = which_bash().unwrap_or_default();
+    let median_ms = if path.is_empty() { 0 } else { median_start_ms(&path) };
+    ShellProbe {
+        faster: faster_shell(&path, median_ms),
+        path,
+        median_ms,
+    }
+}
+
+/// The bash Claude Code will pick.
+///
+/// `CLAUDE_CODE_GIT_BASH_PATH` first, because Claude Code consults it before PATH on Windows.
+/// Timing PATH's bash while Claude Code is using a different one would describe a shell that
+/// nothing runs.
+fn which_bash() -> Option<String> {
+    if let Some(p) = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p.display().to_string());
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join("bash.exe"))
+        .find(|p| p.is_file())
+        .map(|p| p.display().to_string())
+}
+
+/// Git Bash, when it is installed and the shell in use is materially slower.
+///
+/// "Materially" is doing real work here. Changing which shell Claude Code uses is a change to
+/// the user's machine, and it is only worth suggesting when the difference is the difference
+/// between a session that stutters and one that does not.
+pub(crate) fn faster_shell(current: &str, current_ms: u128) -> Option<String> {
+    if current_ms <= SHELL_FAST_MS {
+        return None;
+    }
+    [
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+        "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+    ]
+    .iter()
+    .find(|c| !c.eq_ignore_ascii_case(current) && std::path::Path::new(c).is_file())
+    .map(|c| c.to_string())
+}
+
+fn median_start_ms(shell: &str) -> u128 {
+    let mut samples: Vec<u128> = (0..5)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            let mut cmd = std::process::Command::new(shell);
+            cmd.args(["-c", "exit 0"]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            let _ = cmd.status();
+            t.elapsed().as_millis()
+        })
+        .collect();
+    samples.sort_unstable();
+    samples[samples.len() / 2]
+}
+
+/// Point Claude Code at a faster shell, for new terminals.
+///
+/// `setx` rather than a registry write: it is the documented way to set a persistent user
+/// variable, it broadcasts the change, and it is one line instead of a registry dependency.
+/// Only ever called from an explicit menu action - this changes the user's environment, and
+/// nothing here does that on its own initiative.
+pub fn use_faster_shell(path: &str) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("setx");
+    cmd.args(["CLAUDE_CODE_GIT_BASH_PATH", path]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    match cmd.status() {
+        Ok(st) if st.success() => Ok(format!(
+            "Claude Code will use {path} for hooks. Open a new terminal for it to take effect."
+        )),
+        Ok(st) => Err(format!("setx exited with {st}")),
+        Err(e) => Err(format!("could not run setx: {e}")),
+    }
+}
+
 #[cfg(test)]
 #[path = "hooks_install_tests.rs"]
 mod tests;
@@ -106,7 +263,7 @@ pub fn is_installed() -> bool {
 ///
 /// Idempotent. Our own older entries are removed before the new ones are added, so
 /// installing twice leaves exactly one entry per event rather than two.
-fn merge_install(root: &mut Value, hook_exe: &str) {
+fn merge_install(root: &mut Value, hook_exe: &str, wiring: &[(&str, bool, &str)]) {
     if !root.is_object() {
         *root = json!({});
     }
@@ -131,7 +288,7 @@ fn merge_install(root: &mut Value, hook_exe: &str) {
         root["hooks"] = json!({});
     }
 
-    for (event, need_matcher, internal) in WIRING {
+    for (event, need_matcher, internal) in wiring {
         let arr = root["hooks"][*event].as_array().cloned().unwrap_or_default();
         // Remove our own older entries first
         let mut arr: Vec<Value> = arr.into_iter().filter(|e| !is_ours(e)).collect();
@@ -237,10 +394,29 @@ pub fn install() -> Result<String, String> {
         return Err(format!("missing {}", hook_exe.display()));
     }
 
+    // Measured before deciding, every time, because the answer is a property of this machine
+    // and it can change: installing Git Bash, or pointing Claude Code at it, moves this by an
+    // order of magnitude.
+    let probe = probe_shell();
+    let wiring = wiring_for(probe.median_ms);
+
     let mut root = load(&path);
-    merge_install(&mut root, &hook_exe.display().to_string());
+    merge_install(&mut root, &hook_exe.display().to_string(), wiring);
     backup_and_write(&path, &root)?;
-    Ok(format!("wrote {} ({} events)", path.display(), WIRING.len()))
+
+    let mut msg = format!(
+        "wrote {} ({} events, shell {} ms per hook)",
+        path.display(),
+        wiring.len(),
+        probe.median_ms
+    );
+    if wiring.len() < WIRING.len() {
+        msg.push_str(" - fewer than usual, because that shell is slow");
+    }
+    if probe.faster.is_some() {
+        msg.push_str("; tray has \"Speed up hooks\"");
+    }
+    Ok(msg)
 }
 
 pub fn uninstall() -> Result<String, String> {
@@ -255,4 +431,15 @@ pub fn uninstall() -> Result<String, String> {
     let removed = merge_uninstall(&mut root);
     backup_and_write(&path, &root)?;
     Ok(format!("removed {removed} Codenotch hook(s)"))
+}
+
+/// `probe_shell().faster`, measured once per process.
+///
+/// The probe starts a shell five times, which is fine at install time and not fine on every
+/// tray-menu rebuild - the menu is rebuilt on every toggle, and five WSL starts is four seconds
+/// of a menu that has not appeared yet. The answer only changes when the user installs a shell
+/// or changes an environment variable, neither of which happens mid-session without a restart.
+pub fn cached_faster_shell() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| probe_shell().faster).clone()
 }

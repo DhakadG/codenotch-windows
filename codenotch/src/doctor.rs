@@ -36,6 +36,32 @@ pub fn run() -> String {
     // The exact binary first, so a report can never be attributed to the wrong build.
     o += &format!("== doctor: {} ==\n", crate::version_line());
 
+    // What a hook costs on this machine, which is the question that took three wrong answers
+    // to reach. The cost is the shell's, not the messenger's, and it is not knowable from the
+    // code - only from running it here.
+    {
+        let probe = crate::hooks_install::probe_shell();
+        if probe.path.is_empty() {
+            o += "hooks: no bash on PATH - Claude Code cannot run hook commands at all
+";
+        } else {
+            let wiring = crate::hooks_install::wiring_for(probe.median_ms);
+            o += &format!(
+                "hooks: shell {} at {} ms per hook -> {} event(s) wired
+",
+                probe.path,
+                probe.median_ms,
+                wiring.len()
+            );
+            if let Some(faster) = &probe.faster {
+                o += &format!(
+                    "hooks: {faster} is installed and faster - tray has \"Speed up hooks\", or set CLAUDE_CODE_GIT_BASH_PATH to it
+"
+                );
+            }
+        }
+    }
+
     // What the app has actually spent against the usage endpoint's per-token limit, so
     // "am I the reason for this 429" is answerable from the report rather than guessed at.
     {

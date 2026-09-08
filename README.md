@@ -35,6 +35,29 @@ percentage and a countdown. Nothing here is decorative — each part answers a d
       ╰─────────╯
 ```
 
+### Two rings, not one
+
+The thick outer ring is the **five-hour window**; the thin ring just inside it is the **week**.
+Both are drawn together because they answer different questions and neither answer implies the
+other: a comfortable weekly figure says nothing about the next five hours, and a spent
+five-hour window says nothing about the week.
+
+The percentage and the countdown follow whichever window the tray's *Ring shows* is set to, so
+the number and the thick ring always agree. With the ring pinned to the weekly window the thin
+one is not drawn, because it would be saying the same thing twice.
+
+### Hour marks
+
+Five faint notches on the outer ring, one per hour of the five-hour window.
+
+The ring fills by *usage*, not by time, so on its own it cannot answer "am I spending too
+fast" - and the pace mark alone says where you are without saying what that is worth. The
+notches turn the ring into a clock face: the pace mark sits between two of them, and the gap
+between the filled arc and the pace mark becomes readable in hours rather than in degrees.
+
+Only on the five-hour ring. A week divided into five would be a claim about a length it does
+not have.
+
 ### The ring, and its colour
 
 The ring fills clockwise from twelve o'clock as the window is used up. Its colour is a
@@ -58,9 +81,9 @@ The provider's own brand mark, or the installed application's icon if the app is
 machine. It dims when the window is fully used (100 %), which is the one state where the
 number alone is easy to misread as "fine, it says a number".
 
-### The pace mark
+### The pace marks
 
-A short white tick on the ring showing **how far through the reset window you are**, drawn at
+A short white tick on each ring showing **how far through that window you are**, drawn at
 the same angle the ring would reach if you were spending evenly.
 
 That is the second half of the sentence the percentage starts. Sixty percent used is
@@ -68,6 +91,9 @@ comfortable an hour before a reset and alarming five minutes into a new window �
 
 - **Ring ahead of the tick** — spending faster than the window replenishes.
 - **Ring behind the tick** — comfortable.
+
+Both rings get one, sized to their own band: the same idea at two scales rather than two marks
+that happen to look alike.
 
 No tick is drawn when the window's length is not one of the two Anthropic publishes, because a
 pace mark computed from a guessed length is worse than none.
@@ -111,6 +137,40 @@ little is left.
 
 It disappears while a reading is stale, because a countdown is a claim about *right now*, and
 one computed from an old reading keeps ticking toward a moment that has already passed.
+
+### When a window fills up
+
+A desktop notification the first time a window crosses into the red, and **only** the first
+time. Each window is armed while it sits below the threshold, fires once on the way up, and
+re-arms when it drops back - so a full window is one notification rather than one every poll
+for the rest of the afternoon.
+
+The first reading after a launch primes without firing. Starting the app at 90 % should be a
+number, not an alert about a crossing that happened before the app was running.
+
+On by default, because the whole point is the times you are not looking at the pill.
+
+### Two ways to read the number
+
+**Show what is left** inverts the number and the arc: `45%` becomes `55%` and the ring empties
+instead of filling.
+
+The colour does not invert with it. Red keeps meaning trouble, because a palette that flipped
+with the setting would make a nearly-full green ring mean two opposite things depending on
+something you cannot see from across the room. The pace marks mirror along with the arc, so the
+one rule holds in either mode: **the arc falling short of the mark is the warning.**
+
+**Colourblind palette** rebuilds the ramp along blue → amber → orange rather than recolouring
+the red-green one. Red and green are the pair that goes, so the axis changes rather than the
+shades; the three steps also differ in lightness, so they survive a greyscale screenshot.
+
+### The stale warning dot
+
+A small amber dot on the ring when a reading is **stale and failing**.
+
+Dimming already says "this number is old". A reading can be old because one refresh was skipped,
+which resolves itself, or because every attempt is failing, which does not - and only the second
+is worth acting on. The dot is the difference.
 
 ### Clicking
 

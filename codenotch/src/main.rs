@@ -11,7 +11,9 @@ mod config;
 mod doctor;
 mod focus;
 mod hooks_install;
+mod notify;
 mod oauth;
+mod window_start;
 mod i18n;
 mod server;
 mod state;
@@ -351,6 +353,12 @@ pub struct Prefs {
     pub show_countdown: bool,
     pub show_pace_tick: bool,
     pub show_activity_arc: bool,
+    pub show_weekly_ring: bool,
+    pub show_hour_marks: bool,
+    pub remaining_mode: bool,
+    pub colorblind: bool,
+    pub show_stale_warning: bool,
+    pub red_threshold: f64,
     pub float_pill: bool,
 }
 
@@ -365,6 +373,12 @@ impl Prefs {
             show_countdown: c.show_countdown,
             show_pace_tick: c.show_pace_tick,
             show_activity_arc: c.show_activity_arc,
+            show_weekly_ring: c.show_weekly_ring,
+            show_hour_marks: c.show_hour_marks,
+            remaining_mode: c.remaining_mode,
+            colorblind: c.colorblind,
+            show_stale_warning: c.show_stale_warning,
+            red_threshold: c.red_threshold,
             float_pill: c.float_pill,
         }
     }
@@ -430,7 +444,7 @@ fn hide_provider(app: AppHandle, provider: String) {
     let _ = tray::rebuild(&app);
 }
 
-/// Open a URL in the user's browser.
+/// Hand a URL or a path to the Windows shell, which opens it with whatever owns it.
 ///
 /// `ShellExecuteW`, not `cmd /C start`. The shell was fine while every URL here was a bare
 /// page address, and stops being fine the moment one carries a query: `cmd.exe` reparses its
@@ -438,19 +452,19 @@ fn hide_provider(app: AppHandle, provider: String) {
 /// nothing but `&`-joined parameters - was cut off at the first one. The sign-in would have
 /// failed with an error from Anthropic about a missing parameter, pointing at the wrong thing
 /// entirely. No shell, no reparsing, no quoting rules to get right.
-pub fn open_in_browser(url: &str) {
+pub fn open_in_browser(target: &str) {
     #[cfg(windows)]
     {
         use windows::core::{w, PCWSTR};
         use windows::Win32::UI::Shell::ShellExecuteW;
         use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-        let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
             ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
         }
     }
     #[cfg(not(windows))]
-    let _ = url;
+    let _ = target;
 }
 
 /// A click on a cell opens that provider's usage page
@@ -691,14 +705,10 @@ fn log_js(msg: String) {
 
 #[tauri::command]
 fn open_usage_page() {
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.args(["/C", "start", "", "https://claude.ai/settings/usage"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let _ = cmd.spawn();
+    // Through the same launcher as everything else. This one has no query string, so `cmd /C
+    // start` happened to work here - but leaving a second way to open a URL is leaving a
+    // second place for the next URL with an `&` in it to be cut in half.
+    open_in_browser("https://claude.ai/settings/usage");
 }
 
 #[tauri::command]
@@ -909,6 +919,8 @@ fn main() {
             cursor::start(handle.clone());
             antigravity::start(handle.clone());
             activity::start(handle.clone());
+            window_start::start_watcher(handle.clone());
+            notify::start_watcher(handle.clone());
             // Collecting glyphs may read icon resources out of a few executables; do it off the main thread and push when done
             let gh = handle.clone();
             std::thread::spawn(move || reload_glyphs(&gh));
