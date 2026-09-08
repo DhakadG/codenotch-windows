@@ -57,15 +57,61 @@
   .cell{display:flex;flex-direction:column;align-items:center;gap:6px;
     transition:transform 160ms cubic-bezier(.2,.7,.3,1),opacity 160ms ease;
     will-change:transform,opacity}
-  .cell.pressed{transform:scale(.9);opacity:.65;transition-duration:90ms}
-  @keyframes cell-ack{0%{transform:scale(.94)}55%{transform:scale(1.06)}100%{transform:scale(1)}}
-  .cell.acted{animation:cell-ack 260ms cubic-bezier(.2,.7,.3,1)}
+  /* Two stages rather than one.
+
+     The first version jumped straight to 0.9 in 90 ms, which is a step with a duration rather
+     than a press: the whole movement happened at the start and there was nothing to follow.
+     This settles in two - a quick dip to 0.955 that tracks the finger going down, then a slow
+     creep to 0.93 for as long as the button is held, so a long press keeps moving and a short
+     one still reads as a press. Opacity trails the scale slightly for the same reason.
+
+     `cubic-bezier(.34,1.3,.44,1)` on the release overshoots by a few per cent before settling.
+     That is what makes it feel sprung rather than merely reversed: an equal-and-opposite return
+     reads as an animation being undone, and a small overshoot reads as an object with mass. */
+  .cell.pressed{
+    animation:cell-press 220ms cubic-bezier(.25,.6,.3,1) forwards;
+    transition:none;
+  }
+  @keyframes cell-press{
+    0%{transform:scale(1);opacity:1}
+    28%{transform:scale(.955);opacity:.82}
+    100%{transform:scale(.93);opacity:.72}
+  }
+  /* The acknowledgement, which is a different gesture from the press: the press is under your
+     control and this is the app answering. It leaves from wherever the press left off, so
+     releasing mid-dip does not snap back before the beat starts. */
+  @keyframes cell-ack{
+    0%{transform:scale(.93)}
+    38%{transform:scale(1.045)}
+    68%{transform:scale(.988)}
+    100%{transform:scale(1)}
+  }
+  .cell.acted{animation:cell-ack 340ms cubic-bezier(.34,1.3,.44,1)}
+  /* The stale-and-failing mark: a small dot on the ring's upper right.
+     A dot rather than a glyph, because at this size a glyph is a smudge.
+     Anchored to the ring rather than to the cell, which is the part worth stating: the cell is
+     a flex column whose width is whatever its parent gives it, so a dot positioned against the
+     cell lands in a different place depending on the layout around it. The ring is always
+     56 px. Drawn at 4 o'clock's mirror - up and to the right - because that is where the ring
+     is emptiest at the usage levels this mark appears at. */
+  .cell.warn .ringwrap::after{
+    content:"";position:absolute;top:2px;right:2px;width:7px;height:7px;border-radius:50%;
+    background:#FFBF00;box-shadow:0 0 0 1.5px #0a0a0a;
+    animation:warn-breathe 2.4s ease-in-out infinite;pointer-events:none;
+  }
+  @keyframes warn-breathe{0%,100%{opacity:1}50%{opacity:.45}}
   /* Someone who asked the system to stop animating still needs to know the click landed, so
      the dip stays and only its motion goes: it becomes an instant state change rather than a
      transition, and the acknowledgement beat is dropped entirely. */
   @media (prefers-reduced-motion:reduce){
+    /* The press still has to be visible - someone who asked for less movement still needs to
+       know the click landed - so the dip stays and becomes a state rather than a transition.
+       The acknowledgement beat and the warning's breathing are dropped entirely: both are pure
+       motion, and the warning dot is still a dot. */
     .cell{transition:none}
+    .cell.pressed{animation:none;transform:scale(.93);opacity:.72}
     .cell.acted{animation:none}
+    .cell.warn .ringwrap::after{animation:none}
   }
   .ringwrap{position:relative;width:56px;height:56px}
   .ringwrap > svg.ring{position:absolute;inset:0;overflow:visible} /* pins only the ring itself; an inline logo svg must not match this or it ends up in the top-left corner */
@@ -210,8 +256,28 @@ const listen = window.__TAURI__.event.listen;
 
 /* Colour ramp (upstream palette values) */
 const AMPLE='#00FF88', WATCH='#F2FF00', CRIT='#FF3F00';
+/* A ramp that survives red-green colour blindness.
+
+   Not a recolouring of the first one. Red and green are the pair that goes, so the ramp is
+   rebuilt along blue-to-orange instead, which is the axis that stays separable under both
+   deuteranopia and protanopia - and the three steps also differ in lightness, so they remain
+   distinguishable in a screenshot printed in grey. */
+const CB_AMPLE='#3FA9FF', CB_WATCH='#FFC24A', CB_CRIT='#FF5E1A';
 const TRACK='#303030', AMBER='#FFBF00', RUNGREEN='#28E07B';
-const tone=f=> f>=0.8?CRIT : f>=0.5?WATCH : AMPLE;
+/* Keyed to what is *used*, always - never to what is displayed.
+
+   With "show what is left" on, the number and the arc invert but the colour must not: red has
+   to keep meaning trouble. A palette that flipped with the number would make a nearly full
+   green ring mean two opposite things depending on a setting nobody can see from across the
+   room. The red threshold follows the tray's setting so the ring and the notification agree on
+   where the red starts. */
+function tone(usedFrac){
+  const red=(prefs.red_threshold||0.8), watch=red*0.625; // 0.5 when red is 0.8, as before
+  if(prefs.colorblind) return usedFrac>=red?CB_CRIT : usedFrac>=watch?CB_WATCH : CB_AMPLE;
+  return usedFrac>=red?CRIT : usedFrac>=watch?WATCH : AMPLE;
+}
+/* What the cell shows for a fraction: used, or what is left of it. */
+const shown=usedFrac=> prefs.remaining_mode ? Math.max(0,1-usedFrac) : usedFrac;
 
 let usage={status:'',windows:[],fetched_at:0,note:''};
 let codexSnap={status:'absent',windows:[],fetched_at:0,note:''};
@@ -242,7 +308,7 @@ function glyphHtml(p,small){
 // Provider table (order = top to bottom in the pill). `glyph` is the fallback letter used when no mark is available
 /* User preferences, pushed from the tray. Defaults match the previous behaviour exactly, so
    a config that has never been touched changes nothing. */
-let prefs={hidden_providers:[],ring_window:'auto',show_percent:true,show_countdown:true,show_pace_tick:true,show_activity_arc:true,float_pill:false,show_weekly_ring:true,show_hour_marks:true};
+let prefs={hidden_providers:[],ring_window:'auto',show_percent:true,show_countdown:true,show_pace_tick:true,show_activity_arc:true,float_pill:false,show_weekly_ring:true,show_hour_marks:true,remaining_mode:false,colorblind:false,show_stale_warning:true,red_threshold:0.8};
 
 function providers(){
   const list=[{id:'claude',name:'Claude',glyph:'C',snap:usage}];
@@ -388,7 +454,13 @@ function paceTick(w,r0,r1,style){
   // Outside the window we assumed, the assumption is wrong, so draw nothing rather than
   // pinning the mark misleadingly at one end.
   if(remain<=0||remain>len) return '';
-  return radialMark(1-remain/len,r0,r1,style);
+  /* Mirrored in "show what is left" mode, along with the arc.
+     The mark's job is a comparison, not a position: with the arc showing usage, an arc past the
+     mark means spending faster than the clock. Invert the arc and leave the mark alone and that
+     comparison silently reverses - the same picture would mean the opposite thing depending on
+     a setting. Mirroring both keeps one rule: the arc falling short of the mark is the warning,
+     in either mode. */
+  return radialMark(shown(1-remain/len),r0,r1,style);
 }
 
 function renderRing(){
@@ -421,7 +493,7 @@ function renderRing(){
     // weekly ring the same five marks would be a claim about a length it does not have.
     if(prefs.show_hour_marks && h && h===sess && h.count==null) inner+=hourMarks();
     if(h && h.count==null){
-      inner+=svgArc(R_SESSION,Math.min(h.used,1),tone(h.used),W_SESSION);
+      inner+=svgArc(R_SESSION,Math.min(shown(h.used),1),tone(h.used),W_SESSION);
       // Only for a metered window, and only when it is not stale: a pace mark computed from
       // a reading of unknown age would point at a moment that has already passed.
       if(prefs.show_pace_tick && fresh){
@@ -429,7 +501,7 @@ function renderRing(){
       }
     }
     if(thin&&thin.count==null){
-      inner+=svgArc(R_WEEK,Math.min(thin.used,1),tone(thin.used),W_WEEK);
+      inner+=svgArc(R_WEEK,Math.min(shown(thin.used),1),tone(thin.used),W_WEEK);
       // Its own countdown mark, sized to its own band. Same shape as the five-hour one and a
       // third of the weight, so the two read as the same idea at two scales rather than as
       // two different marks that happen to look alike.
@@ -479,7 +551,7 @@ function renderRing(){
     }
     if(p.snap.status==='needsAuth'||p.snap.status==='none') pct.textContent='—';
     else if(h && h.count!=null) pct.textContent='~'+h.count;
-    else if(h) pct.textContent=(h.derived?'~':'')+Math.round(h.used*100)+'%';
+    else if(h) pct.textContent=(h.derived?'~':'')+Math.round(shown(h.used)*100)+'%';
     else pct.textContent='…';
     pct.hidden=!prefs.show_percent;
     const cd=cell.querySelector('.cd');
@@ -491,6 +563,13 @@ function renderRing(){
     cd.hidden=!left;
     glyph.classList.toggle('dim', !!(h && h.used>=1));
     wrap.classList.toggle('dim', staleOf(p.snap));
+    /* Stale *and* failing is a different message from stale.
+       Dimming already says "this number is old". A reading can be old because one refresh was
+       skipped, which resolves itself, or because every attempt is failing, which does not -
+       and only the second is worth doing something about. The mark is drawn only for the
+       second, which is why it needs an error as well as staleness. */
+    const warn=prefs.show_stale_warning && staleOf(p.snap) && !!p.snap.note && p.snap.status!=='ok';
+    cell.classList.toggle('warn', warn);
   }
 }
 

@@ -138,6 +138,40 @@ little is left.
 It disappears while a reading is stale, because a countdown is a claim about *right now*, and
 one computed from an old reading keeps ticking toward a moment that has already passed.
 
+### When a window fills up
+
+A desktop notification the first time a window crosses into the red, and **only** the first
+time. Each window is armed while it sits below the threshold, fires once on the way up, and
+re-arms when it drops back - so a full window is one notification rather than one every poll
+for the rest of the afternoon.
+
+The first reading after a launch primes without firing. Starting the app at 90 % should be a
+number, not an alert about a crossing that happened before the app was running.
+
+On by default, because the whole point is the times you are not looking at the pill.
+
+### Two ways to read the number
+
+**Show what is left** inverts the number and the arc: `45%` becomes `55%` and the ring empties
+instead of filling.
+
+The colour does not invert with it. Red keeps meaning trouble, because a palette that flipped
+with the setting would make a nearly-full green ring mean two opposite things depending on
+something you cannot see from across the room. The pace marks mirror along with the arc, so the
+one rule holds in either mode: **the arc falling short of the mark is the warning.**
+
+**Colourblind palette** rebuilds the ramp along blue → amber → orange rather than recolouring
+the red-green one. Red and green are the pair that goes, so the axis changes rather than the
+shades; the three steps also differ in lightness, so they survive a greyscale screenshot.
+
+### The stale warning dot
+
+A small amber dot on the ring when a reading is **stale and failing**.
+
+Dimming already says "this number is old". A reading can be old because one refresh was skipped,
+which resolves itself, or because every attempt is failing, which does not - and only the second
+is worth acting on. The dot is the difference.
+
 ### Clicking
 
 | Gesture | What happens |

@@ -66,6 +66,33 @@ pub struct Config {
     /// The five faint hour boundaries on the five-hour ring.
     #[serde(default = "yes")]
     pub show_hour_marks: bool,
+    /// Raise a desktop notification when a window first crosses into the red.
+    ///
+    /// On by default, unlike the other additions here, because the whole point is the times
+    /// you are not looking at the pill - a warning nobody switched on is a warning nobody
+    /// gets. It fires once per crossing and re-arms only when usage drops back, so the cost of
+    /// being wrong about that default is one notification, not a stream.
+    #[serde(default = "yes")]
+    pub notify_threshold: bool,
+    /// Where the red starts, as a fraction. Also where the ring's colour turns.
+    #[serde(default = "default_red")]
+    pub red_threshold: f64,
+    /// Show what is left rather than what is spent.
+    ///
+    /// The mod calls this Remaining mode. Only the number and the arc length change: the colour
+    /// stays keyed to usage, so red still means trouble. A palette that inverted with the number
+    /// would make a nearly-full green ring mean two opposite things depending on a setting.
+    #[serde(default)]
+    pub remaining_mode: bool,
+    /// A palette that does not rely on telling red from green.
+    #[serde(default)]
+    pub colorblind: bool,
+    /// A mark on a cell whose reading is both stale and failing.
+    ///
+    /// Dimming already says "old". This says "and it is not coming back on its own", which is
+    /// a different message and the one worth acting on.
+    #[serde(default = "yes")]
+    pub show_stale_warning: bool,
     /// Lift the pill off the screen edge instead of welding it there.
     ///
     /// Upstream is welded on purpose - the fillets that join the pill to the bezel are the
@@ -87,6 +114,11 @@ pub struct Config {
 
 fn yes() -> bool {
     true
+}
+
+/// Eighty per cent, matching the ring's own red band and the mod's default.
+fn default_red() -> f64 {
+    0.8
 }
 
 fn default_ring_window() -> String {
@@ -122,6 +154,11 @@ impl Default for Config {
             show_activity_arc: true,
             show_weekly_ring: true,
             show_hour_marks: true,
+            notify_threshold: true,
+            red_threshold: default_red(),
+            remaining_mode: false,
+            colorblind: false,
+            show_stale_warning: true,
             float_pill: false,
             auto_start_window: false,
         }

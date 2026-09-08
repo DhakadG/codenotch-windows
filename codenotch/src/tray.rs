@@ -93,6 +93,7 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
             ("activity_arc", c.show_activity_arc),
             ("weekly_ring", c.show_weekly_ring),
             ("hour_marks", c.show_hour_marks),
+            ("stale_warning", c.show_stale_warning),
         ]
     };
     let mut show_items = Vec::new();
@@ -106,6 +107,25 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
     let show_menu = SubmenuBuilder::new(app, tr(lang, "show"))
         .items(&show_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<Wry>).collect::<Vec<_>>())
         .build()?;
+
+    // Three that change what the readings mean rather than which decorations are drawn, so
+    // they sit beside the pill's own options rather than inside "Show".
+    let mut mode_items = Vec::new();
+    for (name, on) in {
+        let st = app.state::<crate::AppState>();
+        let c = st.cfg.lock().unwrap();
+        [
+            ("notify_threshold", c.notify_threshold),
+            ("remaining_mode", c.remaining_mode),
+            ("colorblind", c.colorblind),
+        ]
+    } {
+        mode_items.push(
+            CheckMenuItemBuilder::with_id(format!("show-{name}"), tr(lang, name))
+                .checked(on)
+                .build(app)?,
+        );
+    }
 
     let float_pill = CheckMenuItemBuilder::with_id("float-pill", tr(lang, "float_pill"))
         .checked({
@@ -176,6 +196,7 @@ pub fn build_menu(app: &AppHandle, lang: &str) -> tauri::Result<Menu<Wry>> {
         .item(&provider_menu)
         .item(&ring_menu)
         .item(&show_menu)
+        .items(&mode_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<Wry>).collect::<Vec<_>>())
         .item(&float_pill)
         .item(&lang_menu)
         .item(&refresh)
@@ -257,6 +278,10 @@ fn handle(app: &AppHandle, id: &str) {
                     "activity_arc" => c.show_activity_arc = !c.show_activity_arc,
                     "weekly_ring" => c.show_weekly_ring = !c.show_weekly_ring,
                     "hour_marks" => c.show_hour_marks = !c.show_hour_marks,
+                    "stale_warning" => c.show_stale_warning = !c.show_stale_warning,
+                    "notify_threshold" => c.notify_threshold = !c.notify_threshold,
+                    "remaining_mode" => c.remaining_mode = !c.remaining_mode,
+                    "colorblind" => c.colorblind = !c.colorblind,
                     // An id built here that nothing matches would silently do nothing, which is
                     // the failure mode worth naming rather than the one worth ignoring.
                     other => crate::applog(&format!("tray: unknown show toggle {other:?}")),
@@ -350,17 +375,14 @@ fn handle(app: &AppHandle, id: &str) {
             let _ = std::fs::create_dir_all(crate::glyphs::user_dir());
             // `explorer <path>` spawned with CREATE_NO_WINDOW reported "Location is not
             // available" for a directory that plainly existed and opened fine from a normal
-            // shell. explorer.exe is a shell process rather than a console program, and
-            // suppressing its console this way loses the argument. The shell verb is what
-            // the rest of this file already uses to open URLs, so use it here too.
-            let mut cmd = std::process::Command::new("cmd");
-            cmd.args(["/C", "start", ""]).arg(dir.as_os_str());
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x0800_0000); // hides cmd's own console, not explorer's
-            }
-            let _ = cmd.spawn();
+            // shell: explorer.exe is a shell process rather than a console program, and
+            // suppressing its console that way loses the argument.
+            //
+            // The shell verb is the answer, but not through `cmd /C start`. That reparses its
+            // command line, and a profile path containing an `&` - which Windows allows -
+            // would be cut in half exactly as an OAuth URL was. `ShellExecuteW` takes the path
+            // as one argument and hands it to the shell without a parser in between.
+            crate::open_in_browser(&dir.display().to_string());
         }
         // Re-acquire credentials, then re-poll. Distinct from "refresh now", which only
         // re-polls: this is for the case where a reading is missing because the *sign-in*
