@@ -92,6 +92,20 @@ jobs:
           # third-party actions and build scripts - a write-capable token sitting
           # where nothing needs it.
           persist-credentials: false
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # `cargo audit` directly, rather than the action that wraps it.
+      #
+      # The action failed this job on every run, and not for a security reason. It posts its
+      # result as a check run, which needs `checks: write`, and the permissions block above
+      # grants `contents: read`. The log said so plainly - "No vulnerabilities were found",
+      # then "Resource not accessible by integration" - but the job was red, and a job that is
+      # always red is a job nobody reads. Either widen the token or stop needing it. This stops
+      # needing it.
+      #
+      # Bare `cargo audit` is also the policy this project wants, with nothing to configure:
+      # it exits non-zero on a vulnerability and merely prints the informational classes -
+      # unmaintained, unsound - which is right, because all seven currently reported come from
+      # Tauri's own dependency tree and no version of this application can act on them.
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
